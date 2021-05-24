@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,6 +31,8 @@ use crate::{
     IndexMetadata, IndexUri, MetadataSet, Metastore, MetastoreErrorKind, MetastoreResult, SplitId,
     SplitMetadata, SplitState, FILE_FORMAT_VERSION,
 };
+
+const META_FILENAME: &str = "quickwit.json";
 
 /// Single file meta store implementation.
 pub struct SingleFileMetastore {
@@ -47,6 +49,16 @@ impl SingleFileMetastore {
             data: Arc::new(RwLock::new(HashMap::new())),
         })
     }
+
+    // TODO use this path for the metastore json URI.
+    fn meta_uri(&self, index_uri: IndexUri) -> PathBuf {
+        Path::new(&index_uri).join(Path::new(META_FILENAME))
+    }
+}
+
+/// Takes 2 semi-open intervals and returns true iff their intersection is empty
+fn is_disjoint(left: &Range<u64>, right: &Range<u64>) -> bool {
+    left.end <= right.start || right.end <= left.start
 }
 
 #[async_trait]
@@ -66,6 +78,11 @@ impl Metastore for SingleFileMetastore {
             MetastoreErrorKind::InternalError
                 .with_error(anyhow::anyhow!("Failed to read storage: {:?}", e))
         })?;
+
+        // TODO this behavior (`create_or_open`) is not documented in the trait, and not suggested by
+        // the name of the method.
+        //
+        // We need to either change the behavior or rename the method. Either way we need to document it.
         let metadata_set = if exists {
             // Get metadata set from storage.
             let contents = self.storage.get_all(&path).await.map_err(|e| {
@@ -200,11 +217,19 @@ impl Metastore for SingleFileMetastore {
             }
         }
 
+
         // Serialize metadata set.
         let contents = serde_json::to_vec(&metadata_set).map_err(|e| {
             MetastoreErrorKind::InvalidManifest
                 .with_error(anyhow::anyhow!("Failed to serialize meta data: {:?}", e))
         })?;
+
+        // TODO what happens if the push to the datastore fails?
+        // the storage will not be updated
+        // the internal state is updated.
+        //
+        // We want ot put on the storage first and upon success
+        // updat the internal state.
 
         // Put data back into storage.
         self.storage
@@ -222,7 +247,7 @@ impl Metastore for SingleFileMetastore {
         &self,
         index_uri: IndexUri,
         state: SplitState,
-        time_range: Option<Range<u64>>,
+        time_range_opt: Option<Range<u64>>,
     ) -> MetastoreResult<Vec<SplitMetadata>> {
         let mut data = self.data.write().await;
 
@@ -240,24 +265,16 @@ impl Metastore for SingleFileMetastore {
 
         let mut splits: Vec<SplitMetadata> = Vec::new();
         for (_, split_metadata) in split_with_meta_matching_state_it {
-            match time_range {
-                Some(ref filter_time_range) => {
-                    if let Some(split_time_range) = &split_metadata.time_range {
-                        // Splits that overlap at least part of the time range of the filter
-                        // and the time range of the split are added to the list as search targets.
-                        if split_time_range.contains(&filter_time_range.start)
-                            || split_time_range.contains(&filter_time_range.end)
-                            || filter_time_range.contains(&split_time_range.start)
-                            || filter_time_range.contains(&split_time_range.end)
-                        {
-                            splits.push(split_metadata.clone());
-                        }
+            let match_filter_time_range =
+                match (time_range_opt.as_ref(), split_metadata.time_range.as_ref()) {
+                    (Some(filter_time_range), Some(split_time_range)) => {
+                        !is_disjoint(split_time_range, filter_time_range)
                     }
-                }
-                None => {
-                    // if `time_range` is omitted, the metadata is not filtered.
-                    splits.push(split_metadata.clone());
-                }
+                    (None, _) => true, //< if `time_range` is omitted, the metadata is not filtered.
+                    _ => false, //< we could log an error. a time filter was provided, but the split has no timestamp.
+                };
+            if match_filter_time_range {
+                splits.push(split_metadata.clone());
             }
         }
 
@@ -359,6 +376,10 @@ impl Metastore for SingleFileMetastore {
 
 #[cfg(test)]
 mod tests {
+
+
+    // TODO add unit test, testing what happens when the storage returns an error.
+
     use std::ops::Range;
 
     use quickwit_doc_mapping::DocMapping;
@@ -543,6 +564,55 @@ mod tests {
                 .kind();
             let expected = MetastoreErrorKind::IndexDoesNotExist;
             assert_eq!(result, expected);
+        }
+    }
+
+    // TODO fixme. The internal state must act as a cache of the S3 save state.
+    // in the current implementation we never load the data
+    #[tokio::test]
+    async fn test_index_and_list() {
+        let resolver = StorageUriResolver::default();
+        let storage = resolver.resolve("ram://").unwrap();
+        let index_uri = IndexUri::from("ram://test/index");
+
+        {
+            let metastore = SingleFileMetastore::new(storage.clone()).await.unwrap();
+            // create index
+            metastore
+                .create_index(index_uri.clone(), DocMapping::Dynamic)
+                .await
+                .unwrap();
+            // stage split
+            let split_id_1 = "one".to_string();
+            let split_metadata_1 = SplitMetadata {
+                split_id: "one".to_string(),
+                split_state: SplitState::Staged,
+                num_records: 1,
+                size_in_bytes: 2,
+                time_range: Some(Range { start: 0, end: 100 }),
+                generation: 3,
+            };
+           metastore
+                .stage_split(index_uri.clone(), split_id_1.clone(), split_metadata_1)
+                .await
+                .unwrap();
+        }
+        {
+            let metastore = SingleFileMetastore::new(storage).await.unwrap();
+            // list
+            let range = Some(Range { start: 0, end: 99 });
+            let splits = metastore
+                .list_splits(index_uri.clone(), SplitState::Staged, range)
+                .await
+                .unwrap();
+            let mut split_id_vec = Vec::new();
+            for split_metadata in splits {
+                split_id_vec.push(split_metadata.split_id);
+            }
+            assert_eq!(split_id_vec.contains(&"one".to_string()), true);
+            assert_eq!(split_id_vec.contains(&"two".to_string()), false);
+            assert_eq!(split_id_vec.contains(&"three".to_string()), false);
+            assert_eq!(split_id_vec.contains(&"four".to_string()), false);
         }
     }
 

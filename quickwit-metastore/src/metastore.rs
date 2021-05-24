@@ -89,6 +89,11 @@ pub struct MetadataSet {
 #[async_trait]
 pub trait Metastore: Send + Sync + 'static {
     /// Creates an index.
+    ///
+    /// TODO document what happens if an index already exists.
+    /// TODO ideally add a test suite that takes any trait implementation for this kind of
+    /// specification. It is very easy to end up with implementation that have different beahvior on that
+    /// of edge case. (You can check `Storage` or tantivy `Directory` for an example.)
     async fn create_index(
         &self,
         index_uri: IndexUri,
