@@ -48,3 +48,5 @@ path = '../quickwit-storage'
 [dev-dependencies]
 serde_json = "1"
 assert-json-diff = "2"
+serde = { version = "1.0", features = ["derive"] }
+typetag = "0.1"

@@ -370,8 +370,10 @@ pub fn make_collector(
 
 #[cfg(test)]
 mod tests {
-    use crate::collector::top_k_partial_hits;
+    use crate::collector::{extract_fast_field_names, top_k_partial_hits};
+    use quickwit_doc_mapping::{DocMapper, DocParsingError, QueryParserError, SortBy, SortOrder};
     use quickwit_proto::PartialHit;
+    use serde::{Deserialize, Serialize};
 
     use super::PartialHitHeapItem;
     use std::cmp::Ordering;
@@ -422,5 +424,69 @@ mod tests {
             ),
             vec![make_hit_given_split_id(1), make_hit_given_split_id(2)]
         );
+    }
+
+    #[test]
+    fn test_extract_fast_field_names() {
+        //TODO: replace this with a better mocked implementation (mockall)
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        struct TestMapper {
+            is_same_field: bool,
+            no_timestamp: bool,
+        }
+        #[typetag::serde(name = "test_mapper")]
+        impl DocMapper for TestMapper {
+            fn doc_from_json(&self, _doc_json: &str) -> Result<tantivy::Document, DocParsingError> {
+                todo!()
+            }
+            fn schema(&self) -> tantivy::schema::Schema {
+                todo!()
+            }
+            fn query(
+                &self,
+                _request: &quickwit_proto::SearchRequest,
+            ) -> Result<Box<dyn tantivy::query::Query>, QueryParserError> {
+                todo!()
+            }
+            fn default_sort_by(&self) -> SortBy {
+                SortBy::SortByFastField {
+                    field_name: "ts".to_string(),
+                    order: SortOrder::Asc,
+                }
+            }
+            fn timestamp_field(&self) -> Option<tantivy::schema::Field> {
+                None
+            }
+            fn timestamp_field_name(&self) -> Option<String> {
+                if self.no_timestamp {
+                    return None;
+                }
+                if self.is_same_field {
+                    return Some("ts".to_string());
+                }
+                Some("date".to_string())
+            }
+        }
+
+        let mapper = TestMapper {
+            is_same_field: false,
+            no_timestamp: false,
+        };
+        assert_eq!(
+            extract_fast_field_names(&mapper),
+            vec!["date".to_string(), "ts".to_string()]
+        );
+
+        let mapper = TestMapper {
+            is_same_field: true,
+            no_timestamp: false,
+        };
+        assert_eq!(extract_fast_field_names(&mapper), vec!["ts".to_string()]);
+
+        let mapper = TestMapper {
+            is_same_field: false,
+            no_timestamp: true,
+        };
+        assert_eq!(extract_fast_field_names(&mapper), vec!["ts".to_string()]);
     }
 }
