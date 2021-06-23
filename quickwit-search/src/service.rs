@@ -33,6 +33,7 @@ use crate::{single_node_search, SearchError};
 #[derive(Clone)]
 /// The search service implementation.
 pub struct SearchServiceImpl {
+    // TODO add the search pool in the search service impl
     metastore_router: HashMap<String, Arc<dyn Metastore>>,
     storage_resolver: StorageUriResolver,
 }
@@ -89,7 +90,12 @@ impl SearchService for SearchServiceImpl {
         &self,
         search_request: SearchRequest,
     ) -> Result<SearchResult, SearchError> {
-        // TODO have distributed search.
+        // TODO(minoru) have distributed search when there are more than one
+        // server in the server pool
+        //
+        // We want the fetch_doc phase to be sent to the same split that
+        // emitted the docs in order to be almost sure that the split
+        // hotcache in its cache.
         let metastore = self
             .metastore_router
             .get(&search_request.index_id)
@@ -111,9 +117,13 @@ impl SearchService for SearchServiceImpl {
         _request: LeafSearchRequest,
     ) -> Result<LeafSearchResult, SearchError> {
         todo!()
+        // TODO(minoru) plug crate::leaf_search with the right arguments.
+        // (see single_node_search to check how it is done.)
     }
 
     async fn fetch_docs(&self, _request: FetchDocsRequest) -> Result<FetchDocsResult, SearchError> {
+        // TODO(minoru) plug crate::fetch_docs with the right arguments.
+        // (see single_node_search to check how it is done.)
         todo!()
     }
 }

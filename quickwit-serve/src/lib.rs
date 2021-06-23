@@ -255,5 +255,8 @@ pub async fn serve_cli(args: ServeArgs) -> anyhow::Result<()> {
     let rest_routes = rest::search_handler(Arc::new(search_service_impl));
     display_help_message(args.rest_socket_addr, &example_index_name)?;
     warp::serve(rest_routes).run(args.rest_socket_addr).await;
+    // add the the tonic grpc server
+    // add the cluster server
+    // and run all of those together
     Ok(())
 }
