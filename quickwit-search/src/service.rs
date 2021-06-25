@@ -18,9 +18,11 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+
 use quickwit_metastore::Metastore;
 use quickwit_proto::{
     FetchDocsRequest, FetchDocsResult, LeafSearchRequest, LeafSearchResult, SearchRequest,
@@ -28,14 +30,20 @@ use quickwit_proto::{
 };
 use quickwit_storage::StorageUriResolver;
 
-use crate::{single_node_search, SearchError};
+use crate::fetch_docs;
+use crate::leaf_search;
+use crate::list_relevant_splits;
+use crate::make_collector;
+use crate::root_search;
+use crate::SearchClientPool;
+use crate::SearchError;
 
 #[derive(Clone)]
 /// The search service implementation.
 pub struct SearchServiceImpl {
-    // TODO add the search pool in the search service impl
     metastore_router: HashMap<String, Arc<dyn Metastore>>,
     storage_resolver: StorageUriResolver,
+    client_pool: Arc<SearchClientPool>,
 }
 
 /// Trait representing a search service.
@@ -76,10 +84,12 @@ impl SearchServiceImpl {
     pub fn new(
         metastore_router: HashMap<String, Arc<dyn Metastore>>,
         storage_resolver: StorageUriResolver,
+        client_pool: Arc<SearchClientPool>,
     ) -> Self {
         SearchServiceImpl {
             metastore_router,
             storage_resolver,
+            client_pool,
         }
     }
 }
@@ -90,12 +100,6 @@ impl SearchService for SearchServiceImpl {
         &self,
         search_request: SearchRequest,
     ) -> Result<SearchResult, SearchError> {
-        // TODO(minoru) have distributed search when there are more than one
-        // server in the server pool
-        //
-        // We want the fetch_doc phase to be sent to the same split that
-        // emitted the docs in order to be almost sure that the split
-        // hotcache in its cache.
         let metastore = self
             .metastore_router
             .get(&search_request.index_id)
@@ -103,27 +107,58 @@ impl SearchService for SearchServiceImpl {
             .ok_or_else(|| SearchError::IndexDoesNotExist {
                 index_id: search_request.index_id.clone(),
             })?;
-        let search_result = single_node_search(
-            &search_request,
-            metastore.as_ref(),
-            self.storage_resolver.clone(),
-        )
-        .await?;
+
+        let search_result =
+            root_search(&search_request, metastore.as_ref(), &self.client_pool).await?;
+
         Ok(search_result)
     }
 
     async fn leaf_search(
         &self,
-        _request: LeafSearchRequest,
+        leaf_search_request: LeafSearchRequest,
     ) -> Result<LeafSearchResult, SearchError> {
-        todo!()
-        // TODO(minoru) plug crate::leaf_search with the right arguments.
-        // (see single_node_search to check how it is done.)
+        let search_request = leaf_search_request
+            .search_request
+            .ok_or_else(|| SearchError::InternalError(anyhow::anyhow!("No search request.")))?;
+        let metastore = self
+            .metastore_router
+            .get(&search_request.index_id)
+            .cloned()
+            .ok_or_else(|| SearchError::IndexDoesNotExist {
+                index_id: search_request.index_id.clone(),
+            })?;
+        let index_metadata = metastore.index_metadata(&search_request.index_id).await?;
+        let storage = self.storage_resolver.resolve(&index_metadata.index_uri)?;
+        let split_metas = list_relevant_splits(&search_request, metastore.as_ref()).await?;
+        let doc_mapper = index_metadata.doc_mapper;
+        let query = doc_mapper.query(&search_request)?;
+        let collector = make_collector(doc_mapper.as_ref(), &search_request);
+
+        let leaf_search_result =
+            leaf_search(query.as_ref(), collector, &split_metas[..], storage.clone()).await?;
+
+        Ok(leaf_search_result)
     }
 
-    async fn fetch_docs(&self, _request: FetchDocsRequest) -> Result<FetchDocsResult, SearchError> {
-        // TODO(minoru) plug crate::fetch_docs with the right arguments.
-        // (see single_node_search to check how it is done.)
-        todo!()
+    async fn fetch_docs(
+        &self,
+        fetch_docs_request: FetchDocsRequest,
+    ) -> Result<FetchDocsResult, SearchError> {
+        let index_id = fetch_docs_request.index_id;
+        let metastore = self
+            .metastore_router
+            .get(&index_id)
+            .cloned()
+            .ok_or_else(|| SearchError::IndexDoesNotExist {
+                index_id: index_id.clone(),
+            })?;
+        let index_metadata = metastore.index_metadata(&index_id).await?;
+        let storage = self.storage_resolver.resolve(&index_metadata.index_uri)?;
+
+        let fetch_docs_result =
+            fetch_docs(fetch_docs_request.partial_hits, storage.clone()).await?;
+
+        Ok(fetch_docs_result)
     }
 }

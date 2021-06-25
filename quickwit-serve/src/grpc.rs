@@ -18,13 +18,30 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-use std::net::SocketAddr;
-use std::path::PathBuf;
 
-#[derive(Debug)]
-pub struct ServeArgs {
-    pub index_uris: Vec<String>,
-    pub rest_socket_addr: SocketAddr,
-    pub host_key_path: PathBuf,
-    pub peer_socket_addrs: Vec<SocketAddr>,
+use std::net::SocketAddr;
+
+use tonic::transport::Server;
+use tracing::*;
+
+use quickwit_proto::cluster_service_server::ClusterServiceServer;
+use quickwit_proto::search_service_server::SearchServiceServer;
+
+use crate::ClusterServiceImpl;
+use crate::GrpcAdapter;
+
+/// Start gRPC service given a gRPC address and a search service and cluster service.
+pub async fn start_grpc_service(
+    grpc_addr: SocketAddr,
+    search_service: GrpcAdapter,
+    cluster_service: ClusterServiceImpl,
+) -> anyhow::Result<()> {
+    info!(grpc_addr=?grpc_addr, "Start gRPC service.");
+    Server::builder()
+        .add_service(ClusterServiceServer::new(cluster_service))
+        .add_service(SearchServiceServer::new(search_service))
+        .serve(grpc_addr)
+        .await?;
+
+    Ok(())
 }

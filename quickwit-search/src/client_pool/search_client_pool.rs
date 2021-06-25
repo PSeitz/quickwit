@@ -36,14 +36,7 @@ use quickwit_proto::search_service_client::SearchServiceClient;
 use crate::client::create_search_service_client;
 use crate::client_pool::{ClientPool, Job};
 use crate::rendezvous_hasher::{sort_by_rendez_vous_hash, Node};
-
-const GRPC_PORT_INC: u16 = 1;
-
-/// Compute the gRPC port from the base port.
-/// Add 1 to the base port to get the gRPC port.
-pub fn get_grpc_addr(listen_addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(listen_addr.ip(), listen_addr.port() + GRPC_PORT_INC)
-}
+use crate::swim_addr_to_grpc_addr;
 
 /// Search client pool implementation.
 #[derive(Clone)]
@@ -79,7 +72,7 @@ impl SearchClientPool {
                 // Create a list of addresses to be removed.
                 let members_addresses: HashSet<SocketAddr> = members
                     .iter()
-                    .map(|member| get_grpc_addr(member.listen_addr))
+                    .map(|member| swim_addr_to_grpc_addr(member.listen_addr))
                     .collect();
                 let addrs_to_remove: Vec<SocketAddr> = clients
                     .keys()
@@ -97,7 +90,7 @@ impl SearchClientPool {
 
                 // Add clients to the client pool.
                 for member in members {
-                    let grpc_addr = get_grpc_addr(member.listen_addr);
+                    let grpc_addr = swim_addr_to_grpc_addr(member.listen_addr);
                     if let Entry::Vacant(_entry) = clients.entry(grpc_addr) {
                         match create_search_service_client(grpc_addr).await {
                             Ok(client) => {

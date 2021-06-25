@@ -1,4 +1,3 @@
-use quickwit_search::SearchError;
 /*
  * Copyright (C) 2021 Quickwit Inc.
  *
@@ -23,6 +22,8 @@ use serde::ser::SerializeMap;
 use thiserror::Error;
 use warp::http;
 use warp::hyper::StatusCode;
+
+use quickwit_search::SearchError;
 
 #[derive(Debug, Error)]
 pub enum ApiError {

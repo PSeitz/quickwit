@@ -36,6 +36,8 @@ pub struct Job {
     pub cost: u32,
 }
 
+/// ClientPool meant to manage Quickwit's clients.
+/// The client pool provides the available clients.
 #[async_trait]
 pub trait ClientPool: Send + Sync + 'static {
     /// Assign the given job to the clients.

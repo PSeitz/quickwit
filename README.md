@@ -14,14 +14,14 @@ Stay tuned.
 ## create the index
 
 ```
-cargo run -- new --index-uri file:///home/fulmicoton/datasets/wikipedia-idx --doc-mapper-type wikipedia
+cargo run -- new --index-uri file:///path/to/indices/wikipedia-idx --doc-mapper-type wikipedia
 ```
 
 ## index the data
 
-cat wiki-1000.json | RUST_LOG=info cargo run -- index --index-uri file:///home/fulmicoton/datasets/wikipedia-idx --heap-size 1000000000 --num-threads 1
+cat wiki-1000.json | RUST_LOG=info cargo run -- index --index-uri file:///path/to/indices/wikipedia-idx --heap-size 1000000000 --num-threads 1
 
 ## start the search server
 
-cargo run -- serve --index-uri 'file:///home/fulmicoton/datasets/wikipedia-idx'
+cargo run -- serve --index-uris file:///path/to/indices/wikipedia-idx
 ```
