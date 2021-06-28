@@ -52,7 +52,9 @@ use quickwit_storage::{
 use quickwit_telemetry::payload::{ServeEvent, TelemetryEvent};
 
 pub use crate::args::ServeArgs;
+pub use crate::error::ApiError;
 use crate::grpc::start_grpc_service;
+use crate::grpc_adapter::GrpcAdapter;
 use crate::rest::start_rest_service;
 
 const FULL_SLICE: Range<usize> = 0..usize::MAX;
@@ -60,9 +62,6 @@ const FULL_SLICE: Range<usize> = 0..usize::MAX;
 /// Hotcache cache capacity is hardcoded to 500 MB.
 /// Once the capacity is reached, a LRU strategy is used.
 const HOTCACHE_CACHE_CAPACITY: usize = 500_000_000;
-
-pub use crate::error::ApiError;
-use crate::grpc_adapter::GrpcAdapter;
 
 async fn get_from_cache_or_create_metastore(
     metastore_cache: &mut HashMap<String, Arc<dyn Metastore>>,
