@@ -23,14 +23,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::*;
 use warp::hyper::StatusCode;
-use warp::reply;
-use warp::Filter;
-use warp::Rejection;
-use warp::Reply;
+use warp::{reply, Filter, Rejection, Reply};
 
-use quickwit_proto as grpc;
 use quickwit_search::{SearchService, SearchServiceImpl};
 
 use crate::ApiError;
@@ -84,8 +80,8 @@ struct SearchResultJson {
     num_microsecs: u64,
 }
 
-impl From<grpc::SearchResult> for SearchResultJson {
-    fn from(search_result: grpc::SearchResult) -> Self {
+impl From<quickwit_proto::SearchResult> for SearchResultJson {
+    fn from(search_result: quickwit_proto::SearchResult) -> Self {
         let hits: Vec<serde_json::Value> = search_result
             .hits
             .into_iter()
@@ -110,7 +106,7 @@ async fn search_endpoint<TSearchService: SearchService>(
     search_request: SearchRequestQueryString,
     search_service: &TSearchService,
 ) -> Result<SearchResultJson, ApiError> {
-    let search_request = grpc::SearchRequest {
+    let search_request = quickwit_proto::SearchRequest {
         index_id,
         query: search_request.query,
         start_timestamp: search_request.start_timestamp,
@@ -290,7 +286,7 @@ mod tests {
         mock_search_service
             .expect_root_search()
             .with(predicate::function(
-                |search_request: &grpc::SearchRequest| {
+                |search_request: &quickwit_proto::SearchRequest| {
                     search_request.start_offset == 5 && search_request.max_hits == 30
                 },
             ))

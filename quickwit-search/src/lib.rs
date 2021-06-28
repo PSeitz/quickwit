@@ -46,14 +46,14 @@ use quickwit_proto::SearchRequest;
 use quickwit_proto::{PartialHit, SearchResult};
 use quickwit_storage::StorageUriResolver;
 
+pub use crate::client_pool::search_client_pool::SearchClientPool;
+pub use crate::client_pool::ClientPool;
 use crate::collector::make_collector;
 pub use crate::error::SearchError;
 use crate::fetch_docs::fetch_docs;
 use crate::leaf::leaf_search;
 use crate::root::root_search;
 pub use crate::service::{MockSearchService, SearchService, SearchServiceImpl};
-pub use client_pool::search_client_pool::SearchClientPool;
-pub use client_pool::ClientPool;
 
 /// Compute the SWIM port from the HTTP port.
 /// Add 1 to the HTTP port to get the SWIM port.
