@@ -67,8 +67,13 @@ impl ProtoSearchService for GrpcSearchServiceImpl {
 
     async fn leaf_search(
         &self,
+<<<<<<< HEAD
         request: tonic::Request<quickwit_proto::LeafSearchRequest>,
     ) -> Result<tonic::Response<quickwit_proto::LeafSearchResult>, tonic::Status> {
+=======
+        request: tonic::Request<LeafSearchRequest>,
+    ) -> Result<tonic::Response<LeafSearchResult>, tonic::Status> {
+>>>>>>> Implement gRPC service
         let leaf_search_request = request.into_inner();
         let leaf_search_result = self
             .0
@@ -80,8 +85,13 @@ impl ProtoSearchService for GrpcSearchServiceImpl {
 
     async fn fetch_docs(
         &self,
+<<<<<<< HEAD
         request: tonic::Request<quickwit_proto::FetchDocsRequest>,
     ) -> Result<tonic::Response<quickwit_proto::FetchDocsResult>, tonic::Status> {
+=======
+        request: tonic::Request<FetchDocsRequest>,
+    ) -> Result<tonic::Response<FetchDocsResult>, tonic::Status> {
+>>>>>>> Implement gRPC service
         let fetch_docs_request = request.into_inner();
         let fetch_docs_result = self
             .0
