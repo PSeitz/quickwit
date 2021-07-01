@@ -53,3 +53,6 @@ path = '../quickwit-storage'
 [dev-dependencies]
 serde_json = "1"
 assert-json-diff = "2"
+
+[dev-dependencies.quickwit-proto]
+path = '../quickwit-proto'
