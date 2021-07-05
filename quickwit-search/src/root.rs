@@ -346,11 +346,7 @@ mod tests {
         let merged_partial_hits = merge_partial_hits(partial_hits1, partial_hits2);
 
         assert_eq!(
-<<<<<<< HEAD
             merged_partial_hits,
-=======
-            marged_partial_hits,
->>>>>>> Keep the grpc:: or quickwit_proto:: in front of protobuf generated struct.
             vec![p1, p6, p2, p7, p3, p8, p4, p9, p5, p10]
         );
     }
