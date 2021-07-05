@@ -24,12 +24,8 @@ cat wiki-1000.json | RUST_LOG=info cargo run -- index --index-uri file:///path/t
 
 ## start the search server
 
-<<<<<<< HEAD
-cargo run -- serve --index-uris file:///path/to/indices/wikipedia-idx
-=======
 ```
-cargo run -- serve --index-uri file:///path/to/indices/wikipedia-idx
->>>>>>> Add gRPC server.
+cargo run -- serve --index-uris file:///path/to/indices/wikipedia-idx
 ```
 
 ## show cluster members
