@@ -140,7 +140,7 @@ pub async fn root_search(
 
     // Perform the query phese.
     let mut leaf_search_handles: Vec<JoinHandle<anyhow::Result<LeafSearchResult>>> = Vec::new();
-    for (addr, jobs) in assigned_leaf_search_jobs {
+    for (addr, jobs) in assigned_leaf_search_jobs.iter() {
         let mut search_client = if let Some(client) = clients.get(&addr) {
             client.clone()
         } else {
@@ -193,23 +193,9 @@ pub async fn root_search(
             .push(partial_hit.clone());
     }
 
-    // Create a job for fetching docs and assign the splits that the node is responsible for based on the job.
-    let fetch_docs_jobs: Vec<Job> = partial_hits_map
-        .keys()
-        .map(|split| {
-            // TODO: Change to a better way that does not use unwrap().
-            let split_metadata = split_metadata_map.get(split).unwrap();
-            Job {
-                split: split.clone(),
-                cost: compute_split_cost(split_metadata),
-            }
-        })
-        .collect();
-    let assigned_fetch_docs_jobs = client_pool.assign_jobs(fetch_docs_jobs).await?;
-
     // Perform the fetch docs phese.
     let mut fetch_docs_handles: Vec<JoinHandle<anyhow::Result<FetchDocsResult>>> = Vec::new();
-    for (addr, jobs) in assigned_fetch_docs_jobs {
+    for (addr, jobs) in assigned_leaf_search_jobs.iter() {
         for job in jobs {
             let mut search_client = if let Some(client) = clients.get(&addr) {
                 client.clone()
