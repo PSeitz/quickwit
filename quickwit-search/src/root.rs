@@ -19,6 +19,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,55 +48,60 @@ fn compute_split_cost(_split_metadata: &SplitMetadata) -> u32 {
 }
 
 /// Merges two partial hits that have already been sorted.
-fn merge_partial_hits(
-    partial_hits1: Vec<PartialHit>,
-    partial_hits2: Vec<PartialHit>,
-) -> Vec<PartialHit> {
-    let mut merged_partial_hits = Vec::new();
+fn merge_hits(hits1: &[Hit], hits2: &[Hit]) -> anyhow::Result<Vec<Hit>> {
+    let mut merged_hits: Vec<Hit> = Vec::new();
 
     let mut index1 = 0;
     let mut index2 = 0;
 
     loop {
-        if index1 < partial_hits1.len() && index2 < partial_hits2.len() {
-            let value1 = partial_hits1.get(index1).unwrap().clone();
-            let value2 = partial_hits2.get(index2).unwrap().clone();
+        match (index1.cmp(&hits1.len()), index2.cmp(&hits2.len())) {
+            (Ordering::Less, Ordering::Less) => {
+                let hit1 = hits1.get(index1).unwrap();
+                let hit2 = hits2.get(index2).unwrap();
 
-            // Sort by descending order.
-            if value1.sorting_field_value > value2.sorting_field_value {
-                merged_partial_hits.push(value1);
-                index1 += 1;
-            } else if value1.sorting_field_value < value2.sorting_field_value {
-                merged_partial_hits.push(value2);
-                index2 += 1;
-            } else {
-                merged_partial_hits.push(value1);
-                index1 += 1;
-                merged_partial_hits.push(value2);
-                index2 += 1;
+                let partial_hit1 = hit1.partial_hit.as_ref().unwrap();
+                let partial_hit2 = hit2.partial_hit.as_ref().unwrap();
+
+                // Sort by descending order.
+                match  partial_hit1.sorting_field_value.cmp(&partial_hit2.sorting_field_value) {
+                    Ordering::Greater => {
+                        merged_hits.push(hit1.clone());
+                        index1 += 1;
+                    }
+                    Ordering::Less => {
+                        merged_hits.push(hit2.clone());
+                        index2 += 1;
+                    }
+                    Ordering::Equal => {
+                        merged_hits.push(hit1.clone());
+                        index1 += 1;
+                        merged_hits.push(hit2.clone());
+                        index2 += 1;
+                    }
+                }
             }
-        } else if index1 < partial_hits1.len() {
-            let remaining = partial_hits1
-                .as_slice()
-                .get(index1..partial_hits1.len())
-                .unwrap_or(&Vec::new())
-                .to_vec();
-            merged_partial_hits.extend(remaining);
-            break;
-        } else if index2 < partial_hits2.len() {
-            let remaining = partial_hits2
-                .as_slice()
-                .get(index2..partial_hits2.len())
-                .unwrap_or(&Vec::new())
-                .to_vec();
-            merged_partial_hits.extend(remaining);
-            break;
-        } else {
-            break;
-        }
+            (Ordering::Less, _) => {
+                let remaining = hits1
+                    .get(index1..hits1.len())
+                    .unwrap_or(&Vec::new())
+                    .to_vec();
+                merged_hits.extend(remaining);
+                break;
+            }
+            (_, Ordering::Less) => {
+                let remaining = hits2
+                    .get(index2..hits2.len())
+                    .unwrap_or(&Vec::new())
+                    .to_vec();
+                merged_hits.extend(remaining);
+                break;
+            }
+            _ => break,
+        };
     }
 
-    merged_partial_hits
+    Ok(merged_hits)
 }
 
 /// Perform a distributed search.
@@ -227,7 +233,7 @@ pub async fn root_search(
     for response in fetch_docs_responses {
         match response {
             Ok(fetch_docs_result) => {
-                hits.extend(fetch_docs_result.hits);
+                hits = merge_hits(&hits, &fetch_docs_result.hits)?;
             }
             Err(err) => error!(err=?err),
         }
@@ -244,82 +250,124 @@ pub async fn root_search(
 
 #[cfg(test)]
 mod tests {
+    use quickwit_proto::Hit;
     use quickwit_proto::PartialHit;
 
-    use crate::root::merge_partial_hits;
+    use crate::root::merge_hits;
 
     #[test]
-    fn test_root_merge_partial_hits() {
-        let p1 = PartialHit {
-            sorting_field_value: 9,
-            split: "split1".to_string(),
-            segment_ord: 1,
-            doc_id: 1,
+    fn test_root_merge_hits() {
+        let hit1 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 9,
+                split: "split1".to_string(),
+                segment_ord: 1,
+                doc_id: 1,
+            }),
         };
-        let p2 = PartialHit {
-            sorting_field_value: 7,
-            split: "split1".to_string(),
-            segment_ord: 2,
-            doc_id: 2,
+        let hit2 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 7,
+                split: "split1".to_string(),
+                segment_ord: 2,
+                doc_id: 2,
+            }),
         };
-        let p3 = PartialHit {
-            sorting_field_value: 5,
-            split: "split1".to_string(),
-            segment_ord: 3,
-            doc_id: 3,
+        let hit3 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 5,
+                split: "split1".to_string(),
+                segment_ord: 3,
+                doc_id: 3,
+            }),
         };
-        let p4 = PartialHit {
-            sorting_field_value: 3,
-            split: "split1".to_string(),
-            segment_ord: 4,
-            doc_id: 4,
+        let hit4 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 3,
+                split: "split1".to_string(),
+                segment_ord: 4,
+                doc_id: 4,
+            }),
         };
-        let p5 = PartialHit {
-            sorting_field_value: 1,
-            split: "split1".to_string(),
-            segment_ord: 5,
-            doc_id: 5,
+        let hit5 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 1,
+                split: "split1".to_string(),
+                segment_ord: 5,
+                doc_id: 5,
+            }),
+        };
+        let hit6 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 8,
+                split: "split2".to_string(),
+                segment_ord: 6,
+                doc_id: 6,
+            }),
+        };
+        let hit7 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 6,
+                split: "split2".to_string(),
+                segment_ord: 7,
+                doc_id: 7,
+            }),
+        };
+        let hit8 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 4,
+                split: "split2".to_string(),
+                segment_ord: 8,
+                doc_id: 8,
+            }),
+        };
+        let hit9 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 2,
+                split: "split2".to_string(),
+                segment_ord: 9,
+                doc_id: 9,
+            }),
+        };
+        let hit10 = Hit {
+            json: "{}".to_string(),
+            partial_hit: Some(PartialHit {
+                sorting_field_value: 0,
+                split: "split2".to_string(),
+                segment_ord: 10,
+                doc_id: 10,
+            }),
         };
 
-        let p6 = PartialHit {
-            sorting_field_value: 8,
-            split: "split2".to_string(),
-            segment_ord: 6,
-            doc_id: 6,
-        };
-        let p7 = PartialHit {
-            sorting_field_value: 6,
-            split: "split2".to_string(),
-            segment_ord: 7,
-            doc_id: 7,
-        };
-        let p8 = PartialHit {
-            sorting_field_value: 4,
-            split: "split2".to_string(),
-            segment_ord: 8,
-            doc_id: 8,
-        };
-        let p9 = PartialHit {
-            sorting_field_value: 2,
-            split: "split2".to_string(),
-            segment_ord: 9,
-            doc_id: 9,
-        };
-        let p10 = PartialHit {
-            sorting_field_value: 0,
-            split: "split2".to_string(),
-            segment_ord: 10,
-            doc_id: 10,
-        };
+        let hits1 = vec![
+            hit1.clone(),
+            hit2.clone(),
+            hit3.clone(),
+            hit4.clone(),
+            hit5.clone(),
+        ];
+        let hits2 = vec![
+            hit6.clone(),
+            hit7.clone(),
+            hit8.clone(),
+            hit9.clone(),
+            hit10.clone(),
+        ];
 
-        let partial_hits1 = vec![p1.clone(), p2.clone(), p3.clone(), p4.clone(), p5.clone()];
-        let partial_hits2 = vec![p6.clone(), p7.clone(), p8.clone(), p9.clone(), p10.clone()];
-
-        let merged_partial_hits = merge_partial_hits(partial_hits1, partial_hits2);
+        let merged_hits = merge_hits(&hits1, &hits2).unwrap();
 
         assert_eq!(
-            merged_partial_hits,
-            vec![p1, p6, p2, p7, p3, p8, p4, p9, p5, p10]
+            merged_hits,
+            vec![hit1, hit6, hit2, hit7, hit3, hit8, hit4, hit9, hit5, hit10]
         );
     }
 }
