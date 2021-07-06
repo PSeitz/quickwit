@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::task::JoinHandle;
 use tracing::*;
 
@@ -30,9 +31,12 @@ use quickwit_proto::{
     FetchDocsRequest, FetchDocsResult, Hit, LeafSearchRequest, LeafSearchResult, PartialHit,
     SearchRequest, SearchResult,
 };
+use tantivy::collector::Collector;
+use tokio::task::spawn_blocking;
 
 use crate::client_pool::Job;
 use crate::list_relevant_splits;
+use crate::make_collector;
 use crate::ClientPool;
 use crate::SearchClientPool;
 
@@ -164,39 +168,21 @@ pub async fn root_search(
     }
     let leaf_search_responses = futures::future::try_join_all(leaf_search_handles).await?;
 
+    let index_metadata = metastore.index_metadata(&search_request.index_id).await?;
+    let doc_mapper = index_metadata.doc_mapper;
+    let collector = make_collector(doc_mapper.as_ref(), search_request);
+
     // Find the sum of the number of hits and merge multiple partial hits into a single partial hits.
-    let mut num_hits = 0;
-    let mut partial_hits = Vec::new();
-    for response in leaf_search_responses {
-        match response {
-            Ok(leaf_search_result) => {
-                num_hits += leaf_search_result.num_hits;
-                partial_hits = merge_partial_hits(partial_hits, leaf_search_result.partial_hits);
-            }
+    let mut leaf_search_results = Vec::new();
+    for leaf_search_response in leaf_search_responses {
+        match leaf_search_response {
+            Ok(leaf_search_result) => leaf_search_results.push(leaf_search_result),
             Err(err) => error!(err=?err),
         }
     }
-    // Extract the leaf search results for the range specified in the original search request.
-    let start_offset = if search_request.start_offset > partial_hits.len() as u64 {
-        partial_hits.len() as u64
-    } else {
-        search_request.start_offset
-    };
-    let end_offset = if start_offset + search_request.max_hits > partial_hits.len() as u64 {
-        partial_hits.len() as u64
-    } else {
-        start_offset + search_request.max_hits
-    };
-    partial_hits = partial_hits
-        .as_slice()
-        .get(start_offset as usize..end_offset as usize)
-        .unwrap_or(&Vec::new())
-        .to_vec();
-    // Make the leaf search results after distributed search.
-    let leaf_search_result = LeafSearchResult {
-        num_hits,
-        partial_hits,
-    };
+    let leaf_search_result = spawn_blocking(move || collector.merge_fruits(leaf_search_results))
+        .await
+        .with_context(|| "Failed to merge leaf search results.")??;
 
     // Create a hash map of PartialHit with split as a key.
     let mut partial_hits_map: HashMap<String, Vec<PartialHit>> = HashMap::new();
