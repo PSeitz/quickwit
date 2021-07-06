@@ -64,7 +64,10 @@ fn merge_hits(hits1: &[Hit], hits2: &[Hit]) -> anyhow::Result<Vec<Hit>> {
                 let partial_hit2 = hit2.partial_hit.as_ref().unwrap();
 
                 // Sort by descending order.
-                match  partial_hit1.sorting_field_value.cmp(&partial_hit2.sorting_field_value) {
+                match partial_hit1
+                    .sorting_field_value
+                    .cmp(&partial_hit2.sorting_field_value)
+                {
                     Ordering::Greater => {
                         merged_hits.push(hit1.clone());
                         index1 += 1;
