@@ -259,7 +259,7 @@ mod tests {
     async fn test_rest_search_api_route_serialize_with_results() -> anyhow::Result<()> {
         let mut mock_search_service = MockSearchService::new();
         mock_search_service.expect_root_search().returning(|_| {
-            Ok(grpc::SearchResult {
+            Ok(quickwit_proto::SearchResult {
                 hits: Vec::new(),
                 num_hits: 10,
                 elapsed_time_micros: 16,
