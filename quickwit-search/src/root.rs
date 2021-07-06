@@ -237,7 +237,7 @@ pub async fn root_search(
 
     Ok(SearchResult {
         num_hits: leaf_search_result.num_hits,
-        hits: hits,
+        hits,
         elapsed_time_micros: elapsed.as_micros() as u64,
     })
 }

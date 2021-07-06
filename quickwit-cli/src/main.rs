@@ -233,13 +233,10 @@ impl CliCommand {
         .to_path_buf();
         let mut peer_socket_addrs: Vec<SocketAddr> = Vec::new();
         if matches.is_present("peer-seeds") {
-            match matches.values_of("peer-seeds") {
-                Some(values) => {
-                    for value in values {
-                        peer_socket_addrs.push(to_socket_addr(value)?);
-                    }
+            if let Some(values) = matches.values_of("peer-seeds") {
+                for value in values {
+                    peer_socket_addrs.push(to_socket_addr(value)?);
                 }
-                None => (),
             }
         }
 
