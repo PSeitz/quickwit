@@ -41,6 +41,7 @@ use doc_mapper::{
 };
 pub use doc_mapping::{DocMapping, Mode, ModeType};
 pub use error::{DocParsingError, QueryParserError};
+pub use query_builder::PredicateCacheContext;
 use quickwit_common::shared_consts::FIELD_PRESENCE_FIELD_NAME;
 use quickwit_proto::types::DocMappingUid;
 #[cfg(feature = "metrics")]

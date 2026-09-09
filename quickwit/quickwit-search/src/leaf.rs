@@ -30,7 +30,9 @@ use quickwit_common::pretty::PrettySample;
 use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
-use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
+use quickwit_doc_mapper::{
+    Automaton, DocMapper, FastFieldWarmupInfo, PredicateCacheContext, TermRange, WarmupInfo,
+};
 use quickwit_metrics::{GaugeGuard, HistogramTimer};
 use quickwit_proto::search::lambda_single_split_result::Outcome;
 use quickwit_proto::search::{
@@ -39,8 +41,7 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
-    BoolQuery, CacheNode, HitSet, PredicateCache, QueryAst, QueryAstTransformer, RangeQuery,
-    TermQuery,
+    BoolQuery, HitSet, PredicateCache, QueryAst, QueryAstTransformer, RangeQuery, TermQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_storage::{
@@ -635,7 +636,8 @@ fn compute_index_size(hot_directory: &HotDirectory) -> ByteSize {
 ///
 /// The key is the field id followed by the hex of the term's serialized value bytes
 /// (which for a JSON field already encode the path and type) — together a unique
-/// identifier of the term. It never collides with the whole-query keys the [`CacheNode`]
+/// identifier of the term. It never collides with the whole-query keys the
+/// [`CacheNode`](quickwit_query::query_ast::CacheNode)
 /// positive cache stores in the same instance: those are serialized query ASTs that
 /// start with `{`, never a hex field id.
 pub(crate) fn term_absence_cache_key(term: &Term) -> String {
@@ -729,21 +731,22 @@ async fn leaf_search_single_split(
         agg_context_params,
     )?;
 
-    let predicate_cache = if collector.requires_scoring() {
+    let predicate_cache_context = if collector.requires_scoring() {
         // at the moment the predicate cache doesn't support scoring
         None
     } else {
-        Some((
-            ctx.searcher_context.predicate_cache.clone() as _,
-            split.split_id.clone(),
-        ))
+        Some(PredicateCacheContext {
+            cache: ctx.searcher_context.predicate_cache.clone(),
+            split_id: split.split_id.clone(),
+            cache_whole_query: search_request.search_after.is_some(),
+        })
     };
     let split_schema = index.schema();
     let (query, mut warmup_info) = ctx.doc_mapper.query(
         split_schema.clone(),
         query_ast.clone(),
         false,
-        predicate_cache,
+        predicate_cache_context,
     )?;
 
     let collector_warmup_info = collector.warmup_info();
@@ -986,20 +989,6 @@ fn rewrite_request(
         remove_redundant_timestamp_range(search_request, split, timestamp_field);
     }
     rewrite_aggregation(search_request);
-    // we add a top level cache node when search_after is set, this won't help for this query (which
-    // is the 2nd in its series), but should speedup every other request that comes after
-    if search_request.search_after.is_some() {
-        add_top_cache_node(search_request)
-    }
-}
-
-fn add_top_cache_node(search_request: &mut SearchRequest) {
-    let Ok(query_ast) = serde_json::from_str(search_request.query_ast.as_str()) else {
-        // an error will get raised a bit after anyway
-        return;
-    };
-    let new_ast: QueryAst = CacheNode::new(query_ast).into();
-    search_request.query_ast = serde_json::to_string(&new_ast).unwrap();
 }
 
 /// Rewrite aggregation to make them easier to cache

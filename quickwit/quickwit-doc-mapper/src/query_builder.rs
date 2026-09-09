@@ -18,8 +18,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use quickwit_query::query_ast::{
-    BuildTantivyAstContext, FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery, QueryAst,
-    QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery, WildcardQuery,
+    BuildTantivyAstContext, FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery, PredicateCache,
+    QueryAst, QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_query::{InvalidQuery, find_field_or_hit_dynamic};
@@ -153,15 +153,37 @@ impl<'a, 'f> QueryAstVisitor<'a> for ExistsQueryFastFields<'f> {
     }
 }
 
+/// Predicate-cache settings for building a query against a split.
+pub struct PredicateCacheContext {
+    /// Cache used for query result lookups and fills.
+    pub cache: Arc<dyn PredicateCache>,
+    /// Split whose document IDs the cached results refer to.
+    pub split_id: String,
+    /// Wrap the whole query in a cache node after query rewrites.
+    pub cache_whole_query: bool,
+}
+
 /// Build a `Query` with field resolution & forbidding range clauses.
 pub(crate) fn build_query(
     query_ast: QueryAst,
     context: &BuildTantivyAstContext,
-    cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
+    predicate_cache_context: Option<PredicateCacheContext>,
 ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
     let mut fast_fields: HashSet<FastFieldWarmupInfo> = HashSet::new();
 
-    let query_ast = if let Some((cache, split_id)) = cache_context {
+    // Merge before inserting cache nodes so cache keys, execution and warmup use the same AST.
+    let query_ast = quickwit_query::query_ast::merge_regexes(query_ast, context);
+    let query_ast = if let Some(PredicateCacheContext {
+        cache,
+        split_id,
+        cache_whole_query,
+    }) = predicate_cache_context
+    {
+        let query_ast = if cache_whole_query {
+            quickwit_query::query_ast::CacheNode::new(query_ast).into()
+        } else {
+            query_ast
+        };
         let Ok(query_ast) = quickwit_query::query_ast::PredicateCacheInjector { cache, split_id }
             .transform(query_ast);
         // this transformer isn't supposed to ever remove a node
@@ -385,19 +407,6 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
         Ok(())
     }
 
-    fn visit_wildcard(&mut self, wildcard_query: &'a WildcardQuery) -> Result<(), Self::Err> {
-        let (field, path, regex) =
-            match wildcard_query.to_regex(self.schema, self.tokenizer_manager) {
-                Ok(res) => res,
-                /* the query will be nullified when casting to a tantivy ast */
-                Err(InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
-                Err(e) => return Err(e),
-            };
-
-        self.add_automaton(field, Automaton::Regex(path, regex));
-        Ok(())
-    }
-
     fn visit_regex(&mut self, regex_query: &'a RegexQuery) -> Result<(), Self::Err> {
         let resolved = match regex_query.to_resolved(self.schema, Some(self.tokenizer_manager)) {
             Ok(res) => res,
@@ -431,21 +440,77 @@ fn extract_prefix_term_ranges_and_automaton(
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
     use std::ops::Bound;
 
     use quickwit_common::shared_consts::FIELD_PRESENCE_FIELD_NAME;
     use quickwit_query::query_ast::{
         BuildTantivyAstContext, FullTextMode, FullTextParams, PhrasePrefixQuery, QueryAstVisitor,
-        UserInputQuery, query_ast_from_user_text,
+        RegexQuery, UserInputQuery, query_ast_from_user_text,
     };
     use quickwit_query::{
         BooleanOperand, MatchAllOrNone, create_default_quickwit_tokenizer_manager,
     };
-    use tantivy::Term;
-    use tantivy::schema::{DateOptions, DateTimePrecision, FAST, INDEXED, STORED, Schema, TEXT};
+    use tantivy::collector::DocSetCollector;
+    use tantivy::schema::{
+        DateOptions, DateTimePrecision, FAST, INDEXED, STORED, Schema, TEXT, TextFieldIndexing,
+        TextOptions,
+    };
+    use tantivy::{Index, TantivyDocument, Term};
 
-    use super::{ExtractPrefixTermRanges, build_query};
+    use super::{ExtractPrefixTermRanges, QueryAst, build_query};
     use crate::{DYNAMIC_FIELD_NAME, SOURCE_FIELD_NAME, TermRange};
+
+    #[test]
+    fn test_regex_merge_execution_and_warmup() {
+        let mut builder = Schema::builder();
+        let options = TextOptions::default()
+            .set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw_lowercase"));
+        let field = builder.add_json_field("json", options);
+        let schema = builder.build();
+        let context = BuildTantivyAstContext::for_test(&schema);
+        let index = Index::create_in_ram(schema.clone());
+        index.tokenizers().register(
+            "raw_lowercase",
+            context
+                .tokenizer_manager
+                .get_tokenizer("raw_lowercase")
+                .unwrap(),
+        );
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        let values = serde_json::json!(["foo", "bar", "soup", "ſoup", "other", ["foo", "other"]]);
+        for value in values.as_array().unwrap() {
+            // A matching sibling catches accidental loss of the union's JSON path prefix.
+            let doc = serde_json::json!({"json": {"path": value, "sibling": "foo"}});
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, &doc.to_string()).unwrap())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        for (occur, expected) in [("must", [0, 2, 5]), ("must_not", [1, 3, 4])] {
+            // Preserve the comment boundary, explicit case flag, and wildcard normalization.
+            // Reapplying (?i) to the union would incorrectly match both "bar" and "ſoup".
+            let ast: QueryAst = serde_json::from_value(serde_json::json!({
+                "type": "bool", (occur): [{"type": "bool", "should": [
+                    {"type": "regex", "field": "json.path", "regex": "(?x) f o o # trailing comment"},
+                    {"type": "regex", "field": "json.path", "regex": "(?-i)BAR"},
+                    QueryAst::Regex(RegexQuery::from_wildcard("json.path".to_string(), "S*", false))
+                ]}]
+            })).unwrap();
+            let (query, warmup) = build_query(ast, &context, None).unwrap();
+            let docs: HashSet<_> = searcher
+                .search(&query, &DocSetCollector)
+                .unwrap()
+                .into_iter()
+                .map(|address| address.doc_id)
+                .collect();
+            assert_eq!(docs, HashSet::from(expected), "{occur}");
+            assert_eq!(warmup.automatons_grouped_by_field.len(), 1);
+            assert_eq!(warmup.automatons_grouped_by_field[&field].len(), 1);
+        }
+    }
 
     enum TestExpectation<'a> {
         Err(&'a str),

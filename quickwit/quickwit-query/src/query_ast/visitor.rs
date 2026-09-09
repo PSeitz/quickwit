@@ -18,7 +18,7 @@ use crate::query_ast::field_presence::FieldPresenceQuery;
 use crate::query_ast::user_input_query::UserInputQuery;
 use crate::query_ast::{
     BoolQuery, CacheNode, FullTextQuery, PhrasePrefixQuery, QueryAst, RangeQuery, RegexQuery,
-    TermQuery, TermSetQuery, WildcardQuery,
+    TermQuery, TermSetQuery,
 };
 
 /// Simple trait to implement a Visitor over the QueryAst.
@@ -40,7 +40,6 @@ pub trait QueryAstVisitor<'a> {
             QueryAst::Boost { underlying, boost } => self.visit_boost(underlying, *boost),
             QueryAst::UserInput(user_text_query) => self.visit_user_text(user_text_query),
             QueryAst::FieldPresence(exists) => self.visit_exists(exists),
-            QueryAst::Wildcard(wildcard) => self.visit_wildcard(wildcard),
             QueryAst::Regex(regex) => self.visit_regex(regex),
             QueryAst::Cache(cache_node) => self.visit_cache_node(cache_node),
         }
@@ -106,10 +105,6 @@ pub trait QueryAstVisitor<'a> {
         Ok(())
     }
 
-    fn visit_wildcard(&mut self, _wildcard_query: &'a WildcardQuery) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
     fn visit_regex(&mut self, _regex_query: &'a RegexQuery) -> Result<(), Self::Err> {
         Ok(())
     }
@@ -147,13 +142,20 @@ pub trait QueryAstTransformer {
             QueryAst::Boost { underlying, boost } => self.transform_boost(*underlying, boost),
             QueryAst::UserInput(user_text_query) => self.transform_user_text(user_text_query),
             QueryAst::FieldPresence(exists) => self.transform_exists(exists),
-            QueryAst::Wildcard(wildcard) => self.transform_wildcard(wildcard),
             QueryAst::Regex(regex) => self.transform_regex(regex),
             QueryAst::Cache(cache_node) => self.transform_cache_node(cache_node),
         }
     }
 
-    fn transform_bool(&mut self, mut bool_query: BoolQuery) -> Result<Option<QueryAst>, Self::Err> {
+    fn transform_bool(&mut self, bool_query: BoolQuery) -> Result<Option<QueryAst>, Self::Err> {
+        self.transform_bool_children(bool_query)
+    }
+
+    /// Traverse Boolean children without invoking the `transform_bool` override again.
+    fn transform_bool_children(
+        &mut self,
+        mut bool_query: BoolQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
         bool_query.must = bool_query
             .must
             .into_iter()
@@ -240,13 +242,6 @@ pub trait QueryAstTransformer {
         exists_query: FieldPresenceQuery,
     ) -> Result<Option<QueryAst>, Self::Err> {
         Ok(Some(QueryAst::FieldPresence(exists_query)))
-    }
-
-    fn transform_wildcard(
-        &mut self,
-        wildcard_query: WildcardQuery,
-    ) -> Result<Option<QueryAst>, Self::Err> {
-        Ok(Some(QueryAst::Wildcard(wildcard_query)))
     }
 
     fn transform_regex(&mut self, regex_query: RegexQuery) -> Result<Option<QueryAst>, Self::Err> {

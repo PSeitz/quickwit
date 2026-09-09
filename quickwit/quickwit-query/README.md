@@ -53,5 +53,26 @@ In the body, a user can supply the query using a rich query DSL expressed in JSO
 }
 ```
 
-When the query is passed as an `ESQueryDSL`, it is simply deserialized into a `QueryAST` object. The `QueryAST is` a one-to-one representation of the user input. It is entirely schema-agnostic.
+When the query is passed as an `ESQueryDSL`, it is parsed into a schema-agnostic `QueryAST`.
+Different DSL constructs can produce the same AST node.
+
+## Regex, wildcard, and prefix queries
+
+All three use `RegexQuery` internally. Wildcard/prefix inputs are escaped and converted to regex
+syntax during parsing. They set `normalize_literals` so that literal runs are normalized later,
+when the split's field tokenizer is known. Non-capturing groups preserve the original literal
+boundaries, including escapes, because normalizers can reject long tokens.
+
+Normalization happens before interpreting regex flags. Converted patterns explicitly enable or
+disable case folding, preserving wildcard case behavior rather than inheriting regex queries'
+automatic case folding on lowercasing fields. `lenient` makes a missing field match nothing; it
+does not suppress malformed patterns or non-text-field errors. Both flags default to false.
+
+The merger resolves patterns before combining them and clears `normalize_literals` on its output.
+Query execution and automaton warmup both use the resolved regex.
+
+The internal serialized AST now represents wildcard/prefix inputs as `type: "regex"` with
+`normalize_literals: true`, not `type: "wildcard"`. Root and leaf servers must support this
+representation; it is not compatible with older servers' wildcard handling. The public wildcard
+and prefix query syntax is unchanged.
 

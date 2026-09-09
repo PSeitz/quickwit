@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::NotNaNf32;
 use crate::elastic_query_dsl::one_field_map::OneFieldMap;
 use crate::elastic_query_dsl::{ConvertibleToQueryAst, StringOrStructForSerialization};
-use crate::query_ast::{QueryAst, WildcardQuery as AstWildcardQuery};
+use crate::query_ast::{QueryAst, RegexQuery};
 
 #[derive(Deserialize, Clone, Eq, PartialEq, Debug)]
 #[serde(from = "OneFieldMap<StringOrStructForSerialization<WildcardQueryParams>>")]
@@ -38,11 +38,13 @@ pub struct WildcardQueryParams {
 
 impl ConvertibleToQueryAst for WildcardQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
-        let wildcard_ast: QueryAst = AstWildcardQuery {
-            field: self.field,
-            value: self.params.value,
+        let wildcard_ast: QueryAst = RegexQuery {
             lenient: true,
-            case_insensitive: self.params.case_insensitive,
+            ..RegexQuery::from_wildcard(
+                self.field,
+                &self.params.value,
+                self.params.case_insensitive,
+            )
         }
         .into();
         Ok(wildcard_ast.boost(self.params.boost))
@@ -85,12 +87,13 @@ mod tests {
         let wildcard_query: WildcardQuery = serde_json::from_str(wildcard_query_json).unwrap();
         let query_ast = wildcard_query.convert_to_query_ast().unwrap();
 
-        if let QueryAst::Wildcard(wildcard) = query_ast {
-            assert_eq!(wildcard.field, "user_name");
-            assert_eq!(wildcard.value, "john*");
-            assert!(wildcard.lenient);
+        if let QueryAst::Regex(regex) = query_ast {
+            assert_eq!(regex.field, "user_name");
+            assert_eq!(regex.regex, "(?-i)(?:john).*");
+            assert!(regex.lenient);
+            assert!(regex.normalize_literals);
         } else {
-            panic!("Expected QueryAst::Wildcard");
+            panic!("Expected QueryAst::Regex");
         }
     }
 
@@ -106,16 +109,17 @@ mod tests {
         let query_ast = wildcard_query.convert_to_query_ast().unwrap();
 
         if let QueryAst::Boost { underlying, boost } = query_ast {
-            if let QueryAst::Wildcard(wildcard) = *underlying {
-                assert_eq!(wildcard.field, "user_name");
-                assert_eq!(wildcard.value, "john*");
-                assert!(wildcard.lenient);
+            if let QueryAst::Regex(regex) = *underlying {
+                assert_eq!(regex.field, "user_name");
+                assert_eq!(regex.regex, "(?-i)(?:john).*");
+                assert!(regex.lenient);
+                assert!(regex.normalize_literals);
             } else {
-                panic!("Expected underlying QueryAst::Wildcard");
+                panic!("Expected underlying QueryAst::Regex");
             }
             assert_eq!(boost, NotNaNf32::try_from(2.0).unwrap());
         } else {
-            panic!("Expected QueryAst::Wildcard");
+            panic!("Expected QueryAst::Boost");
         }
     }
 }

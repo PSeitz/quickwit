@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use crate::elastic_query_dsl::one_field_map::OneFieldMap;
 use crate::elastic_query_dsl::{ConvertibleToQueryAst, StringOrStructForSerialization};
-use crate::query_ast::{QueryAst, WildcardQuery as AstWildcardQuery};
+use crate::query_ast::{QueryAst, RegexQuery};
 
 #[derive(Deserialize, Clone, Eq, PartialEq, Debug)]
 #[serde(from = "OneFieldMap<StringOrStructForSerialization<PrefixQueryParams>>")]
@@ -43,11 +43,9 @@ impl ConvertibleToQueryAst for PrefixQuery {
                 .replace("*", r"\*")
                 .replace("?", r"\?")
         );
-        Ok(AstWildcardQuery {
-            field: self.field,
-            value: wildcard,
+        Ok(RegexQuery {
             lenient: true,
-            case_insensitive: self.params.case_insensitive,
+            ..RegexQuery::from_wildcard(self.field, &wildcard, self.params.case_insensitive)
         }
         .into())
     }
@@ -88,12 +86,13 @@ mod tests {
         let prefix_query: PrefixQuery = serde_json::from_str(prefix_query_json).unwrap();
         let query_ast = prefix_query.convert_to_query_ast().unwrap();
 
-        if let QueryAst::Wildcard(prefix) = query_ast {
-            assert_eq!(prefix.field, "user_name");
-            assert_eq!(prefix.value, "john*");
-            assert!(prefix.lenient);
+        if let QueryAst::Regex(regex) = query_ast {
+            assert_eq!(regex.field, "user_name");
+            assert_eq!(regex.regex, "(?-i)(?:john).*");
+            assert!(regex.lenient);
+            assert!(regex.normalize_literals);
         } else {
-            panic!("Expected QueryAst::Prefix, got {:?}", query_ast);
+            panic!("Expected QueryAst::Regex, got {:?}", query_ast);
         }
     }
 
@@ -107,12 +106,13 @@ mod tests {
         let prefix_query: PrefixQuery = serde_json::from_str(prefix_query_json).unwrap();
         let query_ast = prefix_query.convert_to_query_ast().unwrap();
 
-        if let QueryAst::Wildcard(prefix) = query_ast {
-            assert_eq!(prefix.field, "user_name");
-            assert_eq!(prefix.value, r"a\\dm\?n\**");
-            assert!(prefix.lenient);
+        if let QueryAst::Regex(regex) = query_ast {
+            assert_eq!(regex.field, "user_name");
+            assert_eq!(regex.regex, r"(?-i)(?:a)(?:\\)(?:dm)(?:\?)(?:n)(?:\*).*");
+            assert!(regex.lenient);
+            assert!(regex.normalize_literals);
         } else {
-            panic!("Expected QueryAst::Prefix, got {:?}", query_ast);
+            panic!("Expected QueryAst::Regex, got {:?}", query_ast);
         }
     }
 }

@@ -9278,6 +9278,7 @@ dependencies = [
  "quickwit-common",
  "quickwit-datetime",
  "regex",
+ "regex-syntax",
  "rustc-hash",
  "serde",
  "serde_json",
