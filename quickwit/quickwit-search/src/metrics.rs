@@ -159,6 +159,64 @@ fn pseudo_exponential_bytes_buckets() -> Vec<f64> {
     ]
 }
 
+static PREDICATE_CACHE_SPLIT_SEARCHES_TOTAL: LazyCounter = lazy_counter!(
+    name: "predicate_cache_split_searches_total",
+    description: "Split searches checking the predicate cache, by outcome (hit or miss).",
+    subsystem: "search",
+);
+
+static PREDICATE_CACHE_PREDICATES_TOTAL: LazyCounter = lazy_counter!(
+    name: "predicate_cache_predicates_total",
+    description: "Atomic query predicates covered or not covered by the predicate cache.",
+    subsystem: "search",
+);
+
+static VIRTUAL_PREDICATE_CACHE_SPLIT_SEARCHES_TOTAL: LazyCounter = lazy_counter!(
+    name: "virtual_predicate_cache_split_searches_total",
+    description: "Split searches benefiting from each virtual predicate cache.",
+    subsystem: "search",
+);
+
+static VIRTUAL_PREDICATE_CACHE_PREDICATES_TOTAL: LazyCounter = lazy_counter!(
+    name: "virtual_predicate_cache_predicates_total",
+    description: "Atomic predicates covered or not covered by each virtual predicate cache.",
+    subsystem: "search",
+);
+
+pub(crate) fn record_predicate_cache_stats(
+    stats: quickwit_query::query_ast::PredicateCacheStats,
+    term_absence_hit: bool,
+    virtual_cache: Option<&(String, String)>,
+) {
+    // Constant-only queries have no meaningful predicate coverage ratio.
+    if stats.num_predicates == 0 {
+        return;
+    }
+    let outcome = if term_absence_hit || stats.num_cached_predicates > 0 {
+        "hit"
+    } else {
+        "miss"
+    };
+
+    // A known-absent required term avoids evaluating the entire query.
+    let num_cached = if term_absence_hit {
+        stats.num_predicates
+    } else {
+        stats.num_cached_predicates
+    };
+    let num_uncached = stats.num_predicates - num_cached;
+    if let Some((capacity, policy)) = virtual_cache {
+        counter!(parent: VIRTUAL_PREDICATE_CACHE_SPLIT_SEARCHES_TOTAL, "capacity" => capacity.clone(), "policy" => policy.clone(), "outcome" => outcome).inc();
+        counter!(parent: VIRTUAL_PREDICATE_CACHE_PREDICATES_TOTAL, "capacity" => capacity.clone(), "policy" => policy.clone(), "status" => "cached").inc_by(num_cached);
+        counter!(parent: VIRTUAL_PREDICATE_CACHE_PREDICATES_TOTAL, "capacity" => capacity.clone(), "policy" => policy.clone(), "status" => "uncached").inc_by(num_uncached);
+    } else {
+        counter!(parent: PREDICATE_CACHE_SPLIT_SEARCHES_TOTAL, "outcome" => outcome).inc();
+        counter!(parent: PREDICATE_CACHE_PREDICATES_TOTAL, "status" => "cached").inc_by(num_cached);
+        counter!(parent: PREDICATE_CACHE_PREDICATES_TOTAL, "status" => "uncached")
+            .inc_by(num_uncached);
+    }
+}
+
 static SPLIT_SEARCH_OUTCOME: LazyCounter = lazy_counter!(
         name: "split_search_outcome",
         description: "Count the state in which each leaf search split ended. Errors are classified by the error label",
@@ -283,6 +341,48 @@ pub(crate) static SEARCHER_NODE_LOAD: LazyGauge = lazy_gauge!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_virtual_predicate_metrics_cover_term_absence_and_zero_predicates() {
+        use quickwit_query::query_ast::PredicateCacheStats;
+
+        let labels = ("123456789".to_string(), "lru".to_string());
+        let cached = counter!(parent: VIRTUAL_PREDICATE_CACHE_PREDICATES_TOTAL, "capacity" => labels.0.clone(), "policy" => labels.1.clone(), "status" => "cached");
+        let uncached = counter!(parent: VIRTUAL_PREDICATE_CACHE_PREDICATES_TOTAL, "capacity" => labels.0.clone(), "policy" => labels.1.clone(), "status" => "uncached");
+        let hits = counter!(parent: VIRTUAL_PREDICATE_CACHE_SPLIT_SEARCHES_TOTAL, "capacity" => labels.0.clone(), "policy" => labels.1.clone(), "outcome" => "hit");
+        let misses = counter!(parent: VIRTUAL_PREDICATE_CACHE_SPLIT_SEARCHES_TOTAL, "capacity" => labels.0.clone(), "policy" => labels.1.clone(), "outcome" => "miss");
+        let stats = PredicateCacheStats {
+            num_predicates: 3,
+            num_cached_predicates: 1,
+        };
+        record_predicate_cache_stats(stats, false, Some(&labels));
+        assert_eq!(
+            (cached.get(), uncached.get(), hits.get(), misses.get()),
+            (1, 2, 1, 0)
+        );
+        record_predicate_cache_stats(stats, true, Some(&labels));
+        assert_eq!(
+            (cached.get(), uncached.get(), hits.get(), misses.get()),
+            (4, 2, 2, 0)
+        );
+        record_predicate_cache_stats(
+            PredicateCacheStats {
+                num_cached_predicates: 0,
+                ..stats
+            },
+            false,
+            Some(&labels),
+        );
+        assert_eq!(
+            (cached.get(), uncached.get(), hits.get(), misses.get()),
+            (4, 5, 2, 1)
+        );
+        record_predicate_cache_stats(PredicateCacheStats::default(), true, Some(&labels));
+        assert_eq!(
+            (cached.get(), uncached.get(), hits.get(), misses.get()),
+            (4, 5, 2, 1)
+        );
+    }
 
     fn assert_error_label(counter: &Counter, expected_error: &str) {
         let labels: Vec<(&str, &str)> = counter

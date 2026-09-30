@@ -116,6 +116,23 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> MemorySizedCache<K> {
         self.inner.lock().unwrap().get(cache_key)
     }
 
+    /// Looks up the real cache and all virtual caches once, returning virtual
+    /// outcomes in configuration order alongside the real payload.
+    pub fn get_with_virtual_hits<Q>(&self, cache_key: &Q) -> (Option<OwnedBytes>, Vec<bool>)
+    where
+        K: Borrow<Q>,
+        Arc<K>: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut state = self.inner.lock().unwrap();
+        let virtual_hits = state
+            .virtual_caches
+            .iter_mut()
+            .map(|cache| cache.get(cache_key).is_some())
+            .collect();
+        (state.cache.get(cache_key), virtual_hits)
+    }
+
     /// Attempts to put the data in the cache and returns whether it was admitted.
     pub fn put(&self, val: K, bytes: OwnedBytes) -> bool {
         self.inner.lock().unwrap().put(val, bytes)

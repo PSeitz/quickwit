@@ -789,16 +789,58 @@ async fn leaf_search_single_split(
     // required terms can only make it emptier. An empty result is segment- and
     // scoring-agnostic, so this holds even for scored queries (which the `CacheNode`
     // machinery itself does not support).
-    let cached_known_empty = warmup_info.required_terms.iter().any(|term| {
-        match ctx
+    let mut cached_known_empty = false;
+    let mut virtual_known_empty =
+        vec![false; ctx.searcher_context.predicate_cache.num_virtual_caches()];
+    // Check all required terms: each virtual cache may hit a different absent term.
+    // Entries under term_absence_cache_key are only ever populated with empty hit sets.
+    for term in warmup_info
+        .required_terms
+        .union(&warmup_info.virtual_cache_required_terms)
+    {
+        let (entry, virtual_hits) = ctx
             .searcher_context
             .predicate_cache
-            .get(split_id.clone(), term_absence_cache_key(term))
-        {
-            Some((_segment_id, hits)) => hits.is_empty(),
-            None => false,
+            .get_with_virtual_hits(split_id.clone(), term_absence_cache_key(term));
+        if warmup_info.required_terms.contains(term) {
+            cached_known_empty |= entry.is_some_and(|(_, hits)| hits.is_empty());
         }
-    });
+        assert_eq!(virtual_hits.len(), virtual_known_empty.len());
+        for (known_empty, hit) in virtual_known_empty.iter_mut().zip(virtual_hits) {
+            *known_empty |= hit;
+        }
+    }
+    if ctx.searcher_context.predicate_cache.is_enabled() {
+        crate::metrics::record_predicate_cache_stats(
+            warmup_info.predicate_cache_stats,
+            cached_known_empty,
+            None,
+        );
+        // Scored queries do not inject cache nodes, but can still use term absence.
+        assert!(
+            warmup_info.virtual_predicate_cache_stats.is_empty()
+                || warmup_info.virtual_predicate_cache_stats.len() == virtual_known_empty.len()
+        );
+        for (index, known_empty) in virtual_known_empty.into_iter().enumerate() {
+            let stats = if warmup_info.virtual_predicate_cache_stats.is_empty() {
+                quickwit_query::query_ast::PredicateCacheStats {
+                    num_predicates: warmup_info.predicate_cache_stats.num_predicates,
+                    num_cached_predicates: 0,
+                }
+            } else {
+                warmup_info.virtual_predicate_cache_stats[index]
+            };
+            crate::metrics::record_predicate_cache_stats(
+                stats,
+                known_empty,
+                Some(
+                    ctx.searcher_context
+                        .predicate_cache
+                        .virtual_cache_labels(index),
+                ),
+            );
+        }
+    }
     let provably_empty = if cached_known_empty {
         true
     } else {

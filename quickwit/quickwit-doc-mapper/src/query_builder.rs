@@ -146,6 +146,16 @@ pub(crate) fn build_query(
     context: &BuildTantivyAstContext,
     cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
 ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
+    let num_virtual_caches = cache_context
+        .as_ref()
+        .map_or(0, |(cache, _)| cache.num_virtual_caches());
+    // Real-cache substitution can hide required terms inside a cached subtree.
+    // Virtual caches must still be able to hit absence entries for those terms.
+    let virtual_cache_required_terms = if num_virtual_caches > 0 {
+        query_ast.build_tantivy_query_and_required_terms(context)?.1
+    } else {
+        HashSet::new()
+    };
     let query_ast = if let Some((cache, split_id)) = cache_context {
         let Ok(query_ast) = quickwit_query::query_ast::PredicateCacheInjector { cache, split_id }
             .transform(query_ast);
@@ -188,6 +198,17 @@ pub(crate) fn build_query(
     });
 
     let warmup_info = WarmupInfo {
+        virtual_cache_required_terms,
+        virtual_predicate_cache_stats: (0..num_virtual_caches)
+            .map(|index| {
+                quickwit_query::query_ast::PredicateCacheStats::from_virtual_cache(
+                    &query_ast, index,
+                )
+            })
+            .collect(),
+        predicate_cache_stats: quickwit_query::query_ast::PredicateCacheStats::from_query_ast(
+            &query_ast,
+        ),
         term_dict_fields: term_set_query_fields,
         terms_grouped_by_field,
         term_ranges_grouped_by_field,
@@ -435,6 +456,70 @@ mod test {
         WarmupInfo,
     };
 
+    #[test]
+    fn test_virtual_predicate_warmup_preserves_terms_hidden_by_real_hit() {
+        use std::sync::Arc;
+
+        use quickwit_query::query_ast::{HitSet, PredicateCache, PredicateCacheStats, TermQuery};
+        use tantivy::index::SegmentId;
+
+        struct RealHitVirtualMiss;
+        impl PredicateCache for RealHitVirtualMiss {
+            fn get(&self, _: String, _: String) -> Option<(SegmentId, HitSet)> {
+                Some((SegmentId::generate_random(), HitSet::empty()))
+            }
+            fn num_virtual_caches(&self) -> usize {
+                1
+            }
+            fn get_with_virtual_hits(
+                &self,
+                split: String,
+                query: String,
+            ) -> (Option<(SegmentId, HitSet)>, Vec<bool>) {
+                (self.get(split, query), vec![false])
+            }
+            fn put(&self, _: String, _: String, _: SegmentId, _: HitSet) {
+                panic!("building a query must not fill the cache");
+            }
+        }
+        let mut schema = Schema::builder();
+        let body = schema.add_text_field("body", TEXT);
+        let schema = schema.build();
+        let ast = CacheNode::new(
+            TermQuery {
+                field: "body".into(),
+                value: "missing".into(),
+            }
+            .into(),
+        )
+        .into();
+        let (_, warmup) = build_query(
+            ast,
+            &BuildTantivyAstContext::for_test(&schema),
+            Some((Arc::new(RealHitVirtualMiss), "split".into())),
+        )
+        .unwrap();
+        assert!(warmup.required_terms.is_empty());
+        assert_eq!(
+            warmup.virtual_cache_required_terms,
+            HashSet::from([Term::from_field_text(body, "missing")])
+        );
+        assert_eq!(
+            warmup.predicate_cache_stats,
+            PredicateCacheStats {
+                num_predicates: 1,
+                num_cached_predicates: 1
+            }
+        );
+        assert_eq!(
+            warmup.virtual_predicate_cache_stats,
+            [PredicateCacheStats {
+                num_predicates: 1,
+                num_cached_predicates: 0
+            }]
+        );
+    }
+
     fn calc_field(expression: &str) -> QueryAst {
         CalcFieldQuery {
             expression: deserialize(expression).unwrap(),
@@ -470,6 +555,10 @@ mod test {
             warmup_info(query),
             WarmupInfo {
                 fast_fields: expected_fast_fields(&["duration", "#computed", "custom.label"]),
+                predicate_cache_stats: quickwit_query::query_ast::PredicateCacheStats {
+                    num_predicates: 1,
+                    num_cached_predicates: 0,
+                },
                 ..Default::default()
             }
         );
@@ -478,7 +567,16 @@ mod test {
     #[test]
     fn test_calc_field_warmup_constants_need_no_fields() {
         for expression in ["true", "false", "(EQ 1i64 1i64)"] {
-            assert_eq!(warmup_info(calc_field(expression)), WarmupInfo::default());
+            assert_eq!(
+                warmup_info(calc_field(expression)),
+                WarmupInfo {
+                    predicate_cache_stats: quickwit_query::query_ast::PredicateCacheStats {
+                        num_predicates: 1,
+                        num_cached_predicates: 0,
+                    },
+                    ..Default::default()
+                }
+            );
         }
     }
 
@@ -649,6 +747,13 @@ mod test {
             with_subfields: true,
         });
         assert_eq!(warmup.fast_fields, expected);
+        assert_eq!(
+            warmup.predicate_cache_stats,
+            quickwit_query::query_ast::PredicateCacheStats {
+                num_predicates: 8,
+                num_cached_predicates: 0,
+            }
+        );
     }
 
     #[test]

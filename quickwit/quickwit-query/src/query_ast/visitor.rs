@@ -278,6 +278,7 @@ pub trait QueryAstTransformer {
                 QueryAst::Cache(CacheNode {
                     inner: Box::new(inner),
                     state: Default::default(),
+                    virtual_hits: Vec::new(),
                 })
             })
         })

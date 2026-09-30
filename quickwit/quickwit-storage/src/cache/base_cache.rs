@@ -183,14 +183,9 @@ impl<K: Hash + Eq, V: ValueLen + Clone> Lru<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         let item_opt = self.lru_cache.get_mut(cache_key);
-        if let Some(item) = item_opt {
-            self.cache_metrics.hits_num_items.inc();
-            self.cache_metrics.hits_num_bytes.inc_by(item.len() as u64);
-            Some(item.payload())
-        } else {
-            self.cache_metrics.misses_num_items.inc();
-            None
-        }
+        self.cache_metrics
+            .record_lookup(item_opt.as_ref().map(|item| item.len()));
+        item_opt.map(|item| item.payload())
     }
 
     /// Attempt to put the given amount of data in the cache.
@@ -310,14 +305,9 @@ impl<K: Hash + Eq, V: ValueLen + Clone> S3Fifo<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         let item_opt = self.cache.get(cache_key);
-        if let Some(item) = item_opt {
-            self.cache_metrics.hits_num_items.inc();
-            self.cache_metrics.hits_num_bytes.inc_by(item.len() as u64);
-            Some(item.clone())
-        } else {
-            self.cache_metrics.misses_num_items.inc();
-            None
-        }
+        self.cache_metrics
+            .record_lookup(item_opt.as_ref().map(|item| item.len()));
+        item_opt.cloned()
     }
 
     /// Attempt to put the given amount of data in the cache.
@@ -420,16 +410,9 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: ValueLen + Clone + Send + Sync + '
         Q: Hash + Eq + ?Sized,
     {
         let item_opt = self.cache.get(cache_key);
-        if let Some(item) = item_opt {
-            self.cache_metrics.hits_num_items.inc();
-            self.cache_metrics
-                .hits_num_bytes
-                .inc_by(item.item.len() as u64);
-            Some(item.item.clone())
-        } else {
-            self.cache_metrics.misses_num_items.inc();
-            None
-        }
+        self.cache_metrics
+            .record_lookup(item_opt.as_ref().map(|item| item.item.len()));
+        item_opt.map(|item| item.item.clone())
     }
 
     /// Attempt to put the given amount of data in the cache.

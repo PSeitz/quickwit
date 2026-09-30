@@ -238,6 +238,7 @@ pub struct PredicateCacheImpl {
     content: MemorySizedCache<CacheKeyHash>,
     key_hasher: CacheKeyHasher,
     enabled: bool,
+    virtual_cache_labels: Vec<(String, String)>,
 }
 
 impl PredicateCacheImpl {
@@ -249,11 +250,25 @@ impl PredicateCacheImpl {
             ),
             key_hasher: CacheKeyHasher::random(),
             enabled: config.capacity().as_u64() > 0,
+            virtual_cache_labels: config
+                .virtual_caches
+                .iter()
+                .cloned()
+                .map(|mut virtual_config| {
+                    let capacity = virtual_config.capacity_for_virtual_cache(config.capacity());
+                    let policy = virtual_config.policy_for_virtual_cache(config.policy());
+                    (capacity.as_u64().to_string(), policy.to_string())
+                })
+                .collect(),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(crate) fn virtual_cache_labels(&self, index: usize) -> &(String, String) {
+        &self.virtual_cache_labels[index]
     }
 }
 
@@ -263,18 +278,38 @@ impl quickwit_query::query_ast::PredicateCache for PredicateCacheImpl {
         split_id: String,
         query_ast_json: String,
     ) -> Option<(SegmentId, quickwit_query::query_ast::HitSet)> {
+        self.get_with_virtual_hits(split_id, query_ast_json).0
+    }
+
+    fn num_virtual_caches(&self) -> usize {
+        self.virtual_cache_labels.len()
+    }
+
+    fn get_with_virtual_hits(
+        &self,
+        split_id: String,
+        query_ast_json: String,
+    ) -> (
+        Option<(SegmentId, quickwit_query::query_ast::HitSet)>,
+        Vec<bool>,
+    ) {
         if !self.enabled {
-            return None;
+            return (None, vec![false; self.num_virtual_caches()]);
         }
         let key = self
             .key_hasher
             .hash(&(split_id.as_str(), query_ast_json.as_str()));
-        let encoded_result = self.content.get(&key)?;
-        let (segment_id_bytes, hits_buffer) = encoded_result.split(32);
-        let segment_id =
-            SegmentId::from_uuid_string(str::from_utf8(&segment_id_bytes).ok()?).ok()?;
-        let hits = quickwit_query::query_ast::HitSet::from_buffer(hits_buffer);
-        Some((segment_id, hits))
+        let (encoded_result, virtual_hits) = self.content.get_with_virtual_hits(&key);
+        let entry = encoded_result.and_then(|encoded_result| {
+            let (segment_id_bytes, hits_buffer) = encoded_result.split(32);
+            let segment_id =
+                SegmentId::from_uuid_string(str::from_utf8(&segment_id_bytes).ok()?).ok()?;
+            Some((
+                segment_id,
+                quickwit_query::query_ast::HitSet::from_buffer(hits_buffer),
+            ))
+        });
+        (entry, virtual_hits)
     }
 
     fn put(
@@ -317,6 +352,37 @@ mod tests {
     use tantivy::index::SegmentId;
 
     use super::{CacheKey, CacheKeyHasher, LeafSearchCache, PredicateCacheImpl};
+
+    #[test]
+    fn test_predicate_virtual_lookup_results() {
+        use quickwit_config::CacheConfig;
+        use quickwit_query::query_ast::HitSet;
+
+        let mut config = CacheConfig::default_with_capacity(ByteSize::kb(10));
+        config.virtual_caches = vec![
+            CacheConfig::default_with_capacity(ByteSize::b(0)),
+            CacheConfig::default_with_capacity(ByteSize::kb(20)),
+        ];
+        let cache = PredicateCacheImpl::new(&config);
+        assert_eq!(cache.num_virtual_caches(), 2);
+        assert_eq!(
+            cache.virtual_cache_labels(1),
+            &("20000".into(), "lru".into())
+        );
+        let lookup = || cache.get_with_virtual_hits("split".into(), "query".into());
+        let (entry, virtual_hits) = lookup();
+        assert!(entry.is_none());
+        assert_eq!(virtual_hits, [false, false]);
+        cache.put(
+            "split".into(),
+            "query".into(),
+            SegmentId::generate_random(),
+            HitSet::empty(),
+        );
+        let (entry, virtual_hits) = lookup();
+        assert!(entry.is_some());
+        assert_eq!(virtual_hits, [false, true]);
+    }
 
     #[test]
     fn test_leaf_search_cache_no_timestamp() {

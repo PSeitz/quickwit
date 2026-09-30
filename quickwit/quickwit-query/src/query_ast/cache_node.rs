@@ -35,6 +35,9 @@ pub struct CacheNode {
     pub inner: Box<QueryAst>,
     #[serde(skip)]
     pub state: CacheState,
+    /// Lookup results in configured virtual-cache order; never used for execution.
+    #[serde(skip)]
+    pub virtual_hits: Vec<bool>,
 }
 
 #[derive(Default, Clone)]
@@ -74,6 +77,7 @@ impl CacheNode {
         CacheNode {
             inner: Box::new(ast),
             state: CacheState::Uninitialized,
+            virtual_hits: Vec::new(),
         }
     }
 
@@ -81,7 +85,10 @@ impl CacheNode {
         let Ok(query) = serde_json::to_string(&self.inner) else {
             return;
         };
-        if let Some((segment_id, hits)) = cache.get(split_id.to_string(), query.clone()) {
+        let (entry, virtual_hits) =
+            cache.get_with_virtual_hits(split_id.to_string(), query.clone());
+        self.virtual_hits = virtual_hits;
+        if let Some((segment_id, hits)) = entry {
             self.state = CacheState::CacheHit(CacheEntry { segment_id, hits });
         } else {
             self.state = CacheState::CacheMiss(CacheFiller {
@@ -488,6 +495,7 @@ impl crate::query_ast::QueryAstTransformer for PredicateCacheInjector {
                 QueryAst::Cache(CacheNode {
                     inner: Box::new(inner),
                     state: cache_node.state,
+                    virtual_hits: cache_node.virtual_hits,
                 })
             })
         })
@@ -497,6 +505,20 @@ impl crate::query_ast::QueryAstTransformer for PredicateCacheInjector {
 // we use a trait to dodge circular dependancies with quickwit-storage
 pub trait PredicateCache: Send + Sync + 'static {
     fn get(&self, split_id: String, query_ast_json: String) -> Option<(SegmentId, HitSet)>;
+
+    fn num_virtual_caches(&self) -> usize {
+        0
+    }
+
+    /// Return real and virtual outcomes from the same lookup. Virtual outcomes are
+    /// ordered by configuration and do not contain payloads.
+    fn get_with_virtual_hits(
+        &self,
+        split_id: String,
+        query_ast_json: String,
+    ) -> (Option<(SegmentId, HitSet)>, Vec<bool>) {
+        (self.get(split_id, query_ast_json), Vec::new())
+    }
 
     fn put(&self, split_id: String, query_ast_json: String, segment: SegmentId, results: HitSet);
 }
@@ -599,6 +621,7 @@ mod tests {
             let ast = CacheNode {
                 inner: Box::new(term_query.clone()),
                 state: CacheState::Uninitialized,
+                virtual_hits: Vec::new(),
             };
             let uninit_cache_query: Box<dyn TantivyQuery> = ast
                 .build_tantivy_ast_impl(&BuildTantivyAstContext::for_test(&schema))
@@ -619,6 +642,7 @@ mod tests {
             let ast = CacheNode {
                 inner: Box::new(term_query.clone()),
                 state: CacheState::CacheHit(cache_entry),
+                virtual_hits: Vec::new(),
             };
             let cache_hit_query: Box<dyn TantivyQuery> = ast
                 .build_tantivy_ast_impl(&BuildTantivyAstContext::for_test(&schema))
@@ -638,6 +662,7 @@ mod tests {
             let ast = CacheNode {
                 inner: Box::new(term_query.clone()),
                 state: CacheState::CacheMiss(cache_filler),
+                virtual_hits: Vec::new(),
             };
             let cache_miss_query: Box<dyn TantivyQuery> = ast
                 .build_tantivy_ast_impl(&BuildTantivyAstContext::for_test(&schema))
@@ -678,6 +703,7 @@ mod tests {
             let ast = CacheNode {
                 inner: Box::new(term_query.clone()),
                 state: CacheState::Uninitialized,
+                virtual_hits: Vec::new(),
             }
             .into();
 
@@ -697,6 +723,7 @@ mod tests {
             let ast = CacheNode {
                 inner: Box::new(term_query.clone()),
                 state: CacheState::CacheHit(cache_entry),
+                virtual_hits: Vec::new(),
             }
             .into();
 
@@ -716,6 +743,7 @@ mod tests {
             let ast = CacheNode {
                 inner: Box::new(term_query.clone()),
                 state: CacheState::CacheMiss(cache_filler),
+                virtual_hits: Vec::new(),
             }
             .into();
 
@@ -726,6 +754,90 @@ mod tests {
             visitor.transform(ast).unwrap();
             assert!(visitor.0);
         }
+    }
+
+    #[test]
+    fn test_predicate_cache_coverage_and_nested_lookups() {
+        use crate::query_ast::{BoolQuery, PredicateCacheStats};
+
+        let term = |value: &str| -> QueryAst {
+            TermQuery {
+                field: "body".to_string(),
+                value: value.to_string(),
+            }
+            .into()
+        };
+        let first = term("first");
+        let compound: QueryAst = BoolQuery {
+            must: vec![CacheNode::new(first.clone()).into()],
+            filter: vec![CacheNode::new(term("second")).into()],
+            ..Default::default()
+        }
+        .into();
+        let ast: QueryAst = BoolQuery {
+            must: vec![CacheNode::new(compound.clone()).into()],
+            must_not: vec![term("third")],
+            should: vec![QueryAst::MatchAll, QueryAst::MatchNone],
+            ..Default::default()
+        }
+        .into();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let inject = |ast: QueryAst| {
+            PredicateCacheInjector {
+                cache: cache.clone(),
+                split_id: "split".to_string(),
+            }
+            .transform(ast)
+            .unwrap()
+            .unwrap()
+        };
+        let assert_coverage = |ast: &QueryAst, num_cached_predicates| {
+            assert_eq!(
+                PredicateCacheStats::from_query_ast(ast),
+                PredicateCacheStats {
+                    num_predicates: 3,
+                    num_cached_predicates,
+                }
+            );
+        };
+        assert_coverage(&ast, 0);
+        assert_coverage(&inject(ast.clone()), 0);
+        let put = |ast: &QueryAst| {
+            cache.put(
+                "split".to_string(),
+                serde_json::to_string(ast).unwrap(),
+                SegmentId::generate_random(),
+                HitSet::empty(),
+            );
+        };
+        put(&first);
+        let partially_cached = inject(ast.clone());
+        assert_coverage(&partially_cached, 1);
+        put(&compound);
+        // An already initialized nested hit must not be counted twice either.
+        assert_coverage(&inject(partially_cached), 2);
+        let injected = inject(ast.clone());
+        assert_coverage(&injected, 2);
+        let QueryAst::Bool(root) = injected else {
+            panic!("expected bool")
+        };
+        let QueryAst::Cache(parent) = &root.must[0] else {
+            panic!("expected cache")
+        };
+        let QueryAst::Bool(children) = &*parent.inner else {
+            panic!("expected bool")
+        };
+        let QueryAst::Cache(child) = &children.must[0] else {
+            panic!("expected cache")
+        };
+        // Nested lookups still run so virtual caches observe them even on a parent hit.
+        assert!(matches!(child.state, CacheState::CacheHit(_)));
+        put(&ast);
+        let boosted = QueryAst::Boost {
+            underlying: Box::new(CacheNode::new(ast).into()),
+            boost: 2.0f32.try_into().unwrap(),
+        };
+        assert_coverage(&inject(boosted), 3);
     }
 
     #[test]
@@ -788,6 +900,7 @@ mod tests {
         let cache_node = CacheNode {
             inner: Box::new(term_query.clone()),
             state: CacheState::Uninitialized,
+            virtual_hits: Vec::new(),
         };
         let query_json = serde_json::to_string(&cache_node.inner).unwrap();
         let ast: QueryAst = cache_node.into();
@@ -872,6 +985,7 @@ mod tests {
         let ast = CacheNode {
             inner: Box::new(term_query.clone()),
             state: CacheState::CacheHit(cache_entry),
+            virtual_hits: Vec::new(),
         };
         let cache_hit_query: Box<dyn TantivyQuery> = ast
             .build_tantivy_ast_impl(&BuildTantivyAstContext::for_test(&schema))
@@ -916,6 +1030,7 @@ mod tests {
         let ast = CacheNode {
             inner: Box::new(term_query.clone()),
             state: CacheState::CacheMiss(cache_filler),
+            virtual_hits: Vec::new(),
         };
         let cache_hit_query: Box<dyn TantivyQuery> = ast
             .build_tantivy_ast_impl(&BuildTantivyAstContext::for_test(&schema))

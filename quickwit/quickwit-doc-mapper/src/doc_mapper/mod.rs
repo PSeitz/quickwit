@@ -95,6 +95,12 @@ pub struct FastFieldWarmupInfo {
 /// running the query.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WarmupInfo {
+    /// Predicate coverage after cache injection, before warmup or term-absence pruning.
+    pub predicate_cache_stats: quickwit_query::query_ast::PredicateCacheStats,
+    /// Independent coverage per virtual cache, in configuration order.
+    pub virtual_predicate_cache_stats: Vec<quickwit_query::query_ast::PredicateCacheStats>,
+    /// Required terms before real-cache substitution, for virtual term-absence checks.
+    pub virtual_cache_required_terms: HashSet<Term>,
     /// Name of fields from the term dictionary and posting list which needs to
     /// be entirely loaded
     pub term_dict_fields: HashSet<Field>,
@@ -158,6 +164,27 @@ impl WarmupInfo {
         // Required terms come from the query; a collector's `WarmupInfo` carries
         // none, so this union simply preserves the query's set.
         self.required_terms.extend(other.required_terms);
+        self.virtual_cache_required_terms
+            .extend(other.virtual_cache_required_terms);
+        if self.virtual_predicate_cache_stats.is_empty() {
+            self.virtual_predicate_cache_stats = other.virtual_predicate_cache_stats;
+        } else if !other.virtual_predicate_cache_stats.is_empty() {
+            assert_eq!(
+                self.virtual_predicate_cache_stats.len(),
+                other.virtual_predicate_cache_stats.len()
+            );
+            for (stats, other_stats) in self
+                .virtual_predicate_cache_stats
+                .iter_mut()
+                .zip(other.virtual_predicate_cache_stats)
+            {
+                stats.num_predicates += other_stats.num_predicates;
+                stats.num_cached_predicates += other_stats.num_cached_predicates;
+            }
+        }
+        self.predicate_cache_stats.num_predicates += other.predicate_cache_stats.num_predicates;
+        self.predicate_cache_stats.num_cached_predicates +=
+            other.predicate_cache_stats.num_cached_predicates;
     }
 
     /// Simplify a WarmupInfo, removing some redundant tasks

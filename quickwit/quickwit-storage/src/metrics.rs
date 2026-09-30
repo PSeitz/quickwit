@@ -176,6 +176,8 @@ pub struct CacheMetrics {
 /// evictions.
 #[derive(Clone)]
 pub struct SingleCacheMetrics {
+    /// Some caches report query-level effectiveness instead of mixed-size entry lookups.
+    record_lookups: bool,
     /// Current number of items stored in the cache.
     pub(crate) in_cache_count: Gauge,
     /// Current number of bytes stored in the cache.
@@ -192,19 +194,50 @@ pub struct SingleCacheMetrics {
     pub(crate) evict_num_bytes: Counter,
 }
 
+impl SingleCacheMetrics {
+    pub(crate) fn record_lookup(&self, num_bytes: Option<usize>) {
+        if !self.record_lookups {
+            return;
+        }
+        if let Some(num_bytes) = num_bytes {
+            self.hits_num_items.inc();
+            self.hits_num_bytes.inc_by(num_bytes as u64);
+        } else {
+            self.misses_num_items.inc();
+        }
+    }
+}
+
 impl CacheMetrics {
     /// Creates a new `CacheMetrics` for the given component name.
     pub fn for_component(component_name: &str) -> Self {
+        Self::for_component_with_lookup_metrics(component_name, true)
+    }
+
+    fn for_component_with_lookup_metrics(component_name: &str, record_lookups: bool) -> Self {
         let component_name = component_name.to_string();
         let labels = label_values!(COMPONENT_NAME => component_name.clone());
         CacheMetrics {
             component_name,
             cache_metrics: SingleCacheMetrics {
+                record_lookups,
                 in_cache_count: gauge!(parent: CACHE_IN_CACHE_COUNT, labels: [labels]),
                 in_cache_num_bytes: gauge!(parent: CACHE_IN_CACHE_NUM_BYTES, labels: [labels]),
-                hits_num_items: counter!(parent: CACHE_HITS_TOTAL, labels: [labels]),
-                hits_num_bytes: counter!(parent: CACHE_HITS_BYTES, labels: [labels]),
-                misses_num_items: counter!(parent: CACHE_MISSES_TOTAL, labels: [labels]),
+                hits_num_items: if record_lookups {
+                    counter!(parent: CACHE_HITS_TOTAL, labels: [labels])
+                } else {
+                    Counter::local()
+                },
+                hits_num_bytes: if record_lookups {
+                    counter!(parent: CACHE_HITS_BYTES, labels: [labels])
+                } else {
+                    Counter::local()
+                },
+                misses_num_items: if record_lookups {
+                    counter!(parent: CACHE_MISSES_TOTAL, labels: [labels])
+                } else {
+                    Counter::local()
+                },
                 evict_num_items: counter!(parent: CACHE_EVICT_TOTAL, labels: [labels]),
                 evict_num_bytes: counter!(parent: CACHE_EVICT_BYTES, labels: [labels]),
             },
@@ -228,7 +261,10 @@ impl CacheMetrics {
             config.capacity().as_u64().to_string(),
             config.policy().to_string(),
         );
+        // Virtual caches retain lookup metrics for comparing capacities and policies.
+        let record_lookups = true;
         let new_virtual_cache_metrics = SingleCacheMetrics {
+            record_lookups,
             in_cache_count: gauge!(parent: VIRTUAL_CACHE_IN_CACHE_COUNT, labels: [labels]),
             in_cache_num_bytes: gauge!(parent: VIRTUAL_CACHE_IN_CACHE_NUM_BYTES, labels: [labels]),
             hits_num_items: counter!(parent: VIRTUAL_CACHE_HITS_TOTAL, labels: [labels]),
@@ -341,9 +377,10 @@ pub(crate) static FD_CACHE_METRICS: LazyLock<CacheMetrics> =
 pub static PARTIAL_REQUEST_CACHE: LazyLock<CacheMetrics> =
     LazyLock::new(|| CacheMetrics::for_component("partial_request"));
 
-/// Cache metrics for predicate-evaluated content (used by leaf search caches).
+/// Size and eviction metrics for predicate-evaluated content. Lookup effectiveness
+/// is recorded per split search instead of mixing single and compound entries.
 pub static PREDICATE_CACHE: LazyLock<CacheMetrics> =
-    LazyLock::new(|| CacheMetrics::for_component("predicate"));
+    LazyLock::new(|| CacheMetrics::for_component_with_lookup_metrics("predicate", false));
 
 pub(crate) static SEARCHER_SPLIT_CACHE: LazyLock<CacheMetrics> =
     LazyLock::new(|| CacheMetrics::for_component("searcher_split"));
@@ -356,6 +393,36 @@ pub static SPLIT_FOOTER_CACHE: LazyLock<CacheMetrics> =
 /// Cache metrics for tests.
 pub static CACHE_METRICS_FOR_TESTS: LazyLock<CacheMetrics> =
     LazyLock::new(|| CacheMetrics::for_component("fortest"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_lookup_metrics_can_be_disabled() {
+        for enabled in [false, true] {
+            let component = if enabled {
+                "lookup_metrics_enabled_test"
+            } else {
+                "lookup_metrics_disabled_test"
+            };
+            let metrics = CacheMetrics::for_component_with_lookup_metrics(component, enabled);
+            let virtual_metrics = metrics.virtual_cache(&CacheConfig::no_cache());
+            for (cache_metrics, enabled) in
+                [(&metrics.cache_metrics, enabled), (&virtual_metrics, true)]
+            {
+                cache_metrics.record_lookup(Some(42));
+                cache_metrics.record_lookup(None);
+                assert_eq!(cache_metrics.hits_num_items.get(), u64::from(enabled));
+                assert_eq!(
+                    cache_metrics.hits_num_bytes.get(),
+                    if enabled { 42 } else { 0 }
+                );
+                assert_eq!(cache_metrics.misses_num_items.get(), u64::from(enabled));
+            }
+        }
+    }
+}
 
 pub(crate) fn object_storage_get_slice_in_flight_guards(
     get_request_size: usize,
