@@ -183,10 +183,7 @@ fn convert_user_input_ast_to_query_ast(
                 } else {
                     bail!("regex query with multiple fields is not supported");
                 };
-                let regex_query = query_ast::RegexQuery {
-                    field,
-                    regex: pattern,
-                };
+                let regex_query = query_ast::RegexQuery::new(field, pattern);
                 Ok(regex_query.into())
             }
         },
@@ -284,11 +281,9 @@ fn convert_user_input_literal(
                 }
                 .into()
             } else if wildcard {
-                query_ast::WildcardQuery {
-                    field: field_name,
-                    value: phrase.clone(),
+                query_ast::RegexQuery {
                     lenient,
-                    case_insensitive: false,
+                    ..query_ast::RegexQuery::from_wildcard(field_name, &phrase, false)
                 }
                 .into()
             } else {

@@ -309,6 +309,18 @@ impl Scorer for HitSet {
     }
 }
 
+impl From<tantivy::BitSet> for HitSet {
+    fn from(bitset: tantivy::BitSet) -> Self {
+        let mut docs = tantivy::query::BitSetDocSet::from(bitset);
+        let mut builder = HitSetBuilder::new();
+        while docs.doc() != tantivy::TERMINATED {
+            builder.insert(docs.doc());
+            docs.advance();
+        }
+        builder.build()
+    }
+}
+
 pub struct HitSetBuilder {
     count: u32,
     current_block: [u32; BitPacker1x::BLOCK_LEN],
@@ -434,6 +446,15 @@ pub struct CacheFillerWeight {
 
 impl Weight for CacheFillerWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        // The query is built before warmup, which may have filled this entry since then.
+        if let Some((segment_id, mut hits)) = self.cache_filler.cache.get(
+            self.cache_filler.split_id.clone(),
+            self.cache_filler.query.clone(),
+        ) && segment_id == reader.segment_id()
+        {
+            hits.boost = boost;
+            return Ok(Box::new(hits));
+        }
         let mut hit_set_builder = HitSetBuilder::new();
         let mut scorer = self.inner_weight.scorer(reader, 1.0)?;
         let mut doc_id = scorer.doc();
@@ -453,8 +474,8 @@ impl Weight for CacheFillerWeight {
     }
 }
 
-/// A transformer that goes through a QueryAst, and change the state of all CacheNodes
-/// to Hit/Miss based on the provided cache.
+/// Wrap regex predicates in cache nodes and set all CacheNodes to Hit/Miss based on
+/// the provided cache. Regex results can be populated during automaton warmup.
 ///
 /// This must be called for any CacheNode inside a QueryAst to do anything (though not calling
 /// it isn't an error, it just means no cache will be used).
@@ -466,11 +487,21 @@ pub struct PredicateCacheInjector {
 impl crate::query_ast::QueryAstTransformer for PredicateCacheInjector {
     type Err = std::convert::Infallible;
 
+    fn transform_regex(&mut self, regex: super::RegexQuery) -> Result<Option<QueryAst>, Self::Err> {
+        self.transform_cache_node(CacheNode::new(regex.into()))
+    }
+
     fn transform_cache_node(
         &mut self,
         mut cache_node: CacheNode,
     ) -> Result<Option<QueryAst>, Self::Err> {
         cache_node.fill_cache_state(&self.cache, &self.split_id);
+        // Regex leaves are already wrapped; do not wrap them recursively.
+        if matches!(*cache_node.inner, QueryAst::Regex(_))
+            || matches!(cache_node.state, CacheState::CacheHit(_))
+        {
+            return Ok(Some(cache_node.into()));
+        }
         self.transform(*cache_node.inner).map(|maybe_ast| {
             maybe_ast.map(|inner| {
                 QueryAst::Cache(CacheNode {
@@ -817,6 +848,56 @@ mod tests {
             .into();
 
         assert_eq!(cache_hit_query.count(&searcher).unwrap(), 500);
+    }
+
+    #[test]
+    fn test_cache_miss_reuses_warmup_results() {
+        let index = tantivy::Index::create_in_ram(Schema::builder().build());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer
+            .add_document(tantivy::TantivyDocument::default())
+            .unwrap();
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let reader = &searcher.segment_readers()[0];
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let query = CacheFillerQuery {
+            // Deliberately matches nothing: recomputing instead of reading the warmed entry
+            // would fail the assertions below.
+            inner_query: Box::new(tantivy::query::EmptyQuery),
+            cache_filler: CacheFiller {
+                cache: cache.clone(),
+                split_id: "split".to_string(),
+                query: "regex".to_string(),
+            },
+        };
+        let weight = query
+            .weight(EnableScoring::disabled_from_searcher(&searcher))
+            .unwrap();
+        let mut bitset = tantivy::BitSet::with_max_value(reader.max_doc());
+        bitset.insert(0);
+        cache.put(
+            "split".to_string(),
+            "regex".to_string(),
+            reader.segment_id(),
+            bitset.clone().into(),
+        );
+        let mut scorer = weight.scorer(reader, 3.0).unwrap();
+        assert_eq!(scorer.doc(), 0);
+        assert_eq!(scorer.score(), 3.0);
+        assert_eq!(scorer.advance(), tantivy::TERMINATED);
+
+        // A result for another segment must never be reused.
+        cache.put(
+            "split".to_string(),
+            "regex".to_string(),
+            SegmentId::generate_random(),
+            bitset.into(),
+        );
+        assert_eq!(
+            weight.scorer(reader, 1.0).unwrap().doc(),
+            tantivy::TERMINATED
+        );
     }
 
     #[test]

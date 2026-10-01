@@ -30,7 +30,9 @@ use quickwit_common::pretty::PrettySample;
 use quickwit_common::thread_pool::with_priority::Priority;
 use quickwit_common::uri::Uri;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
-use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
+use quickwit_doc_mapper::{
+    Automaton, DocMapper, FastFieldWarmupInfo, PredicateCacheContext, TermRange, WarmupInfo,
+};
 use quickwit_metrics::{GaugeGuard, HistogramTimer};
 use quickwit_proto::search::lambda_single_split_result::Outcome;
 use quickwit_proto::search::{
@@ -39,8 +41,7 @@ use quickwit_proto::search::{
 };
 use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
-    BoolQuery, CacheNode, HitSet, PredicateCache, QueryAst, QueryAstTransformer, RangeQuery,
-    TermQuery,
+    BoolQuery, HitSet, PredicateCache, QueryAst, QueryAstTransformer, RangeQuery, TermQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_storage::{
@@ -302,6 +303,7 @@ async fn run_cancellable(
 pub(crate) async fn warmup(
     searcher: &Searcher,
     warmup_info: &WarmupInfo,
+    predicate_cache_context: Option<&PredicateCacheContext>,
     on_absent: &(dyn Fn(&Term, SegmentId) + Sync),
 ) -> anyhow::Result<bool> {
     debug!(warmup_info=?warmup_info);
@@ -355,7 +357,7 @@ pub(crate) async fn warmup(
     .instrument(debug_span!("warm_up_postings"));
     let warm_up_automatons_future = run_cancellable(
         abort_token.as_ref(),
-        warm_up_automatons(searcher, &warmup_info.automatons_grouped_by_field),
+        warm_up_automatons(searcher, warmup_info, predicate_cache_context),
     )
     .instrument(debug_span!("warm_up_automatons"));
 
@@ -514,7 +516,8 @@ async fn warm_up_term_ranges(
 
 async fn warm_up_automatons(
     searcher: &Searcher,
-    terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
+    warmup_info: &WarmupInfo,
+    predicate_cache_context: Option<&PredicateCacheContext>,
 ) -> anyhow::Result<()> {
     let mut warm_up_futures = Vec::new();
     let cpu_intensive_executor = |task| async {
@@ -523,30 +526,77 @@ async fn warm_up_automatons(
             .await
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
-    for (field, automatons) in terms_grouped_by_field {
+    for (field, automatons) in &warmup_info.automatons_grouped_by_field {
+        // Keep the keys in the same order as the compiled automatons and returned bitsets.
+        let cache_keys = if predicate_cache_context.is_some() {
+            automatons
+                .iter()
+                .map(|automaton| {
+                    warmup_info
+                        .automaton_cache_keys
+                        .get(&(*field, automaton.clone()))
+                        .cloned()
+                        .context("missing predicate-cache keys for warmup automaton")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let automatons = automatons
+            .iter()
+            .map(|automaton| {
+                let Automaton::Regex(path, regex) = automaton;
+                let automaton = tantivy_fst::Regex::new(regex)
+                    .context("failed to parse regex during warmup")?;
+                anyhow::Ok(quickwit_query::query_ast::JsonPathPrefix {
+                    automaton: Arc::new(automaton),
+                    prefix: path.clone().unwrap_or_default(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         for segment_reader in searcher.segment_readers() {
             let inv_idx = segment_reader.inverted_index(*field)?;
-            for automaton in automatons {
-                let inv_idx_clone = inv_idx.clone();
-                warm_up_futures.push(async move {
-                    match automaton {
-                        Automaton::Regex(path, regex_str) => {
-                            let regex = tantivy_fst::Regex::new(regex_str)
-                                .context("failed to parse regex during warmup")?;
-                            inv_idx_clone
-                                .warm_postings_automaton(
-                                    quickwit_query::query_ast::JsonPathPrefix {
-                                        automaton: regex.into(),
-                                        prefix: path.clone().unwrap_or_default(),
-                                    },
-                                    cpu_intensive_executor,
-                                )
-                                .await
-                                .context("failed to load automaton")
+            let automatons = automatons.clone();
+            let cache_keys = cache_keys.clone();
+            warm_up_futures.push(async move {
+                let Some(cache_context) = predicate_cache_context else {
+                    // Predicate caching does not support scoring. Only warm the postings in
+                    // that case, without decoding bitsets that execution could not reuse.
+                    try_join_all(automatons.into_iter().map(|automaton| {
+                        inv_idx.warm_postings_automaton(automaton, cpu_intensive_executor)
+                    }))
+                    .await
+                    .context("failed to load automatons")?;
+                    return anyhow::Ok(());
+                };
+                let bitsets = inv_idx
+                    .warm_postings_automatons(
+                        automatons,
+                        segment_reader.max_doc(),
+                        cpu_intensive_executor,
+                    )
+                    .await
+                    .context("failed to load automatons")?;
+                anyhow::ensure!(
+                    bitsets.len() == cache_keys.len(),
+                    "automaton bitset count mismatch"
+                );
+                let cache = cache_context.cache.clone();
+                let split_id = cache_context.split_id.clone();
+                let segment_id = segment_reader.segment_id();
+                crate::search_thread_pool()
+                    .run_cpu_intensive(move || {
+                        for (bitset, keys) in bitsets.into_iter().zip(cache_keys) {
+                            let hits = HitSet::from(bitset);
+                            for key in keys {
+                                cache.put(split_id.clone(), key, segment_id, hits.clone());
+                            }
                         }
-                    }
-                });
-            }
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("automaton cache fill task panicked"))?;
+                anyhow::Ok(())
+            });
         }
     }
     try_join_all(warm_up_futures).await?;
@@ -635,7 +685,8 @@ fn compute_index_size(hot_directory: &HotDirectory) -> ByteSize {
 ///
 /// The key is the field id followed by the hex of the term's serialized value bytes
 /// (which for a JSON field already encode the path and type) — together a unique
-/// identifier of the term. It never collides with the whole-query keys the [`CacheNode`]
+/// identifier of the term. It never collides with the whole-query keys the
+/// [`CacheNode`](quickwit_query::query_ast::CacheNode)
 /// positive cache stores in the same instance: those are serialized query ASTs that
 /// start with `{`, never a hex field id.
 pub(crate) fn term_absence_cache_key(term: &Term) -> String {
@@ -729,21 +780,23 @@ async fn leaf_search_single_split(
         agg_context_params,
     )?;
 
-    let predicate_cache = if collector.requires_scoring() {
-        // at the moment the predicate cache doesn't support scoring
-        None
-    } else {
-        Some((
-            ctx.searcher_context.predicate_cache.clone() as _,
-            split.split_id.clone(),
-        ))
-    };
+    let predicate_cache_context =
+        if collector.requires_scoring() || searcher.segment_readers().len() != 1 {
+            // Predicate-cache entries represent one segment and do not support scoring.
+            None
+        } else {
+            Some(PredicateCacheContext {
+                cache: ctx.searcher_context.predicate_cache.clone(),
+                split_id: split.split_id.clone(),
+                cache_whole_query: search_request.search_after.is_some(),
+            })
+        };
     let split_schema = index.schema();
     let (query, mut warmup_info) = ctx.doc_mapper.query(
         split_schema.clone(),
         query_ast.clone(),
         false,
-        predicate_cache,
+        predicate_cache_context.clone(),
     )?;
 
     let collector_warmup_info = collector.warmup_info();
@@ -801,13 +854,17 @@ async fn leaf_search_single_split(
             downloaded_mb = tracing::field::Empty,
             total_mb = tracing::field::Empty
         );
-        let provably_empty = warmup(&searcher, &warmup_info, &record_absence)
-            .instrument(warmup_span.clone())
-            .await
-            .inspect_err(|_| {
-                leaf_search_state_guard
-                    .set_state(SplitSearchState::Error(SplitSearchErrorKind::Warmup))
-            })?;
+        let provably_empty = warmup(
+            &searcher,
+            &warmup_info,
+            predicate_cache_context.as_ref(),
+            &record_absence,
+        )
+        .instrument(warmup_span.clone())
+        .await
+        .inspect_err(|_| {
+            leaf_search_state_guard.set_state(SplitSearchState::Error(SplitSearchErrorKind::Warmup))
+        })?;
         warmup_span.record(
             "downloaded_mb",
             download_counters
@@ -986,20 +1043,6 @@ fn rewrite_request(
         remove_redundant_timestamp_range(search_request, split, timestamp_field);
     }
     rewrite_aggregation(search_request);
-    // we add a top level cache node when search_after is set, this won't help for this query (which
-    // is the 2nd in its series), but should speedup every other request that comes after
-    if search_request.search_after.is_some() {
-        add_top_cache_node(search_request)
-    }
-}
-
-fn add_top_cache_node(search_request: &mut SearchRequest) {
-    let Ok(query_ast) = serde_json::from_str(search_request.query_ast.as_str()) else {
-        // an error will get raised a bit after anyway
-        return;
-    };
-    let new_ast: QueryAst = CacheNode::new(query_ast).into();
-    search_request.query_ast = serde_json::to_string(&new_ast).unwrap();
 }
 
 /// Rewrite aggregation to make them easier to cache
@@ -2971,6 +3014,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_warm_up_automatons() {
+        let (searcher, body) = ram_searcher_with_text("body", &["hello world", "help"]);
+        let automatons = HashMap::from([(
+            body,
+            HashSet::from([
+                Automaton::Regex(None, "hel.*".to_string()),
+                Automaton::Regex(None, "hello".to_string()),
+                Automaton::Regex(None, "world".to_string()),
+                Automaton::Regex(Some(b"he".to_vec()), "lp".to_string()),
+                Automaton::Regex(None, "absent".to_string()),
+            ]),
+        )]);
+        let warmup_info = WarmupInfo {
+            automatons_grouped_by_field: automatons,
+            ..Default::default()
+        };
+        warm_up_automatons(&searcher, &warmup_info, None)
+            .await
+            .unwrap();
+        warm_up_automatons(&searcher, &WarmupInfo::default(), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_warm_up_automatons_fills_predicate_cache() {
+        use quickwit_query::query_ast::RegexQuery;
+        use tantivy::DocSet;
+        use tantivy::collector::Count;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("body", tantivy::schema::TEXT);
+        schema_builder.add_json_field("attributes", tantivy::schema::TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for json in [
+            r#"{"body":"hello world", "attributes":{"left":"hello", "right":"other"}}"#,
+            r#"{"body":"help", "attributes":{"left":"other", "right":"hello"}}"#,
+            r#"{"body":"other"}"#,
+        ] {
+            writer
+                .add_document(TantivyDocument::parse_json(&schema, json).unwrap())
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let regex = |field: &str, pattern: &str| RegexQuery {
+            field: field.to_string(),
+            regex: pattern.to_string(),
+            lenient: false,
+            normalize_literals: false,
+        };
+        let single: QueryAst = regex("body", "hel.*").into();
+        let mut lenient_regex = regex("body", "hel.*");
+        lenient_regex.lenient = true;
+        let lenient: QueryAst = lenient_regex.into();
+        let hello: QueryAst = regex("body", "hello").into();
+        let world: QueryAst = regex("body", "world").into();
+        let help: QueryAst = regex("body", "help").into();
+        let alternatives: QueryAst = BoolQuery {
+            should: vec![hello.clone(), world.clone(), help.clone()],
+            ..Default::default()
+        }
+        .into();
+        let absent: QueryAst = regex("body", "absent").into();
+        let left: QueryAst = regex("attributes.left", "hello").into();
+        let right: QueryAst = regex("attributes.right", "hello").into();
+        let ast: QueryAst = BoolQuery {
+            must: vec![single.clone(), lenient.clone(), alternatives],
+            should: vec![left.clone(), right.clone()],
+            must_not: vec![absent.clone()],
+            ..Default::default()
+        }
+        .into();
+        let cache_context = PredicateCacheContext {
+            cache: Arc::new(crate::leaf_cache::PredicateCacheImpl::new(
+                &ByteSize::mb(1).into(),
+            )),
+            split_id: "regex-warmup".to_string(),
+            cache_whole_query: false,
+        };
+        let mapper = quickwit_doc_mapper::default_doc_mapper_for_test();
+        // Build the executable query before warmup, just as the leaf search does.
+        let (query, warmup_info) = mapper
+            .query(
+                searcher.schema().clone(),
+                ast.clone(),
+                false,
+                Some(cache_context.clone()),
+            )
+            .unwrap();
+        warm_up_automatons(&searcher, &warmup_info, Some(&cache_context))
+            .await
+            .unwrap();
+        for (predicate, expected_docs) in [
+            (single, vec![0, 1]),
+            (lenient, vec![0, 1]),
+            (hello, vec![0]),
+            (world, vec![0]),
+            (help, vec![1]),
+            (absent, vec![]),
+            (left, vec![0]),
+            (right, vec![1]),
+        ] {
+            let (segment_id, mut hits) = cache_context
+                .cache
+                .get(
+                    cache_context.split_id.clone(),
+                    serde_json::to_string(&predicate).unwrap(),
+                )
+                .expect("warmup must fill every regex predicate, including empty results");
+            assert_eq!(segment_id, searcher.segment_readers()[0].segment_id());
+            assert_eq!(hits.size_hint() as usize, expected_docs.len());
+            for doc in expected_docs {
+                assert_eq!(hits.doc(), doc);
+                hits.advance();
+            }
+            assert_eq!(hits.doc(), tantivy::TERMINATED);
+        }
+        assert_eq!(searcher.search(&query, &Count).unwrap(), 2);
+        let (cached_query, cached_warmup) = mapper
+            .query(searcher.schema().clone(), ast, false, Some(cache_context))
+            .unwrap();
+        assert!(cached_warmup.automatons_grouped_by_field.is_empty());
+        assert_eq!(searcher.search(&cached_query, &Count).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_warm_up_automatons_invalid_regex() {
+        let (searcher, body) = ram_searcher_with_text("body", &["hello"]);
+        let error = warm_up_automatons(
+            &searcher,
+            &WarmupInfo {
+                automatons_grouped_by_field: HashMap::from([(
+                    body,
+                    HashSet::from([Automaton::Regex(None, "[".to_string())]),
+                )]),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse regex during warmup")
+        );
+    }
+
+    #[tokio::test]
     async fn test_warmup_reports_absent_required_terms() {
         let (searcher, body) = ram_searcher_with_text("body", &["hello world"]);
         // Single segment: the early-abort optimization is armed, so absence is recorded.
@@ -2983,11 +3178,12 @@ mod tests {
         // `on_absent` was invoked with.
         async fn run(searcher: &Searcher, warmup_info: &WarmupInfo) -> (bool, Vec<Term>) {
             let reported = std::sync::Mutex::new(Vec::new());
-            let provably_empty = warmup(searcher, warmup_info, &|term: &Term, _segment_id| {
-                reported.lock().unwrap().push(term.clone());
-            })
-            .await
-            .unwrap();
+            let provably_empty =
+                warmup(searcher, warmup_info, None, &|term: &Term, _segment_id| {
+                    reported.lock().unwrap().push(term.clone());
+                })
+                .await
+                .unwrap();
             (provably_empty, reported.into_inner().unwrap())
         }
 

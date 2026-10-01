@@ -56,11 +56,7 @@ impl ConvertibleToQueryAst for RegexQuery {
         } else {
             pattern
         };
-        Ok(AstRegexQuery {
-            field: self.field,
-            regex,
-        }
-        .into())
+        Ok(AstRegexQuery::new(self.field, regex).into())
     }
 }
 

@@ -14,7 +14,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use fnv::FnvHashSet;
@@ -42,8 +41,8 @@ use crate::query_builder::build_query;
 use crate::routing_expression::RoutingExpr;
 use crate::{
     Cardinality, DOCUMENT_SIZE_FIELD_NAME, DYNAMIC_FIELD_NAME, DocMapping, DocParsingError,
-    FIELD_PRESENCE_FIELD_NAME, Mode, ModeType, NamedField, QueryParserError, SOURCE_FIELD_NAME,
-    TokenizerEntry, WarmupInfo,
+    FIELD_PRESENCE_FIELD_NAME, Mode, ModeType, NamedField, PredicateCacheContext, QueryParserError,
+    SOURCE_FIELD_NAME, TokenizerEntry, WarmupInfo,
 };
 
 const FIELD_PRESENCE_FIELD: Field = Field::from_field_id(0u32);
@@ -634,12 +633,14 @@ impl DocMapper {
     ///
     /// Considering schema evolution, splits within an index can have different schema
     /// over time. So `split_schema` is the schema of the split the query is targeting.
+    /// If requested by `predicate_cache_context`, a whole-query cache node is inserted after
+    /// rewrites.
     pub fn query(
         &self,
         split_schema: Schema,
         query_ast: QueryAst,
         with_validation: bool,
-        cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, String)>,
+        predicate_cache_context: Option<PredicateCacheContext>,
     ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
         build_query(
             query_ast,
@@ -649,7 +650,7 @@ impl DocMapper {
                 search_fields: &self.default_search_field_names[..],
                 with_validation,
             },
-            cache_context,
+            predicate_cache_context,
         )
     }
 

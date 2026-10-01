@@ -102,11 +102,7 @@ impl ConvertibleToQueryAst for TermQuery {
         } = self.value;
         if case_insensitive {
             let ci_value = format!("(?i){}", regex::escape(&value));
-            let term_ast: QueryAst = query_ast::RegexQuery {
-                field: self.field,
-                regex: ci_value,
-            }
-            .into();
+            let term_ast: QueryAst = query_ast::RegexQuery::new(self.field, ci_value).into();
             return Ok(term_ast.boost(boost));
         }
         let term_ast: QueryAst = query_ast::TermQuery {
