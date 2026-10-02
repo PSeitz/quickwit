@@ -128,6 +128,7 @@ use tantivy::directory::OwnedBytes;
 use tantivy::index::SegmentId;
 use tantivy::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use tantivy::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
+use tantivy_common::BitSet;
 
 #[derive(Clone, Debug)]
 pub struct CacheHitQuery {
@@ -283,6 +284,29 @@ impl HitSet {
     }
 }
 
+impl From<&BitSet> for HitSet {
+    /// Compresses the set bits into a hit set without consuming the bitset.
+    /// The bitset's exclusive upper bound must not exceed `tantivy::TERMINATED`.
+    fn from(bitset: &BitSet) -> Self {
+        assert!(bitset.max_value() <= tantivy::TERMINATED);
+        let mut builder = HitSetBuilder::new();
+        let mut next_bucket = 0;
+        while let Some(bucket) = bitset.first_non_empty_bucket(next_bucket) {
+            for bit in bitset.tinyset(bucket) {
+                builder.insert(bucket * 64 + bit);
+            }
+            next_bucket = bucket + 1;
+        }
+        builder.build()
+    }
+}
+
+impl From<BitSet> for HitSet {
+    fn from(bitset: BitSet) -> Self {
+        Self::from(&bitset)
+    }
+}
+
 impl DocSet for HitSet {
     fn advance(&mut self) -> DocId {
         self.block_pos += 1;
@@ -294,8 +318,27 @@ impl DocSet for HitSet {
         self.current_block[0]
     }
 
-    // fn seek(&mut self, target: DocId) -> DocId {
-    // }
+    fn seek(&mut self, target: DocId) -> DocId {
+        debug_assert!(self.doc() <= target);
+        while self.current_block[BitPacker1x::BLOCK_LEN - 1] < target {
+            self.load_new_block();
+            self.block_pos = 0;
+        }
+        self.block_pos += self.current_block[self.block_pos..].partition_point(|&doc| doc < target);
+        self.doc()
+    }
+
+    fn count_including_deleted(&mut self) -> u32 {
+        if self.doc() == tantivy::TERMINATED {
+            return 0;
+        }
+        // Callers must count a fresh scorer, as Weight::count does.
+        let count = self.size_hint();
+        self.buffer_pos = self.buffer.len();
+        self.current_block.fill(tantivy::TERMINATED);
+        self.block_pos = 0;
+        count
+    }
 
     #[inline(always)]
     fn doc(&self) -> DocId {
@@ -506,9 +549,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use tantivy::DocSet;
     use tantivy::query::Query as TantivyQuery;
     use tantivy::schema::{Schema, TEXT};
+    use tantivy::{DocSet, SeekDangerResult};
 
     use super::*;
     use crate::query_ast::{
@@ -578,6 +621,137 @@ mod tests {
         // many blocks, partial last block
         test_hit_set_roundtrip_helper(generator.clone().take(1024 + 6));
         test_hit_set_roundtrip_helper(generator.clone().skip(10).take(1024 + 6));
+    }
+
+    #[test]
+    fn test_hit_set_from_bitset() {
+        for max_value in [0, 1, 31, 32, 33, 63, 64, 65, 4097] {
+            let empty = BitSet::with_max_value(max_value);
+            assert!(HitSet::from(&empty).is_empty());
+            assert_eq!(HitSet::from(empty).doc(), tantivy::TERMINATED);
+
+            for step in [1, 2, 67] {
+                let docs: Vec<DocId> = (0..max_value).step_by(step).collect();
+                let mut bitset = BitSet::with_max_value(max_value);
+                for &doc in docs.iter().rev() {
+                    bitset.insert(doc);
+                    bitset.insert(doc);
+                }
+                let mut builder = HitSetBuilder::new();
+                for &doc in &docs {
+                    builder.insert(doc);
+                }
+                let mut hits = HitSet::from(&bitset);
+                assert_eq!(hits.clone().count_including_deleted(), docs.len() as u32);
+                let buffer = hits.clone().into_buffer();
+                assert_eq!(buffer.as_slice(), builder.build().into_buffer().as_slice());
+                assert_eq!(
+                    buffer.as_slice(),
+                    HitSet::from(bitset).into_buffer().as_slice()
+                );
+                for doc in docs {
+                    assert_eq!(hits.doc(), doc);
+                    hits.advance();
+                }
+                assert_eq!(hits.doc(), tantivy::TERMINATED);
+            }
+        }
+    }
+
+    #[test]
+    fn test_hit_set_count_including_deleted() {
+        for count in [0, 1, 31, 32, 33, 64, 65, 1030] {
+            let mut builder = HitSetBuilder::new();
+            for doc in 0..count {
+                builder.insert(doc * 3);
+            }
+            let mut hits = builder.build();
+            assert_eq!(hits.count_including_deleted(), count);
+            assert_eq!(hits.doc(), tantivy::TERMINATED);
+            assert_eq!(hits.count_including_deleted(), 0);
+            assert_eq!(hits.advance(), tantivy::TERMINATED);
+        }
+    }
+
+    // Compare seeks and subsequent advances with the uncompressed document IDs.
+    #[test]
+    fn test_hit_set_seek() {
+        for count in [0, 1, 31, 32, 33, 64, 65, 1030] {
+            for start in [0, tantivy::TERMINATED - 4 * 1030] {
+                let docs: Vec<DocId> = (0..count).map(|doc| start + doc * 3).collect();
+                let mut builder = HitSetBuilder::new();
+                for &doc in &docs {
+                    builder.insert(doc);
+                }
+                let hits = builder.build();
+                let mut terminated = hits.clone();
+                assert_eq!(terminated.seek(tantivy::TERMINATED), tantivy::TERMINATED);
+                for _ in 0..96 {
+                    assert_eq!(terminated.doc(), tantivy::TERMINATED);
+                    assert_eq!(terminated.seek(tantivy::TERMINATED), tantivy::TERMINATED);
+                    assert_eq!(terminated.advance(), tantivy::TERMINATED);
+                }
+                for step in [1, 97] {
+                    let mut sought = hits.clone();
+                    for target in (start..start + count * 3 + 2).step_by(step) {
+                        let target = target.max(sought.doc());
+                        let position = docs.partition_point(|&doc| doc < target);
+                        let expected = docs.get(position).copied().unwrap_or(tantivy::TERMINATED);
+                        assert_eq!(sought.seek(target), expected);
+                        assert_eq!(sought.doc(), expected);
+                        // Seeking the current document must not advance it.
+                        assert_eq!(sought.seek(expected), expected);
+                        assert_eq!(
+                            sought.advance(),
+                            docs.get(position + 1)
+                                .copied()
+                                .unwrap_or(tantivy::TERMINATED)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hit_set_seek_danger() {
+        for count in [0, 1, 31, 32, 33, 64, 65, 1030] {
+            for start in [0, tantivy::TERMINATED - 4 * 1030] {
+                let docs: Vec<DocId> = (0..count).map(|doc| start + doc * 3).collect();
+                let mut builder = HitSetBuilder::new();
+                for &doc in &docs {
+                    builder.insert(doc);
+                }
+                let hits = builder.build();
+                // Exercise both successive targets and jumps across several blocks.
+                for step in [1, 97] {
+                    let mut sought = hits.clone();
+                    for target in (start..start + count * 3 + 2).step_by(step) {
+                        let position = docs.partition_point(|&doc| doc < target);
+                        let expected = docs.get(position).copied().unwrap_or(tantivy::TERMINATED);
+                        let result = sought.seek_danger(target);
+                        if expected == target {
+                            assert_eq!(result, SeekDangerResult::Found);
+                            assert_eq!(sought.doc(), target);
+                            assert_eq!(
+                                sought.clone().advance(),
+                                docs.get(position + 1)
+                                    .copied()
+                                    .unwrap_or(tantivy::TERMINATED)
+                            );
+                        } else {
+                            assert_eq!(result, SeekDangerResult::SeekLowerBound(expected));
+                        }
+                    }
+                    assert_eq!(
+                        sought.seek_danger(tantivy::TERMINATED),
+                        SeekDangerResult::SeekLowerBound(tantivy::TERMINATED)
+                    );
+                    assert_eq!(sought.seek(tantivy::TERMINATED), tantivy::TERMINATED);
+                    assert_eq!(sought.count_including_deleted(), 0);
+                }
+            }
+        }
     }
 
     #[test]
