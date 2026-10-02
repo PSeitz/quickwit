@@ -187,6 +187,9 @@ fn compute_query_with_field(
         FieldType::Facet(_) => Err(InvalidQuery::SchemaError(
             "facets are not supported in Quickwit".to_string(),
         )),
+        FieldType::TieBreaker => Err(InvalidQuery::SchemaError(
+            "tiebreaker fields are not supported in Quickwit".to_string(),
+        )),
         FieldType::Custom(_) => Err(InvalidQuery::SchemaError(
             "custom fields are not supported in Quickwit".to_string(),
         )),

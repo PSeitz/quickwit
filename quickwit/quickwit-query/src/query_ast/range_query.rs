@@ -195,6 +195,12 @@ impl BuildTantivyAst for RangeQuery {
                     field_name: field_entry.name().to_string(),
                 });
             }
+            tantivy::schema::FieldType::TieBreaker => {
+                return Err(InvalidQuery::RangeQueryNotSupportedForField {
+                    value_type: "tiebreaker",
+                    field_name: field_entry.name().to_string(),
+                });
+            }
             tantivy::schema::FieldType::Custom(_) => {
                 return Err(InvalidQuery::RangeQueryNotSupportedForField {
                     value_type: "custom",
