@@ -323,6 +323,9 @@ async fn run_cancellable(
 /// request's priority has to be forwarded for that work to be scheduled against the rest of the
 /// queue. Callers without a request priority to forward pass [`Priority::default`].
 ///
+/// `predicate_cache_context` pairs the cache with the split ID. Warmup builds and caches
+/// complete individual regex/wildcard hitsets so execution can avoid another term enumeration.
+///
 /// Returns whether the query is provably empty in this split (i.e. `on_absent` fired and
 /// warmup was short-circuited).
 pub(crate) async fn warmup(
@@ -330,6 +333,7 @@ pub(crate) async fn warmup(
     warmup_info: &WarmupInfo,
     priority: Priority,
     on_absent: &(dyn Fn(&Term, SegmentId) + Sync),
+    predicate_cache_context: Option<&(Arc<dyn PredicateCache>, String)>,
 ) -> anyhow::Result<bool> {
     debug!(warmup_info=?warmup_info);
 
@@ -382,7 +386,7 @@ pub(crate) async fn warmup(
     .instrument(debug_span!("warm_up_all_postings"));
     let warm_up_automatons_future = run_cancellable(
         abort_token.as_ref(),
-        warm_up_automatons(searcher, &warmup_info.automatons_grouped_by_field, priority),
+        warm_up_automatons(searcher, warmup_info, predicate_cache_context, priority),
     )
     .instrument(debug_span!("warm_up_automatons"));
 
@@ -543,7 +547,8 @@ async fn warm_up_term_ranges(
 
 async fn warm_up_automatons(
     searcher: &Searcher,
-    terms_grouped_by_field: &HashMap<Field, HashSet<Automaton>>,
+    warmup_info: &WarmupInfo,
+    predicate_cache_context: Option<&(Arc<dyn PredicateCache>, String)>,
     priority: Priority,
 ) -> anyhow::Result<()> {
     let mut warm_up_futures = Vec::new();
@@ -553,28 +558,64 @@ async fn warm_up_automatons(
             .await
             .map_err(|_| std::io::Error::other("task panicked"))?
     };
-    for (field, automatons) in terms_grouped_by_field {
+    for (field, automatons) in &warmup_info.automatons_grouped_by_field {
         for segment_reader in searcher.segment_readers() {
             let inv_idx = segment_reader.inverted_index(*field)?;
             for automaton in automatons {
-                let inv_idx_clone = inv_idx.clone();
+                let cache_keys = if predicate_cache_context.is_some() {
+                    warmup_info
+                        .automaton_cache_keys
+                        .get(&(*field, automaton.clone()))
+                        .cloned()
+                        .context("missing predicate-cache keys for warmup automaton")?
+                } else {
+                    HashSet::new()
+                };
+                let inv_idx = inv_idx.clone();
+                let automaton = automaton.clone();
                 warm_up_futures.push(async move {
-                    match automaton {
-                        Automaton::Regex(path, regex_str) => {
-                            let regex = get_or_compile_cached_fst_regex(regex_str)
+                    let automaton = crate::search_thread_pool()
+                        .run_cpu_intensive_with_priority(priority, move || {
+                            let Automaton::Regex(path, regex) = automaton;
+                            let automaton = get_or_compile_cached_fst_regex(&regex)
                                 .context("failed to parse regex during warmup")?;
-                            inv_idx_clone
-                                .warm_postings_automaton(
-                                    quickwit_query::query_ast::JsonPathPrefix {
-                                        automaton: regex,
-                                        prefix: path.clone().unwrap_or_default(),
-                                    },
-                                    cpu_intensive_executor,
-                                )
-                                .await
-                                .context("failed to load automaton")
-                        }
-                    }
+                            anyhow::Ok(quickwit_query::query_ast::JsonPathPrefix {
+                                automaton,
+                                prefix: path.unwrap_or_default(),
+                            })
+                        })
+                        .await
+                        .context("automaton compilation task panicked")??;
+                    // Calculated-field prefilters have no final-predicate cache keys.
+                    let Some((cache, split_id)) =
+                        predicate_cache_context.filter(|_| !cache_keys.is_empty())
+                    else {
+                        inv_idx
+                            .warm_postings_automaton(automaton, cpu_intensive_executor)
+                            .await
+                            .context("failed to load automaton")?;
+                        return anyhow::Ok(());
+                    };
+                    let term_infos = inv_idx
+                        .warm_postings_automaton_with_term_infos(automaton, cpu_intensive_executor)
+                        .await
+                        .context("failed to load automaton")?;
+                    let cache = cache.clone();
+                    let split_id = split_id.clone();
+                    let segment_id = segment_reader.segment_id();
+                    let max_doc = segment_reader.max_doc();
+                    crate::search_thread_pool()
+                        .run_cpu_intensive_with_priority(priority, move || {
+                            let hits = HitSet::from_postings(&inv_idx, &term_infos, max_doc)
+                                .context("failed to build automaton hitset")?;
+                            for key in cache_keys {
+                                cache.put(split_id.clone(), key, segment_id, hits.clone());
+                            }
+                            anyhow::Ok(())
+                        })
+                        .await
+                        .context("automaton cache fill task panicked")??;
+                    anyhow::Ok(())
                 });
             }
         }
@@ -759,18 +800,31 @@ async fn leaf_search_single_split(
         agg_context_params,
     )?;
 
-    let predicate_cache =
-        if collector.requires_scoring() || !ctx.searcher_context.predicate_cache.is_enabled() {
-            None
-        } else {
-            Some((
-                ctx.searcher_context.predicate_cache.clone() as Arc<dyn PredicateCache>,
-                split.split_id.clone(),
-            ))
-        };
-    let (query, mut warmup_info) =
-        ctx.doc_mapper
-            .query(index.schema(), query_ast.clone(), false, predicate_cache)?;
+    let priority = Priority::Normal {
+        priority: search_request.priority,
+        job_cost: search_permit.job_cost(),
+    };
+    let predicate_cache = if collector.requires_scoring()
+        || searcher.segment_readers().len() != 1
+        || !ctx.searcher_context.predicate_cache.is_enabled()
+    {
+        None
+    } else {
+        Some((
+            ctx.searcher_context.predicate_cache.clone() as Arc<dyn PredicateCache>,
+            split_id.clone(),
+        ))
+    };
+    let doc_mapper = ctx.doc_mapper.clone();
+    let schema = index.schema();
+    let cache_context = predicate_cache.clone();
+    let query_ast_to_build = query_ast.clone();
+    let (query, mut warmup_info) = crate::search_thread_pool()
+        .run_cpu_intensive_with_priority(priority, move || {
+            doc_mapper.query(schema, query_ast_to_build, false, cache_context)
+        })
+        .await
+        .map_err(|_| SearchError::Internal("query compilation task panicked".to_string()))??;
 
     let collector_warmup_info = collector.warmup_info();
     warmup_info.merge(collector_warmup_info);
@@ -830,11 +884,9 @@ async fn leaf_search_single_split(
         let provably_empty = warmup(
             &searcher,
             &warmup_info,
-            Priority::Normal {
-                priority: search_request.priority,
-                job_cost: search_permit.job_cost(),
-            },
+            priority,
             &record_absence,
+            predicate_cache.as_ref(),
         )
         .instrument(warmup_span.clone())
         .await
@@ -3013,6 +3065,7 @@ mod tests {
                 &|term: &Term, _segment_id| {
                     reported.lock().unwrap().push(term.clone());
                 },
+                None,
             )
             .await
             .unwrap();

@@ -108,6 +108,9 @@ pub struct WarmupInfo {
     pub term_ranges_grouped_by_field: HashMap<Field, HashMap<TermRange, bool>>,
     /// Automatons to warmup
     pub automatons_grouped_by_field: HashMap<Field, HashSet<Automaton>>,
+    /// Serialized individual predicates for each automaton. An empty set denotes a
+    /// calculated-field prefilter, whose candidates are not final predicate hits.
+    pub automaton_cache_keys: HashMap<(Field, Automaton), HashSet<String>>,
     /// Terms that must all be present for the query to match any document.
     ///
     /// If any of these terms has an empty posting list in a split, the query
@@ -153,6 +156,13 @@ impl WarmupInfo {
         for (field, automatons) in other.automatons_grouped_by_field.into_iter() {
             let sub_map = self.automatons_grouped_by_field.entry(field).or_default();
             sub_map.extend(automatons);
+        }
+
+        for (automaton, cache_keys) in other.automaton_cache_keys {
+            self.automaton_cache_keys
+                .entry(automaton)
+                .or_default()
+                .extend(cache_keys);
         }
 
         // Required terms come from the query; a collector's `WarmupInfo` carries

@@ -167,7 +167,7 @@ pub(crate) fn build_query(
     let (query, required_terms) = query_ast.build_tantivy_query_and_required_terms(context)?;
 
     let term_set_query_fields = extract_term_set_query_fields(&query_ast, context.schema)?;
-    let (term_ranges_grouped_by_field, automatons_grouped_by_field) =
+    let (term_ranges_grouped_by_field, automatons_grouped_by_field, automaton_cache_keys) =
         extract_prefix_term_ranges_and_automaton(
             &query_ast,
             context.schema,
@@ -193,6 +193,7 @@ pub(crate) fn build_query(
         term_ranges_grouped_by_field,
         fast_fields: fast_fields_visitor.fields,
         automatons_grouped_by_field,
+        automaton_cache_keys,
         required_terms,
         ..WarmupInfo::default()
     };
@@ -276,6 +277,7 @@ struct ExtractPrefixTermRanges<'a> {
     tokenizer_manager: &'a TokenizerManager,
     term_ranges_to_warm_up: HashMap<Field, HashMap<TermRange, PositionNeeded>>,
     automatons_to_warm_up: HashMap<Field, HashSet<Automaton>>,
+    automaton_cache_keys: AutomatonCacheKeys,
 }
 
 impl<'a> ExtractPrefixTermRanges<'a> {
@@ -285,6 +287,7 @@ impl<'a> ExtractPrefixTermRanges<'a> {
             tokenizer_manager,
             term_ranges_to_warm_up: HashMap::new(),
             automatons_to_warm_up: HashMap::new(),
+            automaton_cache_keys: HashMap::new(),
         }
     }
 
@@ -309,7 +312,16 @@ impl<'a> ExtractPrefixTermRanges<'a> {
             .or_default() |= position_needed;
     }
 
-    fn add_automaton(&mut self, field: Field, automaton: Automaton) {
+    fn add_automaton(&mut self, field: Field, automaton: Automaton, query_ast: Option<QueryAst>) {
+        let cache_keys = self
+            .automaton_cache_keys
+            .entry((field, automaton.clone()))
+            .or_default();
+        if let Some(query_ast) = query_ast {
+            let cache_key = serde_json::to_string(&query_ast)
+                .expect("automaton predicates must serialize for predicate caching");
+            cache_keys.insert(cache_key);
+        }
         self.automatons_to_warm_up
             .entry(field)
             .or_default()
@@ -363,7 +375,11 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
                 Err(e) => return Err(e),
             };
 
-        self.add_automaton(field, Automaton::Regex(path, regex));
+        self.add_automaton(
+            field,
+            Automaton::Regex(path, regex),
+            Some(QueryAst::Wildcard(wildcard_query.clone())),
+        );
         Ok(())
     }
 
@@ -377,6 +393,7 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
         self.add_automaton(
             resolved.field,
             Automaton::Regex(resolved.json_path, resolved.regex),
+            Some(QueryAst::Regex(regex_query.clone())),
         );
         Ok(())
     }
@@ -389,6 +406,7 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
         self.add_automaton(
             resolved.field,
             Automaton::Regex(resolved.json_path, resolved.regex),
+            None,
         );
         Ok(())
     }
@@ -396,17 +414,19 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
 
 type TermRangeWarmupInfo = HashMap<Field, HashMap<TermRange, PositionNeeded>>;
 type AutomatonWarmupInfo = HashMap<Field, HashSet<Automaton>>;
+type AutomatonCacheKeys = HashMap<(Field, Automaton), HashSet<String>>;
 
 fn extract_prefix_term_ranges_and_automaton(
     query_ast: &QueryAst,
     schema: &Schema,
     tokenizer_manager: &TokenizerManager,
-) -> anyhow::Result<(TermRangeWarmupInfo, AutomatonWarmupInfo)> {
+) -> anyhow::Result<(TermRangeWarmupInfo, AutomatonWarmupInfo, AutomatonCacheKeys)> {
     let mut visitor = ExtractPrefixTermRanges::with_schema(schema, tokenizer_manager);
     visitor.visit(query_ast)?;
     Ok((
         visitor.term_ranges_to_warm_up,
         visitor.automatons_to_warm_up,
+        visitor.automaton_cache_keys,
     ))
 }
 

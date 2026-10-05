@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::io;
 use std::sync::Arc;
 
 use bitpacking::{BitPacker, BitPacker1x};
@@ -126,8 +127,12 @@ impl BuildTantivyAst for CacheNode {
 
 use tantivy::directory::OwnedBytes;
 use tantivy::index::SegmentId;
+use tantivy::postings::TermInfo;
 use tantivy::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use tantivy::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
+use tantivy::schema::IndexRecordOption;
+use tantivy::{
+    BitSet, DocId, DocSet, InvertedIndexReader, Score, SegmentReader, TantivyError, Term,
+};
 
 #[derive(Clone, Debug)]
 pub struct CacheHitQuery {
@@ -223,6 +228,38 @@ impl HitSet {
     /// Returns true if this hit set matches no document.
     pub fn is_empty(&self) -> bool {
         self.size_hint() == 0
+    }
+
+    /// Builds a compressed union of the documents in the given postings.
+    ///
+    /// The term infos must belong to this reader and their postings must already be warmed.
+    /// This performs synchronous reads, decoding, and compression; run it on a CPU executor.
+    pub fn from_postings(
+        inverted_index: &InvertedIndexReader,
+        term_infos: &[TermInfo],
+        max_doc: DocId,
+    ) -> io::Result<Self> {
+        let mut hits = BitSet::with_max_value(max_doc);
+        for term_info in term_infos {
+            let mut postings = inverted_index
+                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+            while !postings.docs().is_empty() {
+                for &doc in postings.docs() {
+                    hits.insert(doc);
+                }
+                postings.advance();
+            }
+        }
+        // The builder requires sorted, unique IDs; the bitset supplies that order.
+        let mut builder = HitSetBuilder::new();
+        let mut next_bucket = 0;
+        while let Some(bucket) = hits.first_non_empty_bucket(next_bucket) {
+            for bit in hits.tinyset(bucket) {
+                builder.insert(bucket * 64 + bit);
+            }
+            next_bucket = bucket + 1;
+        }
+        Ok(builder.build())
     }
 
     /// Build a HitSet from its serialized form.
@@ -446,6 +483,16 @@ pub struct CacheFillerWeight {
 
 impl Weight for CacheFillerWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        // Query construction may have seen a miss before warmup populated the cache.
+        if let Some((segment_id, mut hits)) = self.cache_filler.cache.get(
+            self.cache_filler.split_id.clone(),
+            self.cache_filler.query.clone(),
+        ) {
+            if segment_id == reader.segment_id() {
+                hits.boost = boost;
+                return Ok(Box::new(hits));
+            }
+        }
         let mut hit_set_builder = HitSetBuilder::new();
         let mut scorer = self.inner_weight.scorer(reader, 1.0)?;
         let mut doc_id = scorer.doc();
@@ -478,11 +525,34 @@ pub struct PredicateCacheInjector {
 impl crate::query_ast::QueryAstTransformer for PredicateCacheInjector {
     type Err = std::convert::Infallible;
 
+    fn transform_regex(
+        &mut self,
+        regex_query: super::RegexQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        self.transform_cache_node(CacheNode::new(QueryAst::Regex(regex_query)))
+    }
+
+    fn transform_wildcard(
+        &mut self,
+        wildcard_query: super::WildcardQuery,
+    ) -> Result<Option<QueryAst>, Self::Err> {
+        self.transform_cache_node(CacheNode::new(QueryAst::Wildcard(wildcard_query)))
+    }
+
     fn transform_cache_node(
         &mut self,
         mut cache_node: CacheNode,
     ) -> Result<Option<QueryAst>, Self::Err> {
         cache_node.fill_cache_state(&self.cache, &self.split_id);
+        // Do not nest another cache node around an already wrapped automaton predicate.
+        if matches!(cache_node.state, CacheState::CacheHit(_))
+            || matches!(
+                *cache_node.inner,
+                QueryAst::Regex(_) | QueryAst::Wildcard(_)
+            )
+        {
+            return Ok(Some(cache_node.into()));
+        }
         self.transform(*cache_node.inner).map(|maybe_ast| {
             maybe_ast.map(|inner| {
                 QueryAst::Cache(CacheNode {
