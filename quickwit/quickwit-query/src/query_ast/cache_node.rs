@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::HashSet;
-use std::io;
 use std::sync::Arc;
 
 use bitpacking::{BitPacker, BitPacker1x};
@@ -127,12 +126,8 @@ impl BuildTantivyAst for CacheNode {
 
 use tantivy::directory::OwnedBytes;
 use tantivy::index::SegmentId;
-use tantivy::postings::TermInfo;
-use tantivy::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use tantivy::schema::IndexRecordOption;
-use tantivy::{
-    BitSet, DocId, DocSet, InvertedIndexReader, Score, SegmentReader, TantivyError, Term,
-};
+use tantivy::query::{BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight};
+use tantivy::{BitSet, DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
 #[derive(Clone, Debug)]
 pub struct CacheHitQuery {
@@ -230,36 +225,20 @@ impl HitSet {
         self.size_hint() == 0
     }
 
-    /// Builds a compressed union of the documents in the given postings.
-    ///
-    /// The term infos must belong to this reader and their postings must already be warmed.
-    /// This performs synchronous reads, decoding, and compression; run it on a CPU executor.
-    pub fn from_postings(
-        inverted_index: &InvertedIndexReader,
-        term_infos: &[TermInfo],
-        max_doc: DocId,
-    ) -> io::Result<Self> {
-        let mut hits = BitSet::with_max_value(max_doc);
-        for term_info in term_infos {
-            let mut postings = inverted_index
-                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
-            while !postings.docs().is_empty() {
-                for &doc in postings.docs() {
-                    hits.insert(doc);
-                }
-                postings.advance();
-            }
+    /// Compresses the document IDs in a bitset; run this on a CPU executor.
+    pub fn from_bitset(hits: BitSet) -> Self {
+        // BitSetDocSet cannot initialize a bitset with zero buckets.
+        if hits.len() == 0 {
+            return Self::empty();
         }
         // The builder requires sorted, unique IDs; the bitset supplies that order.
+        let mut docs = BitSetDocSet::from(hits);
         let mut builder = HitSetBuilder::new();
-        let mut next_bucket = 0;
-        while let Some(bucket) = hits.first_non_empty_bucket(next_bucket) {
-            for bit in hits.tinyset(bucket) {
-                builder.insert(bucket * 64 + bit);
-            }
-            next_bucket = bucket + 1;
+        while docs.doc() != tantivy::TERMINATED {
+            builder.insert(docs.doc());
+            docs.advance();
         }
-        Ok(builder.build())
+        builder.build()
     }
 
     /// Build a HitSet from its serialized form.
@@ -648,6 +627,31 @@ mod tests {
         // many blocks, partial last block
         test_hit_set_roundtrip_helper(generator.clone().take(1024 + 6));
         test_hit_set_roundtrip_helper(generator.clone().skip(10).take(1024 + 6));
+    }
+
+    #[test]
+    fn test_hit_set_from_bitset() {
+        for docs in [
+            vec![],
+            vec![0],
+            vec![63, 64, 127, 128, 1024],
+            (0..32).collect(),
+            (0..65).collect(),
+            (0..1030).map(|doc| doc * 3).collect(),
+        ] {
+            let max_doc = docs.last().map_or(0, |doc| doc + 1);
+            let mut bitset = BitSet::with_max_value(max_doc);
+            for &doc in &docs {
+                bitset.insert(doc);
+            }
+            let mut hits = HitSet::from_bitset(bitset);
+            assert_eq!(hits.size_hint() as usize, docs.len());
+            for doc in docs {
+                assert_eq!(hits.doc(), doc);
+                hits.advance();
+            }
+            assert_eq!(hits.doc(), tantivy::TERMINATED);
+        }
     }
 
     #[test]

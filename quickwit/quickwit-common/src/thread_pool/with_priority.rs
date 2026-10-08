@@ -225,6 +225,12 @@ impl ThreadPoolWithPriority {
         self.inner.max_running_tasks
     }
 
+    /// Returns the Rayon pool for APIs that cannot use the priority scheduler.
+    /// Tasks spawned directly on this pool bypass priority scheduling and task metrics.
+    pub fn rayon_thread_pool(&self) -> Arc<rayon::ThreadPool> {
+        self.inner.thread_pool.clone()
+    }
+
     /// Schedules a cpu intensive function with [`Priority::default`].
     /// If the result future is dropped before it is scheduled on the
     /// underlying thread pool, the task will be cancelled.
