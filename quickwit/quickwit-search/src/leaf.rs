@@ -54,8 +54,8 @@ use tantivy::aggregation::agg_req::{AggregationVariants, Aggregations};
 use tantivy::collector::Collector;
 use tantivy::fastfield::FastFieldReaders;
 use tantivy::index::SegmentId;
-use tantivy::schema::Field;
-use tantivy::{DateTime, Index, ReloadPolicy, Searcher, TantivyError, Term};
+use tantivy::schema::{Field, IndexRecordOption};
+use tantivy::{BitSet, DateTime, Index, ReloadPolicy, Searcher, TantivyError, Term};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::*;
@@ -320,10 +320,8 @@ async fn run_cancellable(
 /// the (immutable, query-independent) absence — see [`term_absence_cache_key`]. It only ever
 /// fires for a single-segment split, where "absent in the split" is sound.
 ///
-/// `priority` schedules automaton compilation, uncached term enumeration, and hitset compression.
-/// Cached automaton warmup uses a Tantivy executor on the search thread pool, but Tantivy's
-/// executor API cannot forward request priority. Callers without a request priority to forward
-/// pass [`Priority::default`].
+/// `priority` schedules automaton compilation, term enumeration, postings decoding, and hitset
+/// compression. Callers without a request priority to forward pass [`Priority::default`].
 ///
 /// The warmup plan determines whether to cache complete individual regex/wildcard hitsets
 /// in `predicate_cache` under `split_id`, so execution can avoid another term enumeration.
@@ -557,7 +555,6 @@ async fn warm_up_automatons(
     priority: Priority,
 ) -> anyhow::Result<()> {
     let predicate_cache = &predicate_cache;
-    let tantivy_executor = crate::search_thread_pool().rayon_thread_pool().into();
     let mut warm_up_futures = Vec::new();
     let cpu_intensive_executor = |task| async move {
         crate::search_thread_pool()
@@ -577,7 +574,6 @@ async fn warm_up_automatons(
                 }
                 let inv_idx = inv_idx.clone();
                 let automaton = automaton.clone();
-                let tantivy_executor = &tantivy_executor;
                 warm_up_futures.push(async move {
                     let automaton = crate::search_thread_pool()
                         .run_cpu_intensive_with_priority(priority, move || {
@@ -591,34 +587,48 @@ async fn warm_up_automatons(
                         })
                         .await
                         .context("automaton compilation task panicked")??;
+                    // The callback API preserves request priority, unlike Tantivy's concrete
+                    // executor. Warmed directory reads are cached for synchronous decoding below.
+                    inv_idx
+                        .warm_postings_automaton(automaton.clone(), cpu_intensive_executor)
+                        .await
+                        .context("failed to load automaton")?;
                     let AutomatonWarmup::CacheHits(cache_keys) = warmup else {
-                        inv_idx
-                            .warm_postings_automaton(automaton, cpu_intensive_executor)
-                            .await
-                            .context("failed to load automaton")?;
                         return anyhow::Ok(());
                     };
-                    let bitset = inv_idx
-                        .warm_postings_automaton_with_bitset(
-                            automaton,
-                            segment_reader.max_doc(),
-                            tantivy_executor,
-                        )
-                        .await
-                        .context("failed to load automaton hitset")?;
                     let cache = predicate_cache.clone();
                     let split_id = split_id.to_string();
                     let cache_keys = cache_keys.clone();
                     let segment_id = segment_reader.segment_id();
+                    let max_doc = segment_reader.max_doc();
                     crate::search_thread_pool()
                         .run_cpu_intensive_with_priority(priority, move || {
+                            let mut bitset = BitSet::with_max_value(max_doc);
+                            let mut terms = inv_idx
+                                .terms()
+                                .search(automaton)
+                                .without_keys()
+                                .into_stream()?;
+                            while terms.advance() {
+                                let mut postings = inv_idx.read_block_postings_from_terminfo(
+                                    terms.value(),
+                                    IndexRecordOption::Basic,
+                                )?;
+                                while !postings.docs().is_empty() {
+                                    for &doc in postings.docs() {
+                                        bitset.insert(doc);
+                                    }
+                                    postings.advance();
+                                }
+                            }
                             let hits = HitSet::from_bitset(bitset);
                             for key in cache_keys {
                                 cache.put(split_id.clone(), key, segment_id, hits.clone());
                             }
+                            anyhow::Ok(())
                         })
                         .await
-                        .context("automaton cache fill task panicked")?;
+                        .context("automaton cache fill task panicked")??;
                     anyhow::Ok(())
                 });
             }
