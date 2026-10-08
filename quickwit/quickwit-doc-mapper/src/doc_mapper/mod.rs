@@ -85,8 +85,9 @@ pub enum Automaton {
 /// Work to perform when warming an automaton's postings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutomatonWarmup {
-    /// Load postings without caching hits, for example for calculated-field prefilters
-    /// whose candidates are not final predicate hits.
+    /// Load postings without caching hits. Calculated-field prefilters match any indexed value
+    /// in a multivalued column, but the predicate evaluates only the first value. Prefilter hits
+    /// therefore cannot be cached as final calculated-field predicate hits.
     PostingsOnly,
     /// Also cache final predicate hits under these serialized predicate keys.
     /// The set must be nonempty.

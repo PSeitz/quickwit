@@ -378,7 +378,7 @@ quickwit-telemetry-exporters = { path = "quickwit-telemetry-exporters" }
 quickwit-transport = { path = "quickwit-transport" }
 
 # Automaton warmup returns matching term infos.
-tantivy = { git = "https://github.com/PSeitz/tantivy/", rev = "71a2313a782dec5244117d435675837017cfcca8", default-features = false, features = [
+tantivy = { git = "https://github.com/quickwit-oss/tantivy/", rev = "c12cc2d54bc0ff75bf1b4a836b4c7e593600bc1a", default-features = false, features = [
   "jitexpr",
   "lz4-compression",
   "mmap",
@@ -387,7 +387,7 @@ tantivy = { git = "https://github.com/PSeitz/tantivy/", rev = "71a2313a782dec524
   "columnar-zstd-compression",
 ] }
 # Must stay on the same rev as `tantivy`.
-tantivy-common = { git = "https://github.com/PSeitz/tantivy/", rev = "71a2313a782dec5244117d435675837017cfcca8" }
+tantivy-common = { git = "https://github.com/quickwit-oss/tantivy/", rev = "c12cc2d54bc0ff75bf1b4a836b4c7e593600bc1a" }
 tantivy-fst = "0.5"
 
 # This is actually not used directly the goal is to fix the version
