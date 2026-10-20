@@ -175,9 +175,6 @@ After a few seconds, you should see logs on your indexer that show indexing has 
 2022-11-30T18:27:37.628Z  INFO quickwit_serve::rest: Starting REST server. rest_listen_addr=0.0.0.0:7280
 2022-11-30T18:27:37.628Z  INFO quickwit_serve::rest: Searcher ready to accept requests at http://0.0.0.0:7280/
 2022-11-30T18:27:42.654Z  INFO quickwit_indexing::actors::indexer: new-split split_id="01GK4WPTXK8GH3AGTRNBN9A8YG" partition_id=0
-2022-11-30T18:27:52.643Z  INFO quickwit_indexing::actors::indexer: send-to-index-serializer commit_trigger=Timeout split_ids=01GK4WPTXK8GH3AGTRNBN9A8YG num_docs=22
-2022-11-30T18:27:52.652Z  INFO index_batch{index_id=otel-log-v0 source_id=_ingest-api-source pipeline_ord=0}:packager: quickwit_indexing::actors::packager: start-packaging-splits split_ids=["01GK4WPTXK8GH3AGTRNBN9A8YG"]
-2022-11-30T18:27:52.652Z  INFO index_batch{index_id=otel-log-v0 source_id=_ingest-api-source pipeline_ord=0}:packager: quickwit_indexing::actors::packager: create-packaged-split split_id="01GK4WPTXK8GH3AGTRNBN9A8YG"
 2022-11-30T18:27:52.653Z  INFO index_batch{index_id=otel-log-v0 source_id=_ingest-api-source pipeline_ord=0}:uploader: quickwit_indexing::actors::uploader: start-stage-and-store-splits split_ids=["01GK4WPTXK8GH3AGTRNBN9A8YG"]
 2022-11-30T18:27:52.733Z  INFO index_batch{index_id=otel-log-v0 source_id=_ingest-api-source pipeline_ord=0}:uploader:stage_and_upload{split=01GK4WPTXK8GH3AGTRNBN9A8YG}:store_split: quickwit_indexing::split_store::indexing_split_store: store-split-remote-success split_size_in_megabytes=0.018351 num_docs=22 elapsed_secs=0.07654519 throughput_mb_s=0.23974074 is_mature=false
 ```

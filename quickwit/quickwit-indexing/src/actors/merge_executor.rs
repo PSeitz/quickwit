@@ -27,7 +27,7 @@ use quickwit_common::io::IoControls;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_directories::UnionDirectory;
-use quickwit_doc_mapper::DocMapper;
+use quickwit_doc_mapper::{DocMapper, NamedField};
 use quickwit_metastore::SplitMetadata;
 use quickwit_proto::indexing::MergePipelineId;
 use quickwit_proto::metastore::{
@@ -45,10 +45,11 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::actors::Packager;
+use crate::actors::Uploader;
+use crate::actors::split_packaging::package_split;
 use crate::controlled_directory::ControlledDirectory;
 use crate::merge_policy::{MergeOperationType, MergeSource};
-use crate::models::{IndexedSplit, IndexedSplitBatch, MergeScratch, PublishLock, SplitAttrs};
+use crate::models::{IndexedSplit, MergeScratch, PackagedSplitBatch, PublishLock, SplitAttrs};
 
 #[derive(Clone)]
 pub struct MergeExecutor {
@@ -56,7 +57,8 @@ pub struct MergeExecutor {
     metastore: MetastoreServiceClient,
     doc_mapper: Arc<DocMapper>,
     io_controls: IoControls,
-    merge_packager_mailbox: Mailbox<Packager>,
+    tag_fields: Vec<NamedField>,
+    uploader_mailbox: Mailbox<Uploader>,
     /// Bounds concurrent Tantivy merges across pipelines on this node.
     /// `None` in the legacy indexing-side merge pipeline.
     merge_execution_semaphore: Option<Arc<Semaphore>>,
@@ -169,15 +171,16 @@ impl Handler<MergeScratch> for MergeExecutor {
                 MergeSource::Task(task) => Some(task),
                 MergeSource::Operation(_) => None,
             };
+            let packaged_split = package_split(indexed_split, &self.tag_fields, ctx)?;
             ctx.send_message(
-                &self.merge_packager_mailbox,
-                IndexedSplitBatch {
-                    splits: vec![indexed_split],
-                    checkpoint_delta_opt: Default::default(),
-                    publish_lock: PublishLock::default(),
-                    batch_parent_span,
+                &self.uploader_mailbox,
+                PackagedSplitBatch::new(
+                    vec![packaged_split],
+                    None,
+                    PublishLock::default(),
                     merge_task_opt,
-                },
+                    batch_parent_span,
+                ),
             )
             .await?;
         } else {
@@ -328,7 +331,8 @@ impl MergeExecutor {
         metastore: MetastoreServiceClient,
         doc_mapper: Arc<DocMapper>,
         io_controls: IoControls,
-        merge_packager_mailbox: Mailbox<Packager>,
+        tag_fields: Vec<NamedField>,
+        uploader_mailbox: Mailbox<Uploader>,
         merge_execution_semaphore: Option<Arc<Semaphore>>,
     ) -> Self {
         MergeExecutor {
@@ -336,7 +340,8 @@ impl MergeExecutor {
             metastore,
             doc_mapper,
             io_controls,
-            merge_packager_mailbox,
+            tag_fields,
+            uploader_mailbox,
             merge_execution_semaphore,
         }
     }
@@ -680,14 +685,14 @@ mod tests {
             index_uid,
             source_id: test_sandbox.source_id(),
         };
-        let (merge_packager_mailbox, merge_packager_inbox) =
-            test_sandbox.universe().create_test_mailbox();
+        let (uploader_mailbox, uploader_inbox) = test_sandbox.universe().create_test_mailbox();
         let merge_executor = MergeExecutor::new(
             pipeline_id,
             test_sandbox.metastore(),
             test_sandbox.doc_mapper(),
             IoControls::default(),
-            merge_packager_mailbox,
+            test_sandbox.doc_mapper().tag_named_fields()?,
+            uploader_mailbox,
             None,
         );
         let (merge_executor_mailbox, merge_executor_handle) = test_sandbox
@@ -696,14 +701,18 @@ mod tests {
             .spawn(merge_executor);
         merge_executor_mailbox.send_message(merge_scratch).await?;
         merge_executor_handle.process_pending_and_observe().await;
-        let packager_msgs: Vec<IndexedSplitBatch> = merge_packager_inbox.drain_for_test_typed();
-        assert_eq!(packager_msgs.len(), 1);
-        let split_attrs_after_merge = &packager_msgs[0].splits[0].split_attrs;
+        let uploader_msgs: Vec<PackagedSplitBatch> = uploader_inbox.drain_for_test_typed();
+        assert_eq!(uploader_msgs.len(), 1);
+        assert!(uploader_msgs[0].merge_task_opt.is_some());
+        let split = &uploader_msgs[0].splits[0];
+        assert!(!split.hotcache_bytes.is_empty());
+        assert!(split.split_files.iter().all(|path| path.is_file()));
+        let split_attrs_after_merge = &split.split_attrs;
         assert_eq!(split_attrs_after_merge.num_docs, 4);
         assert_eq!(split_attrs_after_merge.uncompressed_docs_size_in_bytes, 136);
         assert_eq!(split_attrs_after_merge.num_merge_ops, 1);
-        let reader = packager_msgs[0].splits[0]
-            .index
+        let index = Index::open_in_dir(split.split_scratch_directory.path())?;
+        let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
@@ -826,13 +835,14 @@ mod tests {
             source_id: test_sandbox.source_id(),
         };
         let universe = Universe::with_accelerated_time();
-        let (merge_packager_mailbox, merge_packager_inbox) = universe.create_test_mailbox();
+        let (uploader_mailbox, uploader_inbox) = universe.create_test_mailbox();
         let delete_task_executor = MergeExecutor::new(
             pipeline_id,
             metastore,
             test_sandbox.doc_mapper(),
             IoControls::default(),
-            merge_packager_mailbox,
+            test_sandbox.doc_mapper().tag_named_fields()?,
+            uploader_mailbox,
             None,
         );
         let (delete_task_executor_mailbox, delete_task_executor_handle) =
@@ -844,10 +854,11 @@ mod tests {
             .process_pending_and_observe()
             .await;
 
-        let packager_msgs: Vec<IndexedSplitBatch> = merge_packager_inbox.drain_for_test_typed();
+        let uploader_msgs: Vec<PackagedSplitBatch> = uploader_inbox.drain_for_test_typed();
         if !result_docs.is_empty() {
-            assert_eq!(packager_msgs.len(), 1);
-            let split = &packager_msgs[0].splits[0];
+            assert_eq!(uploader_msgs.len(), 1);
+            assert!(uploader_msgs[0].merge_task_opt.is_some());
+            let split = &uploader_msgs[0].splits[0];
             assert_eq!(split.split_attrs.num_docs, result_docs.len() as u64);
             assert_eq!(split.split_attrs.delete_opstamp, 1);
             // Delete operations do not update the num_merge_ops value.
@@ -856,8 +867,8 @@ mod tests {
                 split.split_attrs.uncompressed_docs_size_in_bytes,
                 expected_uncompressed_docs_size_in_bytes,
             );
-            let reader = split
-                .index
+            let index = Index::open_in_dir(split.split_scratch_directory.path())?;
+            let reader = index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::Manual)
                 .try_into()?;
@@ -886,7 +897,7 @@ mod tests {
                 assert!(documents_left.contains(doc));
             }
         } else {
-            assert!(packager_msgs.is_empty());
+            assert!(uploader_msgs.is_empty());
             let metastore = test_sandbox.metastore();
             let index_uid = test_sandbox.index_uid();
             let splits = metastore
