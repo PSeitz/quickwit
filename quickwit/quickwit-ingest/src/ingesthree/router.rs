@@ -125,6 +125,35 @@ fn destinations<'a>(
     destinations
 }
 
+/// Candidates are eligible and ordered by AZ, then index affinity/local bonus.
+/// Sample before applying capacity and affinity so a single index can use many nodes.
+/// Remove the winner while preserving order, so retries always try distinct nodes.
+fn take_destination<'a>(
+    destinations: &mut Vec<&'a ClusterNode>,
+    availability_zone: Option<&AvailabilityZone>,
+    rng: &mut impl rand::Rng,
+) -> Option<&'a ClusterNode> {
+    if destinations.is_empty() {
+        return None;
+    }
+    let same_zone_count = destinations
+        .iter()
+        .take_while(|node| {
+            availability_zone.is_some() && node.availability_zone().as_ref() == availability_zone
+        })
+        .count();
+    let num_candidates = if same_zone_count > 0 {
+        same_zone_count
+    } else {
+        destinations.len()
+    };
+    let selected = rand::seq::index::sample(rng, num_candidates, num_candidates.min(2))
+        .into_iter()
+        .min_by_key(|&index| (Reverse(destinations[index].ingesthree_capacity()), index))
+        .expect("at least one eligible destination");
+    Some(destinations.remove(selected))
+}
+
 async fn route_subrequest(
     subrequest: &IngestSubrequest,
     mut destinations: Vec<&ClusterNode>,
@@ -134,7 +163,7 @@ async fn route_subrequest(
 ) -> IngestResponse {
     let mut error =
         IngestServiceError::Unavailable("no ready ingest destination accepted the request".into());
-    // Capacity gates attempts without changing affinity order or consuming retries.
+    // Filter capacity before sampling, without consuming retries.
     // Retain overload evidence just as we do for a destination's rejection below.
     destinations.retain(|node| match node.ingesthree_capacity() {
         Some(0) => {
@@ -144,7 +173,11 @@ async fn route_subrequest(
         Some(_) => true,
         None => false,
     });
-    for node in destinations.into_iter().take(3) {
+    for _ in 0..3 {
+        let Some(node) = take_destination(&mut destinations, availability_zone, &mut rand::rng())
+        else {
+            break;
+        };
         metrics.record_attempt(availability_zone, node.availability_zone().as_ref());
         let client = IngesthreeServiceClient::new(node.channel())
             .max_decoding_message_size(max_message_size.0 as usize)

@@ -25,9 +25,12 @@ recent change. Either budget at or below 5% remaining yields zero. The trend pen
 and integer scoring can yield zero earlier when headroom is shrinking. Closed intake
 also advertises zero. The score measures buffer headroom, rather than CPU or MB/s.
 Routers require ready ingesthree indexers with a positive score. Missing feedback is
-ineligible until advertised. Among eligible nodes they prefer the same AZ, then stable
-per-index affinity with a small local bonus. Positive scores do not change ranking.
-They try up to three destinations on capacity/unavailability failures. Skipping a node
+ineligible until advertised. Among eligible nodes they prefer the same AZ and randomly
+sample two distinct candidates per attempt. The higher capacity score wins. Equal scores
+use stable per-index affinity with a small local bonus. Sampling before applying affinity
+spreads requests for a single index across nodes while retaining a soft index preference.
+Retries exclude previously attempted nodes and fall back across AZs when no local candidates
+remain. They try up to three destinations on capacity/unavailability failures. Skipping a node
 with zero/missing capacity consumes no attempt. Local admission remains authoritative
 because gossip can lag and other routers can consume capacity. Capacity failures,
 including all known destinations advertising zero, return HTTP 429. Saturation observed

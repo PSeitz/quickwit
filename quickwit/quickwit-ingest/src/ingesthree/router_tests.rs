@@ -38,6 +38,9 @@ mod errors;
 #[path = "router_metrics_tests.rs"]
 mod metrics_tests;
 
+#[path = "router_selection_tests.rs"]
+mod selection_tests;
+
 #[derive(Clone)]
 struct Intake {
     calls: Arc<AtomicUsize>,
@@ -332,7 +335,7 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
     assert_eq!(local.calls.load(Ordering::SeqCst), 0);
     assert_eq!(down.calls.load(Ordering::SeqCst), 1);
 
-    // A lower positive score remains eligible and does not override AZ/affinity.
+    // A lower positive score remains eligible and does not override AZ preference.
     let recovered = update_capacity(&local, Some(1)).await;
     let nodes = [recovered, remote.node.clone()];
     assert_eq!(
