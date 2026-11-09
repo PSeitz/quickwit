@@ -18,22 +18,24 @@ use async_trait::async_trait;
 use quickwit_common::uri::Uri;
 use quickwit_proto::control_plane::{ControlPlaneService, ControlPlaneServiceClient};
 use quickwit_proto::metastore::{
-    AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
-    CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
-    DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
-    DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
-    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
-    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
-    IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest, IndexesMetadataResponse,
-    LastDeleteOpstampRequest, LastDeleteOpstampResponse, ListDeleteTasksRequest,
+    AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, AssignFilesForIndexing,
+    AssignFilesForIndexingResponse, CreateIndexRequest, CreateIndexResponse,
+    CreateIndexTemplateRequest, DeleteIndexRequest, DeleteIndexTemplatesRequest, DeleteQuery,
+    DeleteShardsRequest, DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest,
+    DeleteTask, EmptyResponse, FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse,
+    GetClusterIdentityRequest, GetClusterIdentityResponse, GetIndexTemplateRequest,
+    GetIndexTemplateResponse, IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest,
+    IndexesMetadataResponse, LastDeleteOpstampRequest, LastDeleteOpstampResponse,
+    ListCompletedFilesRequest, ListCompletedFilesResponse, ListDeleteTasksRequest,
     ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
     ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
     ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
     ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreResult,
     MetastoreService, MetastoreServiceClient, MetastoreServiceStream, OpenShardsRequest,
-    OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
-    StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest,
-    UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
+    OpenShardsResponse, PruneShardsRequest, PublishFileSplits, PublishFileSplitsResponse,
+    PublishSplitsRequest, RegisterFileForIndexing, RegisterFileForIndexingResponse,
+    ResetSourceCheckpointRequest, StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest,
+    UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
 };
 use tracing::instrument;
 
@@ -155,6 +157,38 @@ impl MetastoreService for ControlPlaneMetastore {
         request: ListIndexesMetadataRequest,
     ) -> MetastoreResult<ListIndexesMetadataResponse> {
         self.metastore.list_indexes_metadata(request).await
+    }
+
+    #[instrument(name = "metastore.control_plane.register_file_for_indexing", skip_all)]
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> MetastoreResult<RegisterFileForIndexingResponse> {
+        self.metastore.register_file_for_indexing(request).await
+    }
+
+    #[instrument(name = "metastore.control_plane.assign_files_for_indexing", skip_all)]
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> MetastoreResult<AssignFilesForIndexingResponse> {
+        self.metastore.assign_files_for_indexing(request).await
+    }
+
+    #[instrument(name = "metastore.control_plane.list_completed_files", skip_all)]
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> MetastoreResult<ListCompletedFilesResponse> {
+        self.metastore.list_completed_files(request).await
+    }
+
+    #[instrument(name = "metastore.control_plane.publish_file_splits", skip_all)]
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> MetastoreResult<PublishFileSplitsResponse> {
+        self.metastore.publish_file_splits(request).await
     }
 
     #[instrument(name = "metastore.control_plane.stage_splits", skip_all, fields(index_uid = %request.index_uid()))]

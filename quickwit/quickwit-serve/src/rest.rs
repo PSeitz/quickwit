@@ -517,6 +517,12 @@ fn api_v1_routes(
     quickwit_services: Arc<QuickwitServices>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     let api_v1_root_url = warp::path!("api" / "v1" / ..);
+    let ingesthree_enabled = quickwit_services
+        .node_config
+        .ingest_api_config
+        .enable_ingesthree;
+    let legacy_ingest_enabled = !ingesthree_enabled && !disable_ingest_v1();
+    let router_ingest_enabled = ingesthree_enabled || enable_ingest_v2();
     api_v1_root_url.and(
         elastic_api_handlers(
             quickwit_services.cluster.clone(),
@@ -526,8 +532,8 @@ fn api_v1_routes(
             quickwit_services.ingest_router_service.clone(),
             quickwit_services.metastore_client.clone(),
             quickwit_services.index_manager.clone(),
-            !disable_ingest_v1(),
-            enable_ingest_v2(),
+            legacy_ingest_enabled,
+            router_ingest_enabled,
         )
         .or(cluster_handler(quickwit_services.cluster.clone()))
         .boxed()
@@ -547,8 +553,8 @@ fn api_v1_routes(
             quickwit_services.ingest_router_service.clone(),
             quickwit_services.ingest_service.clone(),
             quickwit_services.node_config.ingest_api_config.clone(),
-            !disable_ingest_v1(),
-            enable_ingest_v2(),
+            legacy_ingest_enabled,
+            router_ingest_enabled,
         ))
         .boxed()
         .or(otlp_ingest_api_handlers(
@@ -914,8 +920,9 @@ mod tests {
             index_manager: index_service,
             ingest_service: ingest_service_client(),
             ingest_router_opt: None,
-            ingest_router_service: IngestRouterServiceClient::mocked(),
+            ingest_router_service: IngestRouterServiceClient::mocked().into(),
             ingester_opt: None,
+            ingesthree_service_opt: None,
             janitor_service_opt: None,
             otlp_logs_service_opt: None,
             otlp_traces_service_opt: None,

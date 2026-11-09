@@ -102,10 +102,21 @@ impl PutPayload for SplitPayload {
     }
 }
 
+/// A local file streamed in ranges for uploads and their retries.
+/// The caller keeps the file's path and contents unchanged until the upload completes.
+/// Streaming requires nonempty byte ranges.
 #[derive(Clone)]
-struct FilePayload {
+pub struct FilePayload {
     len: u64,
     path: PathBuf,
+}
+
+impl FilePayload {
+    /// Creates a payload using the file's known length, without reading it into memory.
+    /// `len` must equal the file's byte length.
+    pub fn new(path: PathBuf, len: u64) -> Self {
+        Self { len, path }
+    }
 }
 
 #[async_trait]
@@ -189,10 +200,7 @@ impl SplitPayloadBuilder {
                 )
             })?;
 
-        let file_payload = FilePayload {
-            path: path.to_owned(),
-            len: file.len(),
-        };
+        let file_payload = FilePayload::new(path.to_owned(), file.len());
 
         self.add_payload(file_name, Box::new(file_payload));
 

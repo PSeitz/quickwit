@@ -28,22 +28,24 @@ use quickwit_config::{
 };
 use quickwit_proto::ingest::{Shard, ShardState};
 use quickwit_proto::metastore::{
-    AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
-    CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
-    DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
-    DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse, EntityKind,
-    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
-    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
-    IndexMetadataFailure, IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse,
-    IndexStats, IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse,
-    LastDeleteOpstampRequest, LastDeleteOpstampResponse, ListDeleteTasksRequest,
-    ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
+    AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, AssignFilesForIndexing,
+    AssignFilesForIndexingResponse, CreateIndexRequest, CreateIndexResponse,
+    CreateIndexTemplateRequest, DeleteIndexRequest, DeleteIndexTemplatesRequest, DeleteQuery,
+    DeleteShardsRequest, DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest,
+    DeleteTask, EmptyResponse, EntityKind, FindIndexTemplateMatchesRequest,
+    FindIndexTemplateMatchesResponse, GetClusterIdentityRequest, GetClusterIdentityResponse,
+    GetIndexTemplateRequest, GetIndexTemplateResponse, IndexMetadataFailure,
+    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexStats,
+    IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
+    LastDeleteOpstampResponse, ListCompletedFilesRequest, ListCompletedFilesResponse,
+    ListDeleteTasksRequest, ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
     ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
     ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListShardsSubresponse,
     ListSplitsRequest, ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest,
     MetastoreError, MetastoreResult, MetastoreService, MetastoreServiceStream, OpenShardSubrequest,
     OpenShardSubresponse, OpenShardsRequest, OpenShardsResponse, PruneShardsRequest,
-    PublishSplitsRequest, ResetSourceCheckpointRequest, SplitStats, StageSplitsRequest,
+    PublishFileSplits, PublishFileSplitsResponse, PublishSplitsRequest, RegisterFileForIndexing,
+    RegisterFileForIndexingResponse, ResetSourceCheckpointRequest, SplitStats, StageSplitsRequest,
     ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
     UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
@@ -668,6 +670,38 @@ impl MetastoreService for PostgresqlMetastore {
         Ok(EmptyResponse {})
     }
 
+    #[instrument(name = "metastore.postgres.register_file_for_indexing", skip_all)]
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> MetastoreResult<RegisterFileForIndexingResponse> {
+        super::staged_files::register_file_for_indexing(&self.connection_pool, request).await
+    }
+
+    #[instrument(name = "metastore.postgres.assign_files_for_indexing", skip_all)]
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> MetastoreResult<AssignFilesForIndexingResponse> {
+        super::staged_files::assign_files_for_indexing(&self.connection_pool, request).await
+    }
+
+    #[instrument(name = "metastore.postgres.list_completed_files", skip_all)]
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> MetastoreResult<ListCompletedFilesResponse> {
+        super::staged_files::list_completed_files(&self.connection_pool, request).await
+    }
+
+    #[instrument(name = "metastore.postgres.publish_file_splits", skip_all)]
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> MetastoreResult<PublishFileSplitsResponse> {
+        super::staged_files::publish_file_splits(&self.connection_pool, request).await
+    }
+
     #[instrument(name = "metastore.postgres.stage_splits", skip_all, fields(split_ids))]
     async fn stage_splits(&self, request: StageSplitsRequest) -> MetastoreResult<EmptyResponse> {
         let index_uid: IndexUid = request.index_uid().clone();
@@ -726,6 +760,8 @@ impl MetastoreService for PostgresqlMetastore {
                 FROM
                     UNNEST($1, $2, $3, $4, $5, $6, $7, $8)
                     AS staged_splits (split_id, time_range_start, time_range_end, tags_json, split_metadata_json, delete_opstamp, maturity_timestamp, node_id)
+                -- Match publication's split lock order when retrying staging.
+                ORDER BY split_id
                 ON CONFLICT(index_uid, split_id) DO UPDATE
                     SET
                         time_range_start = excluded.time_range_start,
@@ -1087,6 +1123,7 @@ impl MetastoreService for PostgresqlMetastore {
                     WHERE
                         index_uid = $1
                         AND split_id = ANY($2)
+                    ORDER BY split_id
                     FOR UPDATE
                     ) AS splits
                 USING (split_id)
@@ -1160,6 +1197,7 @@ impl MetastoreService for PostgresqlMetastore {
                     WHERE
                         index_uid = $1
                         AND split_id = ANY($2)
+                    ORDER BY split_id
                     FOR UPDATE
                     ) AS splits
                 USING (split_id)
@@ -2033,6 +2071,10 @@ impl crate::tests::DefaultForTest for PostgresqlMetastore {
 }
 
 #[cfg(test)]
+#[path = "staged_files_tests.rs"]
+mod staged_files_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
@@ -2120,6 +2162,39 @@ mod tests {
                 .into_iter()
                 .map(|pg_shard| pg_shard.into())
                 .collect()
+        }
+    }
+
+    #[async_trait]
+    impl crate::tests::staged_file::WriteStagedFileForTest for PostgresqlMetastore {
+        async fn set_staged_file(
+            &self,
+            staged_file: quickwit_proto::metastore::DocumentsStagedForUpload,
+        ) {
+            let result = sqlx::query(
+                "UPDATE staged_files SET create_timestamp = to_timestamp($3),
+                 processing_started_timestamp = to_timestamp($4), completed_timestamp = \
+                 to_timestamp($5), publication_id = $6
+                 WHERE index_uid = $1 AND file_id = $2",
+            )
+            .bind(staged_file.index_uid())
+            .bind(&staged_file.file_id)
+            .bind(staged_file.create_timestamp as f64)
+            .bind(
+                staged_file
+                    .processing_started_timestamp
+                    .map(|timestamp| timestamp as f64),
+            )
+            .bind(
+                staged_file
+                    .completed_timestamp
+                    .map(|timestamp| timestamp as f64),
+            )
+            .bind(&staged_file.publication_id)
+            .execute(&self.connection_pool)
+            .await
+            .unwrap();
+            assert_eq!(result.rows_affected(), 1);
         }
     }
 

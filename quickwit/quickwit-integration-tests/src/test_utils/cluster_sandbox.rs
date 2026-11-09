@@ -318,7 +318,8 @@ impl ClusterSandbox {
                     shutdown_signal,
                     quickwit_serve::do_nothing_env_filter_reload_fn(),
                 )
-                .await?;
+                .await
+                .inspect_err(|error| tracing::error!(%node_id, ?error, "node failed"))?;
                 debug!("{node_id} stopped successfully ({services:?})");
                 Result::<_, anyhow::Error>::Ok(result)
             }
@@ -355,6 +356,30 @@ impl ClusterSandbox {
         self.spawn_node(config.clone(), config_builder.services.clone());
         self.node_configs
             .push((config, config_builder.services.clone()));
+    }
+
+    /// Restarts a removed, fully shut down node with its original identity and data directory.
+    pub async fn restart_node(&mut self, config: NodeConfig) {
+        assert!(
+            self.node_configs
+                .iter()
+                .all(|(node, _)| node.node_id != config.node_id)
+        );
+        let mut addresses = vec![config.rest_config.listen_addr, config.grpc_listen_addr];
+        if let Some(health) = &config.health_config {
+            addresses.push(health.listen_addr);
+        }
+        for address in addresses {
+            self.tcp_listener_resolver
+                .add_listener(TcpListener::bind(address).await.unwrap())
+                .await;
+        }
+        let services = config.enabled_services.clone();
+        self.spawn_node(config.clone(), services.clone());
+        self.node_configs.push((config, services));
+        self.wait_for_cluster_num_ready_nodes(self.node_configs.len())
+            .await
+            .unwrap();
     }
 
     fn find_node_for_service(&self, service: QuickwitService) -> NodeConfig {
@@ -474,8 +499,10 @@ impl ClusterSandbox {
         &self,
         expected_num_ready_nodes: usize,
     ) -> anyhow::Result<()> {
+        // Preserve the last response in the timeout error even when test logging is disabled.
+        let last_cluster_response = std::sync::Mutex::new("request pending".to_string());
         wait_until_predicate(
-            || async move {
+            || async {
                 match self
                     .rest_client(QuickwitService::Metastore)
                     .cluster()
@@ -483,11 +510,14 @@ impl ClusterSandbox {
                     .await
                 {
                     Ok(result) => {
+                        *last_cluster_response.lock().unwrap() = format!("{result:?}");
                         if result.ready_nodes.len() != expected_num_ready_nodes {
                             debug!(
-                                "wait_for_cluster_num_ready_nodes expected {} ready nodes, got {}",
                                 expected_num_ready_nodes,
-                                result.live_nodes.len()
+                                ready_nodes = ?result.ready_nodes,
+                                live_nodes = ?result.live_nodes,
+                                dead_nodes = ?result.dead_nodes,
+                                "waiting for cluster readiness"
                             );
                             false
                         } else {
@@ -495,6 +525,7 @@ impl ClusterSandbox {
                         }
                     }
                     Err(err) => {
+                        *last_cluster_response.lock().unwrap() = format!("{err:?}");
                         debug!("wait_for_cluster_num_ready_nodes error {err}");
                         false
                     }
@@ -503,7 +534,13 @@ impl ClusterSandbox {
             Duration::from_secs(30),
             Duration::from_millis(100),
         )
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "expected {expected_num_ready_nodes} ready nodes; last cluster response: {}",
+                last_cluster_response.lock().unwrap()
+            )
+        })?;
         Ok(())
     }
 

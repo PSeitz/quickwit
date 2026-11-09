@@ -352,6 +352,94 @@ pub(crate) mod tests {
         ENABLED_SERVICES_KEY, GRPC_ADVERTISE_ADDR_KEY, READINESS_KEY, READINESS_VALUE_NOT_READY,
         READINESS_VALUE_READY,
     };
+    use crate::node::{INGESTHREE_CAPACITY_KEY, INGESTHREE_ENABLED_KEY};
+
+    #[tokio::test]
+    async fn test_ingesthree_discovery_defaults_to_v2_and_emits_updates() {
+        let id = ChitchatId::for_local_test(1234);
+        let channel = Channel::from_static("http://127.0.0.1:7281").connect_lazy();
+        let mut state = NodeStateBuilder::default().with_readiness(true).build();
+        let original = ClusterNode::try_new(id.clone(), &state, channel.clone(), true).unwrap();
+        assert!(original.is_ingester());
+        assert!(!original.is_ingesthree());
+        let mut previous_nodes = BTreeMap::from([(original.node_id.clone(), original)]);
+
+        state.set(INGESTHREE_ENABLED_KEY, "true");
+        let event = compute_cluster_change_events_on_updated(
+            "cluster",
+            &id,
+            &id,
+            &state,
+            &mut previous_nodes,
+        )
+        .await
+        .unwrap();
+        let ClusterChange::Update { previous, updated } = event else {
+            panic!("expected update")
+        };
+        // ClusterMember literals and their contents stay unchanged, yet the capability updates.
+        assert_eq!(previous.member(), updated.member());
+        assert_ne!(previous, updated);
+        assert!(updated.is_ingesthree());
+        assert!(!updated.is_ingester());
+
+        state.set(INGESTHREE_ENABLED_KEY, "false");
+        let event = compute_cluster_change_events_on_updated(
+            "cluster",
+            &id,
+            &id,
+            &state,
+            &mut previous_nodes,
+        )
+        .await
+        .unwrap();
+        let ClusterChange::Update { updated, .. } = event else {
+            panic!("expected update")
+        };
+        assert!(updated.is_ingester());
+        assert!(!updated.is_ingesthree());
+
+        state.set(INGESTHREE_ENABLED_KEY, "true");
+        state.set(ENABLED_SERVICES_KEY, "searcher");
+        let searcher = ClusterNode::try_new(id.clone(), &state, channel.clone(), true).unwrap();
+        assert!(!searcher.is_ingesthree());
+        assert!(!searcher.is_ingester());
+        state.set(INGESTHREE_ENABLED_KEY, "invalid");
+        assert!(ClusterNode::try_new(id, &state, channel, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ingesthree_capacity_discovery_and_updates() {
+        let id = ChitchatId::for_local_test(1234);
+        let channel = Channel::from_static("http://127.0.0.1:7281").connect_lazy();
+        let mut state = NodeStateBuilder::default().with_readiness(true).build();
+        state.set(INGESTHREE_ENABLED_KEY, "true");
+        let original = ClusterNode::try_new(id.clone(), &state, channel.clone(), true).unwrap();
+        assert_eq!(original.ingesthree_capacity(), None);
+        let mut previous_nodes = BTreeMap::from([(original.node_id.clone(), original)]);
+        for score in [10, 0, 5] {
+            state.set(INGESTHREE_CAPACITY_KEY, score.to_string());
+            let event = compute_cluster_change_events_on_updated(
+                "cluster",
+                &id,
+                &id,
+                &state,
+                &mut previous_nodes,
+            )
+            .await
+            .unwrap();
+            let ClusterChange::Update { previous, updated } = event else {
+                panic!("expected capacity update")
+            };
+            assert_eq!(previous.member(), updated.member());
+            assert_ne!(previous, updated);
+            assert_eq!(updated.ingesthree_capacity(), Some(score));
+        }
+        for invalid in ["11", "-1", "invalid"] {
+            state.set(INGESTHREE_CAPACITY_KEY, invalid);
+            assert!(ClusterNode::try_new(id.clone(), &state, channel.clone(), true).is_err());
+        }
+    }
 
     pub(crate) struct NodeStateBuilder {
         enabled_services: HashSet<QuickwitService>,

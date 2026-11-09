@@ -16,11 +16,10 @@ use std::collections::HashMap;
 
 use quickwit_common::rate_limited_warn;
 use quickwit_config::{INGEST_V2_SOURCE_ID, validate_identifier, validate_index_id_pattern};
+use quickwit_ingest::router_client::IngestRouterClient;
 use quickwit_ingest::{CommitType, IngestServiceError};
 use quickwit_proto::ingest::DocBatchV2;
-use quickwit_proto::ingest::router::{
-    IngestRequestV2, IngestRouterService, IngestRouterServiceClient, IngestSubrequest,
-};
+use quickwit_proto::ingest::router::{IngestRequestV2, IngestSubrequest};
 use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpValue;
 use quickwit_proto::opentelemetry::proto::common::v1::{
     AnyValue as OtlpAnyValue, ArrayValue as OtlpArrayValue, KeyValue as OtlpKeyValue,
@@ -215,7 +214,7 @@ pub(crate) fn extract_otel_index_id_from_metadata(
 }
 
 pub async fn ingest_doc_batch_v2(
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
     index_id: String,
     doc_batch: DocBatchV2,
     commit_type: CommitType,

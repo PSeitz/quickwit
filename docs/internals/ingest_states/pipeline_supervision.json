@@ -1,0 +1,49 @@
+{
+  "snapshot": "83faf58e19172e3aa65afd41c6cd7df7b10bfaea",
+  "scope": "Selected pipeline-supervision contract, added after the original 12724a544 inventory. Sources resolve at this snapshot. This adds design states, not an implemented supervisor or a recount of the older ledgers.",
+  "counting_rule": "Count named local states excluding shared aliases and distinct non-self directed edges. Count the supervisor policy once and the pipeline-slot ownership type once, without multiplying by pipelines or forming a global state product.",
+  "exclusions": [
+    "Generic task execution, completion, panic and cancellation remain in the shared runtime inventory. A retained task handle can refer to a completed task until the supervisor observes its result.",
+    "Backoff duration, retry counters, pipeline count, JoinSet selection and optional stuck-task progress checks remain implementation choices. No polling loop, spawn permit, timer task or extra execution queue is inferred.",
+    "Supervisor wait/select topology and corresponding owner-qualified dependency states remain unenumerated. This addition counts restart permission and handle/backoff ownership only.",
+    "Draining disables replacement. The contract does not yet specify how active pipelines are stopped or joined during drain, so no additional cancellation/join protocol is counted.",
+    "Restart changes local processing capacity only. Assignment eligibility, retry thresholds and publication winners remain in the existing file protocol graphs.",
+    "Process-wide restart belongs to the deployment system and is outside this supervisor's contract."
+  ],
+  "graphs": [
+    {
+      "id": "proposed_pipeline_restart_policy",
+      "design": "proposed",
+      "category": "control",
+      "dimension": "control",
+      "status": "specification_only",
+      "applies_to": ["proposed"],
+      "states": ["restarts_enabled", "restarts_disabled"],
+      "shared_states": [],
+      "edges": [
+        ["restarts_enabled", "restarts_disabled", "indexer enters drain or shutdown; no further pipeline replacements are allowed"]
+      ],
+      "sources": ["design_answers.md#L114-L120"],
+      "notes": "One supervisor per indexer process owns this policy. No resume-from-drain transition is selected. Disabling restarts does not itself assert that running pipelines have exited or that their resources are released."
+    },
+    {
+      "id": "proposed_pipeline_slot_ownership",
+      "design": "proposed",
+      "category": "control",
+      "dimension": "ownership",
+      "status": "specification_only",
+      "applies_to": ["proposed"],
+      "states": ["no_task", "task_handle_owned", "restart_backoff"],
+      "shared_states": [],
+      "edges": [
+        ["no_task", "task_handle_owned", "supervisor starts a pipeline while starts are permitted"],
+        ["task_handle_owned", "restart_backoff", "supervisor observes an error, panic or unexpected exit while restarts are enabled"],
+        ["restart_backoff", "task_handle_owned", "backoff has elapsed and restarts remain enabled; supervisor starts replacement"],
+        ["task_handle_owned", "no_task", "supervisor observes task completion while restarts are disabled"],
+        ["restart_backoff", "no_task", "drain or shutdown suppresses the pending replacement"]
+      ],
+      "sources": ["design_answers.md#L114-L120"],
+      "notes": "This is the supervisor's ownership/replacement obligation for one pipeline slot, not another task execution graph. task_handle_owned includes an idle pipeline and a completed task whose result has not yet been observed. Errors, panics and unexpected exits share the same restart edge. no_task means no owned pipeline and no pending replacement obligation; it does not assert cancellation of any timer implementation. Processing another file does not change this ownership state. Replacements leave input assignment and completion unchanged."
+    }
+  ]
+}

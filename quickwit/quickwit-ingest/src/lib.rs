@@ -21,6 +21,7 @@ mod ingest_api_service;
 #[allow(clippy::disallowed_methods)]
 mod ingest_service;
 mod ingest_v2;
+pub mod ingesthree;
 mod memory_capacity;
 mod metrics;
 mod mrecordlog_async;
@@ -28,6 +29,7 @@ mod ndjson;
 mod notifications;
 mod position;
 mod queue;
+pub mod router_client;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -710,6 +710,10 @@ pub enum CompressionAlgorithm {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IngestApiConfig {
+    /// Use ingesthree routing and file intake on this node. Indexers also run a file-indexing
+    /// worker and require `enable_standalone_compactors`. Experimental. Defaults to the existing
+    /// ingest path.
+    pub enable_ingesthree: bool,
     /// Maximum memory space taken by the ingest WAL
     pub max_queue_memory_usage: ByteSize,
     /// Maximum disk space taken by the ingest WAL
@@ -739,6 +743,7 @@ pub struct IngestApiConfig {
 impl Default for IngestApiConfig {
     fn default() -> Self {
         Self {
+            enable_ingesthree: false,
             max_queue_memory_usage: ByteSize::gib(2),
             max_queue_disk_usage: ByteSize::gib(4),
             _replication_factor: None,
@@ -1101,6 +1106,18 @@ mod tests {
         let ingest_api_config: IngestApiConfig = serde_yaml::from_str("").unwrap();
         assert!(ingest_api_config.validate().is_ok());
         assert_eq!(ingest_api_config, IngestApiConfig::default());
+    }
+
+    #[test]
+    fn test_ingesthree_requires_opt_in() {
+        let default: IngestApiConfig = serde_yaml::from_str("").unwrap();
+        assert!(!default.enable_ingesthree);
+        let enabled: IngestApiConfig = serde_yaml::from_str("enable_ingesthree: true").unwrap();
+        assert!(enabled.enable_ingesthree);
+        assert!(enabled.validate().is_ok());
+        let roundtrip: IngestApiConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&enabled).unwrap()).unwrap();
+        assert_eq!(roundtrip, enabled);
     }
 
     #[test]

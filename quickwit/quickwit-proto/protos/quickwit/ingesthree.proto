@@ -1,0 +1,32 @@
+// Copyright 2021-Present Datadog, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package quickwit.ingest.ingesthree;
+
+import "quickwit/router.proto";
+
+// Internal file intake, separate from v2 shard persistence and routing.
+service IngesthreeService {
+  // Requires exactly one `ingest-version: ingesthree` metadata value. The server
+  // checks it before index lookup or queue admission. Exactly one subrequest,
+  // Auto commits, and the INGEST_V2_SOURCE_ID source are supported. Success means
+  // a local kernel write with no fsync, replication or search-visibility guarantee.
+  // Shard and position fields in successes are absent. Capacity failures return
+  // RESOURCE_EXHAUSTED, which public routers map to LOAD_SHEDDING.
+  // Retrying after an unavailable response is at-least-once and may duplicate data.
+  rpc Ingest(quickwit.ingest.router.IngestRequestV2)
+      returns (quickwit.ingest.router.IngestResponseV2);
+}

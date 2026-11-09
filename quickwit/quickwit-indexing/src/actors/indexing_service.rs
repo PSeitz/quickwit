@@ -61,10 +61,14 @@ use tracing::{debug, error, info, warn};
 use super::merge_pipeline::{MergePipeline, MergePipelineParams};
 use super::{FinishPendingMergesAndShutdownPipeline, MergePlanner, MergeSchedulerService};
 use crate::docs_clustering::Fingerprinter;
+use crate::ingesthree::S3IndexerSupervisor;
 use crate::models::{DetachIndexingPipeline, DetachMergePipeline, ObservePipeline, SpawnPipeline};
 use crate::source::{AssignShards, Assignment};
 use crate::split_store::IndexingSplitCache;
 use crate::{IndexingPipeline, IndexingPipelineParams, IndexingSplitStore, IndexingStatistics};
+
+#[path = "../ingesthree/service.rs"]
+mod file_indexing;
 
 /// Name of the indexing directory, usually located at `<data_dir_path>/indexing`.
 pub const INDEXING_DIR_NAME: &str = "indexing";
@@ -118,6 +122,8 @@ pub struct IndexingService {
     merge_scheduler_service_opt: Option<Mailbox<MergeSchedulerService>>,
     split_cache: Arc<IndexingSplitCache>,
     merge_pipeline_handles: HashMap<MergePipelineId, MergePipelineHandle>,
+    ingesthree_enabled: bool,
+    s3_indexers: Vec<S3IndexerSupervisor>,
     cooperative_indexing_permits: Option<Arc<Semaphore>>,
     fingerprinter_opt: Option<Fingerprinter>,
     indexing_io_throughput_limiter_opt: Option<io::Limiter>,
@@ -180,6 +186,8 @@ impl IndexingService {
             counters: Default::default(),
             max_concurrent_split_uploads: indexer_config.max_concurrent_split_uploads,
             merge_pipeline_handles: HashMap::new(),
+            ingesthree_enabled: false,
+            s3_indexers: Vec::new(),
             fingerprinter_opt,
             indexing_io_throughput_limiter_opt,
             merge_io_throughput_limiter_opt,
@@ -1000,7 +1008,17 @@ impl Actor for IndexingService {
 
     async fn initialize(&mut self, ctx: &ActorContext<Self>) -> Result<(), ActorExitStatus> {
         self.run_ingest_api_queues_gc().await?;
+        self.start_s3_indexers()?;
         self.handle(SuperviseLoop, ctx).await
+    }
+
+    async fn finalize(
+        &mut self,
+        _exit_status: &ActorExitStatus,
+        _ctx: &ActorContext<Self>,
+    ) -> anyhow::Result<()> {
+        self.stop_s3_indexers().await;
+        Ok(())
     }
 }
 

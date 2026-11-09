@@ -30,8 +30,10 @@ mod uploader;
 #[cfg(feature = "vrl")]
 mod vrl_processing;
 
+pub(crate) use doc_processor::DocumentConverter;
 pub use doc_processor::{DocProcessor, DocProcessorCounters};
 pub use index_serializer::IndexSerializer;
+pub(crate) use indexer::OTHER_PARTITION_ID;
 pub use indexer::{Indexer, IndexerCounters};
 pub use indexing_pipeline::{IndexingPipeline, IndexingPipelineParams};
 pub use indexing_service::{INDEXING_DIR_NAME, IndexingService, IndexingServiceCounters};
@@ -45,7 +47,9 @@ pub(crate) use merge_planner::RunFinalizeMergePolicyAndQuit;
 pub use merge_scheduler_service::{MergePermit, MergeSchedulerService, schedule_merge};
 pub use merge_split_downloader::MergeSplitDownloader;
 pub use packager::Packager;
+pub(crate) use packager::create_packaged_split;
 pub use publisher::{Publisher, PublisherCounters, PublisherType};
 pub use quickwit_proto::indexing::IndexingError;
 pub use sequencer::Sequencer;
 pub use uploader::{SplitsUpdateMailbox, Uploader, UploaderCounters, UploaderType};
+pub(crate) use uploader::{acquire_indexing_upload_permit, prepare_split_for_upload};

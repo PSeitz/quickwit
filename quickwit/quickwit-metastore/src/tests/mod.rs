@@ -25,13 +25,18 @@ use quickwit_proto::metastore::{
 use quickwit_proto::tonic::transport::Channel;
 use quickwit_proto::types::IndexUid;
 
+pub(crate) mod completed_files;
 pub(crate) mod delete_task;
+pub(crate) mod file_assignment;
+pub(crate) mod file_publication;
+pub(crate) mod file_publication_validation;
 pub(crate) mod get_identity;
 pub(crate) mod index;
 pub(crate) mod list_splits;
 pub(crate) mod shard;
 pub(crate) mod source;
 pub(crate) mod split;
+pub(crate) mod staged_file;
 pub(crate) mod template;
 
 use crate::metastore::MetastoreServiceStreamSplitsExt;
@@ -168,6 +173,125 @@ macro_rules! metastore_test_suite {
     ($metastore_type:ty) => {
         #[cfg(test)]
         mod common_tests {
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_register_file_for_indexing() {
+                $crate::tests::staged_file::test_register_file_for_indexing::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_register_file_for_indexing_invalid_request() {
+                $crate::tests::staged_file::test_register_file_for_indexing_invalid_request::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_register_file_for_indexing_index_incarnation() {
+                $crate::tests::staged_file::test_register_file_for_indexing_index_incarnation::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_register_file_for_indexing_concurrent_retries() {
+                $crate::tests::staged_file::test_register_file_for_indexing_concurrent_retries::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_register_file_for_indexing_preserves_progress() {
+                $crate::tests::staged_file::test_register_file_for_indexing_preserves_progress::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_list_completed_files() {
+                $crate::tests::completed_files::test_list_completed_files::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_list_completed_files_validation() {
+                $crate::tests::completed_files::test_list_completed_files_validation::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_oldest_index_group() {
+                $crate::tests::file_assignment::test_assign_files_oldest_index_group::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_count_and_byte_prefix() {
+                $crate::tests::file_assignment::test_assign_files_count_and_byte_prefix::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_lost_response_and_expiry() {
+                $crate::tests::file_assignment::test_assign_files_lost_response_and_expiry::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_concurrent() {
+                $crate::tests::file_assignment::test_assign_files_concurrent::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_invalid_request() {
+                $crate::tests::file_assignment::test_assign_files_invalid_request::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_atomic_and_retry() {
+                $crate::tests::file_publication::test_publish_file_splits_atomic_and_retry::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_zero_outputs() {
+                $crate::tests::file_publication::test_publish_file_splits_zero_outputs::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_older_attempt() {
+                $crate::tests::file_publication::test_publish_file_splits_older_attempt::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_overlap() {
+                $crate::tests::file_publication::test_publish_file_splits_overlap::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_concurrent() {
+                $crate::tests::file_publication::test_publish_file_splits_concurrent::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_output_rollback() {
+                $crate::tests::file_publication_validation::test_publish_file_splits_output_rollback::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_missing_inputs_and_index() {
+                $crate::tests::file_publication_validation::test_publish_file_splits_missing_inputs_and_index::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_publish_file_splits_invalid_request() {
+                $crate::tests::file_publication_validation::test_publish_file_splits_invalid_request::<$metastore_type>().await;
+            }
 
             // Index API tests
             //

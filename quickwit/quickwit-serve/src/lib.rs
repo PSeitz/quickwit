@@ -26,6 +26,7 @@ mod health_check_api;
 mod index_api;
 mod indexing_api;
 mod ingest_api;
+mod ingesthree;
 mod jaeger_api;
 mod load_shield;
 mod mcp_api;
@@ -87,6 +88,7 @@ use quickwit_index_management::{IndexService as IndexManager, IndexServiceError}
 use quickwit_indexing::actors::{IndexingService, MergeSchedulerService};
 use quickwit_indexing::models::ShardPositionsService;
 use quickwit_indexing::{IndexingSplitCache, start_indexing_service};
+use quickwit_ingest::router_client::IngestRouterClient;
 use quickwit_ingest::{
     GetMemoryCapacity, IngestRequest, IngestRouter, IngestServiceClient, Ingester, IngesterPool,
     IngesterPoolEntry, LocalShardsUpdate, get_idle_shard_timeout,
@@ -142,7 +144,9 @@ use crate::rate_modulator::RateModulator;
 use crate::rest::recover_fn;
 pub use crate::search_api::{SearchRequestQueryString, SortBy, search_request_from_api_request};
 
-const COMPACTION_SERVICE_DISCOVERY_TIMEOUT: Duration = if cfg!(any(test, feature = "testsuite")) {
+// Shorten unit-test error paths only. Integration tests need real startup discovery while
+// the remote Janitor starts concurrently, and enforce their own cluster-readiness deadline.
+const COMPACTION_SERVICE_DISCOVERY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
     Duration::from_mins(5)
@@ -188,8 +192,9 @@ struct QuickwitServices {
     pub ingest_service: IngestServiceClient,
     // Ingest v2
     pub ingest_router_opt: Option<IngestRouter>,
-    pub ingest_router_service: IngestRouterServiceClient,
+    pub ingest_router_service: IngestRouterClient,
     ingester_opt: Option<Ingester>,
+    ingesthree_service_opt: Option<quickwit_ingest::ingesthree::IngesthreeService>,
 
     pub compaction_service_client_opt: Option<CompactionPlannerServiceClient>,
     pub compactor_service_opt: Option<Mailbox<CompactorService>>,
@@ -230,8 +235,14 @@ async fn balance_channel_for_service(
     let cluster_change_stream = cluster.change_stream();
     let service_change_stream = cluster_change_stream.filter_map(move |cluster_change| {
         Box::pin(async move {
+            // The Indexer channel here serves legacy ingest. Ingesthree nodes mount a
+            // separate intake RPC. Indexing-service clients use setup_indexer_pool.
+            let accepts_node = |node: &ClusterNode| {
+                node.is_service_enabled(service)
+                    && (service != QuickwitService::Indexer || node.is_ingester())
+            };
             match cluster_change {
-                ClusterChange::Add(node) if node.is_service_enabled(service) => {
+                ClusterChange::Add(node) if accepts_node(&node) => {
                     let chitchat_id = node.chitchat_id();
                     info!(
                         remote_node_id = %chitchat_id.node_id,
@@ -242,7 +253,19 @@ async fn balance_channel_for_service(
                     );
                     Some(Change::Insert(node.grpc_advertise_addr, node.channel()))
                 }
-                ClusterChange::Remove(node) if node.is_service_enabled(service) => {
+                ClusterChange::Update { previous, updated }
+                    if accepts_node(&previous) != accepts_node(&updated) =>
+                {
+                    if accepts_node(&updated) {
+                        Some(Change::Insert(
+                            updated.grpc_advertise_addr,
+                            updated.channel(),
+                        ))
+                    } else {
+                        Some(Change::Remove(previous.grpc_advertise_addr))
+                    }
+                }
+                ClusterChange::Remove(node) if accepts_node(&node) => {
                     let chitchat_id = node.chitchat_id();
                     info!(
                         remote_node_id = %chitchat_id.node_id,
@@ -354,7 +377,7 @@ async fn start_ingest_client_if_needed(
     universe: &Universe,
     cluster: &Cluster,
 ) -> anyhow::Result<IngestServiceClient> {
-    if disable_ingest_v1() {
+    if disable_ingest_v1() || node_config.ingest_api_config.enable_ingesthree {
         debug!("returning no-op ingest service because ingest v1 is disabled");
         let (balance_channel, _change_tx) = BalanceChannel::new();
         let ingest_service = IngestServiceClient::from_balance_channel(
@@ -506,6 +529,8 @@ async fn shutdown_signal_handler(
     shutdown_token: CancellationToken,
     universe: Universe,
     ingester_opt: Option<Ingester>,
+    ingesthree_queue_opt: Option<quickwit_ingest::ingesthree::WriteQueue>,
+    indexing_service_opt: Option<Mailbox<IndexingService>>,
     ingester_decommission_timeout: Duration,
     compactor_service_opt: Option<Mailbox<CompactorService>>,
     compactor_decommission_timeout: Duration,
@@ -521,6 +546,14 @@ async fn shutdown_signal_handler(
         _ = shutdown_token.cancelled() => {
             error!("server supervisor exited; initiating shutdown");
         }
+    }
+    if let Some(queue) = &ingesthree_queue_opt {
+        // V2 keeps its retiring ingester discoverable until WAL draining completes.
+        cluster.set_self_node_readiness(false).await;
+        let indexing_service = indexing_service_opt
+            .as_ref()
+            .expect("file intake starts only alongside the indexing service");
+        ingesthree::shutdown(queue, indexing_service, ingester_decommission_timeout).await;
     }
     if let Some(ingester) = &ingester_opt
         && let Err(error) = ingester.decommission(DecommissionRequest {}).await
@@ -573,9 +606,11 @@ pub async fn serve_quickwit(
     metastore_resolver: MetastoreResolver,
     storage_resolver: StorageResolver,
     tcp_listener_resolver: impl TcpListenerResolver,
-    shutdown_signal: BoxFutureInfaillible<()>,
+    mut shutdown_signal: BoxFutureInfaillible<()>,
     env_filter_reload_fn: EnvFilterReloadFn,
 ) -> anyhow::Result<HashMap<String, ActorExitStatus>> {
+    ingesthree::validate_config(&node_config)?;
+
     let cluster = start_cluster_service(&node_config)
         .await
         .context("failed to start cluster service")?;
@@ -673,16 +708,53 @@ pub async fn serve_quickwit(
         node_config.grpc_config.max_message_size,
     );
 
-    // Setup ingest service v2.
-    let (ingest_router, ingest_router_service, ingester_opt) = setup_ingest_v2(
-        &node_config,
-        &cluster,
-        &event_broker,
-        control_plane_client.clone(),
-        ingester_pool,
-    )
-    .await
-    .context("failed to start ingest v2 service")?;
+    let mut ingesthree_queue_opt = None;
+    let (ingest_router_opt, ingest_router_service, ingester_opt) =
+        if node_config.ingest_api_config.enable_ingesthree {
+            if node_config.is_service_enabled(QuickwitService::Indexer) {
+                // Recovery may wait on storage or metastore. Shutdown must also be able to
+                // cancel startup before the public servers and shutdown handler exist.
+                let queue = tokio::select! {
+                    result = ingesthree::open(
+                        &node_config,
+                        primary_metastore_through_control_plane.clone(),
+                        &storage_resolver,
+                    ) => result?,
+                    _ = &mut shutdown_signal => {
+                        cluster.initiate_shutdown().await?;
+                        return Ok(universe.quit().await);
+                    }
+                };
+                ingesthree_queue_opt = Some(queue);
+                cluster.set_self_ingesthree_enabled(true).await;
+            }
+            // The control plane and existing source pipelines can still need v2 peers.
+            // This pool excludes ingesthree destinations and never receives its traffic.
+            setup_ingester_pool(
+                cluster.change_stream(),
+                None,
+                ingester_pool,
+                node_config.ingest_api_config.grpc_compression_encoding(),
+                node_config.grpc_config.max_message_size,
+            );
+            let router = quickwit_ingest::ingesthree::IngesthreeRouter::new(
+                cluster.clone(),
+                node_config.availability_zone.clone(),
+                node_config.grpc_config.max_message_size,
+            );
+            (None, IngestRouterClient::from(router), None)
+        } else {
+            let (router, client, ingester) = setup_ingest_v2(
+                &node_config,
+                &cluster,
+                &event_broker,
+                control_plane_client.clone(),
+                ingester_pool,
+            )
+            .await
+            .context("failed to start ingest v2 service")?;
+            (Some(router), IngestRouterClient::from(client), ingester)
+        };
 
     if node_config.is_service_enabled(QuickwitService::Indexer)
         || node_config.is_service_enabled(QuickwitService::ControlPlane)
@@ -915,11 +987,17 @@ pub async fn serve_quickwit(
         _local_shards_update_listener_handle_opt: local_shards_update_listener_handle_opt,
         _report_splits_subscription_handle_opt: report_splits_subscription_handle_opt,
         index_manager,
-        indexing_service_opt,
-        ingest_router_opt: Some(ingest_router),
+        indexing_service_opt: indexing_service_opt.clone(),
+        ingest_router_opt,
         ingest_router_service,
         ingest_service,
         ingester_opt: ingester_opt.clone(),
+        ingesthree_service_opt: ingesthree_queue_opt.as_ref().map(|queue| {
+            quickwit_ingest::ingesthree::IngesthreeService::new(
+                primary_metastore_through_control_plane.clone(),
+                queue.clone(),
+            )
+        }),
         compaction_service_client_opt,
         compactor_service_opt: compactor_service_opt.clone(),
         janitor_service_opt,
@@ -1011,11 +1089,18 @@ pub async fn serve_quickwit(
     );
 
     let shutdown_token = CancellationToken::new();
+    let intake_health = ingesthree::watch_writer(
+        &cluster,
+        ingesthree_queue_opt.clone(),
+        shutdown_token.clone(),
+    );
     let shutdown_handle = tokio::spawn(shutdown_signal_handler(
         shutdown_signal,
         shutdown_token.clone(),
         universe,
         ingester_opt,
+        ingesthree_queue_opt,
+        indexing_service_opt,
         ingester_decommission_timeout,
         compactor_service_opt,
         compactor_decommission_timeout,
@@ -1052,7 +1137,8 @@ pub async fn serve_quickwit(
         rest_join_handle,
         health_join_handle,
         chitchat_server_handle,
-        readiness_reporting_fut
+        readiness_reporting_fut,
+        intake_health
     ) {
         error!(?error, "server failed");
         shutdown_token.cancel();
@@ -1204,7 +1290,7 @@ fn setup_ingester_pool(
         let ingester_opt_clone = ingester_opt.clone();
         Box::pin(async move {
             match cluster_change {
-                ClusterChange::Add(node) if node.is_indexer() => {
+                ClusterChange::Add(node) if node.is_ingester() => {
                     let chitchat_id = node.chitchat_id();
                     info!(
                         remote_node_id = %chitchat_id.node_id,
@@ -1221,11 +1307,16 @@ fn setup_ingester_pool(
                     );
                     Some(change)
                 }
-                // only update the ingester pool when the ingester status changes, to avoid
-                // unnecessary churn
                 ClusterChange::Update { previous, updated }
-                    if updated.is_indexer()
-                        && previous.ingester_status != updated.ingester_status =>
+                    if previous.is_ingester() && !updated.is_ingester() =>
+                {
+                    Some(build_ingester_remove_change(&previous))
+                }
+                // Update capacity/status or a switch back to v2, without unrelated churn.
+                ClusterChange::Update { previous, updated }
+                    if updated.is_ingester()
+                        && (!previous.is_ingester()
+                            || previous.ingester_status != updated.ingester_status) =>
                 {
                     let change = build_ingester_insert_change(
                         &updated,
@@ -1235,7 +1326,7 @@ fn setup_ingester_pool(
                     );
                     Some(change)
                 }
-                ClusterChange::Remove(node) if node.is_indexer() => {
+                ClusterChange::Remove(node) => {
                     let change = build_ingester_remove_change(&node);
                     Some(change)
                 }

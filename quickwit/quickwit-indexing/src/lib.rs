@@ -42,6 +42,7 @@ pub use crate::split_store::{
 pub mod actors;
 mod controlled_directory;
 pub mod docs_clustering;
+pub mod ingesthree;
 pub mod merge_policy;
 mod metrics;
 pub mod models;
@@ -77,13 +78,17 @@ pub async fn start_indexing_service(
     merge_scheduler_mailbox_opt: Option<Mailbox<MergeSchedulerService>>,
     indexing_split_cache: Arc<IndexingSplitCache>,
 ) -> anyhow::Result<Mailbox<IndexingService>> {
+    anyhow::ensure!(
+        !config.ingest_api_config.enable_ingesthree || config.enable_standalone_compactors,
+        "ingesthree indexers require enable_standalone_compactors: true"
+    );
     info!("starting indexer service");
     let ingest_api_service_mailbox = universe.get_one::<IngestApiService>();
     let fingerprinter_opt = config
         .docs_clustering_config
         .as_ref()
         .map(Fingerprinter::new);
-    let indexing_service = IndexingService::new(
+    let mut indexing_service = IndexingService::new(
         config.node_id.clone(),
         config.data_dir_path.to_path_buf(),
         config.indexer_config.clone(),
@@ -99,6 +104,9 @@ pub async fn start_indexing_service(
         fingerprinter_opt,
     )
     .await?;
+    if config.ingest_api_config.enable_ingesthree {
+        indexing_service.enable_ingesthree()?;
+    }
     let (indexing_service, _) = universe.spawn_builder().spawn(indexing_service);
     Ok(indexing_service)
 }

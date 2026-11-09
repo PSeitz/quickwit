@@ -16,6 +16,7 @@ pub mod file_backed;
 pub(crate) mod index_metadata;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+mod staged_file;
 
 pub mod control_plane_metastore;
 

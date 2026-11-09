@@ -404,12 +404,17 @@ impl DocProcessorCounters {
 }
 
 pub struct DocProcessor {
-    doc_mapper: Arc<DocMapper>,
+    converter: DocumentConverter,
     indexer_mailbox: Mailbox<Indexer>,
+    publish_lock: PublishLock,
+}
+
+/// Converts input documents using their format, mapping, transform, and fingerprints.
+pub(crate) struct DocumentConverter {
+    doc_mapper: Arc<DocMapper>,
     timestamp_field_opt: Option<Field>,
     fingerprinter_opt: Option<Fingerprinter>,
     counters: Arc<DocProcessorCounters>,
-    publish_lock: PublishLock,
     #[cfg(feature = "vrl")]
     transform_opt: Option<VrlProgram>,
     input_format: SourceInputFormat,
@@ -425,23 +430,50 @@ impl DocProcessor {
         input_format: SourceInputFormat,
         fingerprinter_opt: Option<Fingerprinter>,
     ) -> anyhow::Result<Self> {
+        let converter = DocumentConverter::try_new(
+            index_id,
+            source_id,
+            doc_mapper,
+            transform_config_opt,
+            input_format,
+            fingerprinter_opt,
+        )?;
+        Ok(Self {
+            converter,
+            indexer_mailbox,
+            publish_lock: PublishLock::default(),
+        })
+    }
+}
+
+impl DocumentConverter {
+    pub(crate) fn try_new(
+        index_id: IndexId,
+        source_id: SourceId,
+        doc_mapper: Arc<DocMapper>,
+        transform_config_opt: Option<TransformConfig>,
+        input_format: SourceInputFormat,
+        fingerprinter_opt: Option<Fingerprinter>,
+    ) -> anyhow::Result<Self> {
         let timestamp_field_opt = extract_timestamp_field(&doc_mapper)?;
         if cfg!(not(feature = "vrl")) && transform_config_opt.is_some() {
             bail!("VRL is not enabled: please recompile with the `vrl` feature")
         }
-        Ok(DocProcessor {
+        Ok(Self {
             doc_mapper,
-            indexer_mailbox,
             timestamp_field_opt,
             fingerprinter_opt,
             counters: Arc::new(DocProcessorCounters::new(index_id, source_id)),
-            publish_lock: PublishLock::default(),
             #[cfg(feature = "vrl")]
             transform_opt: transform_config_opt
                 .map(VrlProgram::try_from_transform_config)
                 .transpose()?,
             input_format,
         })
+    }
+
+    pub(crate) fn counters(&self) -> &Arc<DocProcessorCounters> {
+        &self.counters
     }
 
     // Extract a timestamp from a tantivy document.
@@ -464,7 +496,11 @@ impl DocProcessor {
         Ok(Some(timestamp))
     }
 
-    fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
+    pub(crate) fn process_raw_doc(
+        &mut self,
+        raw_doc: Bytes,
+        processed_docs: &mut Vec<ProcessedDoc>,
+    ) {
         let num_bytes = raw_doc.len();
 
         #[cfg(feature = "vrl")]
@@ -537,7 +573,7 @@ impl Actor for DocProcessor {
     type ObservableState = Arc<DocProcessorCounters>;
 
     fn observable_state(&self) -> Self::ObservableState {
-        self.counters.clone()
+        self.converter.counters().clone()
     }
 
     fn queue_capacity(&self) -> QueueCapacity {
@@ -587,7 +623,7 @@ impl Handler<RawDocBatch> for DocProcessor {
 
         for raw_doc in raw_doc_batch.docs {
             let _protected_zone_guard = ctx.protect_zone();
-            self.process_raw_doc(raw_doc, &mut processed_docs);
+            self.converter.process_raw_doc(raw_doc, &mut processed_docs);
             ctx.record_progress();
         }
         let processed_doc_batch = ProcessedDocBatch::new(
@@ -664,6 +700,42 @@ mod tests {
             ]))
             .unwrap();
         Fingerprinter::new(&docs_clustering_config)
+    }
+
+    #[test]
+    fn test_document_converter() {
+        let mut converter = DocumentConverter::try_new(
+            "test-index".to_string(),
+            "test-source".to_string(),
+            Arc::new(default_doc_mapper_for_test()),
+            None,
+            SourceInputFormat::Json,
+            Some(raw_body_fingerprinter_for_test()),
+        )
+        .unwrap();
+        let raw_doc = Bytes::from_static(br#"{"body":"happy","timestamp":1628837062}"#);
+        let missing_timestamp = Bytes::from_static(br#"{"body":"happy"}"#);
+        let num_bytes = raw_doc.len() + missing_timestamp.len() + 1;
+        let mut processed_docs = Vec::new();
+        converter.process_raw_doc(raw_doc.clone(), &mut processed_docs);
+        converter.process_raw_doc(missing_timestamp, &mut processed_docs);
+        converter.process_raw_doc(Bytes::from_static(b"{"), &mut processed_docs);
+
+        assert_eq!(processed_docs.len(), 1);
+        assert_eq!(processed_docs[0].num_bytes, raw_doc.len());
+        assert_eq!(
+            processed_docs[0].timestamp_opt,
+            Some(DateTime::from_timestamp_secs(1628837062))
+        );
+        assert_eq!(processed_docs[0].fingerprint_opt.as_ref().unwrap().len(), 3);
+        let counters = converter.counters();
+        assert_eq!(counters.valid.get_num_docs(), 1);
+        assert_eq!(counters.doc_mapper_errors.get_num_docs(), 1);
+        assert_eq!(counters.json_parse_errors.get_num_docs(), 1);
+        assert_eq!(
+            counters.num_bytes_total.load(Ordering::Relaxed),
+            num_bytes as u64
+        );
     }
 
     #[tokio::test]

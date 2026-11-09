@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use fail::fail_point;
 use itertools::Itertools;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
+use quickwit_common::Progress;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_directories::write_hotcache;
@@ -83,10 +84,7 @@ impl Packager {
         split: IndexedSplit,
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<PackagedSplit> {
-        let index_meta = split.index.load_metas()?;
-        assert_eq!(index_meta.segments.len(), 1);
-        let packaged_split = create_packaged_split(&index_meta, split, &self.tag_fields, ctx)?;
-        Ok(packaged_split)
+        create_packaged_split(split, &self.tag_fields, ctx.progress())
     }
 }
 
@@ -252,7 +250,8 @@ fn try_extract_terms(
                 FieldType::Bytes(_) => {
                     bail!("tags collection is not allowed on `bytes` fields")
                 }
-                _ => std::str::from_utf8(term_data)?.to_string(),
+                FieldType::Str(_) => std::str::from_utf8(term_data)?.to_string(),
+                _ => bail!("unsupported tag field type"),
             };
             terms.push(term);
         }
@@ -260,14 +259,16 @@ fn try_extract_terms(
     Ok(terms)
 }
 
-fn create_packaged_split(
-    index_meta: &IndexMeta,
+/// Packages a finalized split, which must contain exactly one segment.
+pub(crate) fn create_packaged_split(
     split: IndexedSplit,
     tag_fields: &[NamedField],
-    ctx: &ActorContext<Packager>,
+    progress: &Progress,
 ) -> anyhow::Result<PackagedSplit> {
+    let index_meta = split.index.load_metas()?;
+    assert_eq!(index_meta.segments.len(), 1);
     debug!(split_id = %split.split_id(), "create-packaged-split");
-    let split_files = list_split_files(index_meta, &split.split_scratch_directory)?;
+    let split_files = list_split_files(&index_meta, &split.split_scratch_directory)?;
 
     // Extracts tag values from inverted indexes only when a field cardinality is less
     // than `MAX_VALUES_PER_TAG_FIELD`.
@@ -281,7 +282,31 @@ fn create_packaged_split(
     let fields_metadata = split.index.fields_metadata()?;
 
     let mut tags = BTreeSet::default();
-    for named_field in tag_fields {
+    for configured_field in tag_fields {
+        // Merge outputs can retain an older mapping. Field IDs and types belong to the
+        // output schema, while the current mapper only selects the tag field names.
+        let Ok(field) = index_meta.schema.get_field(&configured_field.name) else {
+            continue;
+        };
+        let field_type = index_meta.schema.get_field_entry(field).field_type();
+        if !field_type.is_indexed() {
+            continue;
+        }
+        // A field newly selected as a tag may have used tokenization in older
+        // splits. Those terms cannot represent exhaustive raw tag values.
+        if let FieldType::Str(options) = field_type
+            && options
+                .get_indexing_options()
+                .map(|options| options.tokenizer())
+                != Some("raw")
+        {
+            continue;
+        }
+        let named_field = NamedField {
+            name: configured_field.name.clone(),
+            field,
+            field_type: field_type.clone(),
+        };
         let inverted_indexes = index_reader
             .searcher()
             .segment_readers()
@@ -289,7 +314,7 @@ fn create_packaged_split(
             .map(|segment| segment.inverted_index(named_field.field))
             .collect::<Result<Vec<_>, _>>()?;
 
-        match try_extract_terms(named_field, &inverted_indexes, MAX_VALUES_PER_TAG_FIELD) {
+        match try_extract_terms(&named_field, &inverted_indexes, MAX_VALUES_PER_TAG_FIELD) {
             Ok(terms) => {
                 append_to_tag_set(&named_field.name, &terms, &mut tags);
             }
@@ -299,12 +324,12 @@ fn create_packaged_split(
         }
     }
 
-    ctx.record_progress();
+    progress.record_progress();
 
     debug!(split_id = %split.split_id(), "build-hotcache");
     let mut hotcache_bytes = Vec::new();
     build_hotcache(split.split_scratch_directory.path(), &mut hotcache_bytes)?;
-    ctx.record_progress();
+    progress.record_progress();
 
     let serialized_split_fields = serialize_fields_metadata(&fields_metadata);
 
@@ -547,6 +572,32 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn test_packager_resolves_tags_against_output_schema() -> anyhow::Result<()> {
+        let split = make_indexed_split_for_test(&[DateTime::from_timestamp_secs(1628203589)])?;
+        // A newer mapper reorders fields, changes a numeric type, and adds a field
+        // absent from this old split. Neither its IDs nor types describe the output.
+        let mut schema = Schema::builder();
+        schema.add_u64_field("tag_i64", NumericOptions::default().set_indexed());
+        schema.add_text_field("added", STRING);
+        schema.add_text_field("tag_str", STRING);
+        schema.add_u64_field("timestamp", NumericOptions::default().set_indexed());
+        schema.add_text_field("text", STRING);
+        let tag_fields = get_tag_fields(
+            schema.build(),
+            &["tag_i64", "added", "tag_str", "timestamp", "text"],
+        );
+        let packaged = create_packaged_split(split, &tag_fields, &Progress::default())?;
+        assert_eq!(
+            packaged.tags,
+            ["tag_i64!", "tag_i64:-42", "tag_str!", "tag_str:value"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        Ok(())
     }
 
     #[tokio::test]

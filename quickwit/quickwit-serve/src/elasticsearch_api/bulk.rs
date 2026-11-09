@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use bytesize::ByteSize;
+use quickwit_ingest::router_client::IngestRouterClient;
 use quickwit_ingest::{
     CommitType, DocBatchBuilder, IngestRequest, IngestService, IngestServiceClient,
     split_ndjson_lines,
 };
-use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::types::IndexId;
 use warp::http::StatusCode;
 use warp::{Filter, Rejection};
@@ -36,14 +36,14 @@ use crate::{Body, with_arg};
 /// POST `_elastic/_bulk`
 pub fn es_compat_bulk_handler(
     ingest_service: IngestServiceClient,
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: impl Into<IngestRouterClient>,
     content_length_limit: ByteSize,
     enable_ingest_v1: bool,
     enable_ingest_v2: bool,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     elastic_bulk_filter(content_length_limit)
         .and(with_arg(ingest_service))
-        .and(with_arg(ingest_router))
+        .and(with_arg(ingest_router.into()))
         .then(move |body, bulk_options, ingest_service, ingest_router| {
             elastic_ingest_bulk(
                 None,
@@ -63,14 +63,14 @@ pub fn es_compat_bulk_handler(
 /// POST `_elastic/<index>/_bulk`
 pub fn es_compat_index_bulk_handler(
     ingest_service: IngestServiceClient,
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: impl Into<IngestRouterClient>,
     content_length_limit: ByteSize,
     enable_ingest_v1: bool,
     enable_ingest_v2: bool,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     elastic_index_bulk_filter(content_length_limit)
         .and(with_arg(ingest_service))
-        .and(with_arg(ingest_router))
+        .and(with_arg(ingest_router.into()))
         .then(
             move |index_id, body, bulk_options, ingest_service, ingest_router| {
                 elastic_ingest_bulk(
@@ -95,7 +95,7 @@ async fn elastic_ingest_bulk(
     body: Body,
     bulk_options: ElasticBulkOptions,
     ingest_service: IngestServiceClient,
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
     enable_ingest_v1: bool,
     enable_ingest_v2: bool,
 ) -> Result<ElasticBulkResponse, ElasticsearchError> {

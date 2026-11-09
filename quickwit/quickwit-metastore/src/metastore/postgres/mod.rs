@@ -20,6 +20,7 @@ mod migrator;
 mod model;
 pub(crate) mod pool;
 mod split_stream;
+mod staged_files;
 mod tags;
 mod utils;
 

@@ -16,8 +16,11 @@
 //! import `FileBackedIndex` and run backward-compatibility tests. You should not have to import
 //! anything from here directly.
 
+#[cfg(test)]
+mod mutation_tests;
 mod serialize;
 mod shards;
+mod staged_files;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -30,9 +33,9 @@ use quickwit_config::{
 };
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, DeleteQuery, DeleteShardsRequest,
-    DeleteShardsResponse, DeleteTask, EntityKind, IndexStats, ListShardsSubrequest,
-    ListShardsSubresponse, MetastoreError, MetastoreResult, OpenShardSubrequest,
-    OpenShardSubresponse, PruneShardsRequest, SplitStats,
+    DeleteShardsResponse, DeleteTask, DocumentsStagedForUpload, EntityKind, IndexStats,
+    ListShardsSubrequest, ListShardsSubresponse, MetastoreError, MetastoreResult,
+    OpenShardSubrequest, OpenShardSubresponse, PruneShardsRequest, SplitStats,
 };
 use quickwit_proto::types::{IndexUid, PublishToken, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,8 @@ pub(crate) struct FileBackedIndex {
     metadata: IndexMetadata,
     /// List of splits belonging to the index.
     splits: HashMap<SplitId, Split>,
+    /// Registered ingesthree staged files, including retained completion evidence.
+    staged_files: HashMap<String, DocumentsStagedForUpload>,
     /// Shards of each source.
     per_source_shards: HashMap<SourceId, Shards>,
     /// Delete tasks.
@@ -126,6 +131,7 @@ impl quickwit_config::TestableForRegression for FileBackedIndex {
     fn assert_equality(&self, other: &Self) {
         self.metadata().assert_equality(other.metadata());
         assert_eq!(self.splits, other.splits);
+        assert_eq!(self.staged_files, other.staged_files);
         assert_eq!(self.per_source_shards, other.per_source_shards);
         assert_eq!(self.delete_tasks, other.delete_tasks);
     }
@@ -145,6 +151,7 @@ impl From<IndexMetadata> for FileBackedIndex {
         Self {
             metadata: index_metadata,
             splits: Default::default(),
+            staged_files: Default::default(),
             per_source_shards,
             delete_tasks: Default::default(),
             stamper: Default::default(),
@@ -180,6 +187,7 @@ impl FileBackedIndex {
         Self {
             metadata,
             splits,
+            staged_files: Default::default(),
             per_source_shards,
             delete_tasks,
             stamper: Stamper::new(last_opstamp),
@@ -765,13 +773,17 @@ fn split_query_predicate(split: &&Split, query: &ListSplitsQuery) -> bool {
     }
 
     match &query.mature {
-        Bound::Included(evaluation_datetime) => {
-            return split.split_metadata.is_mature(*evaluation_datetime);
+        Bound::Included(evaluation_datetime)
+            if !split.split_metadata.is_mature(*evaluation_datetime) =>
+        {
+            return false;
         }
-        Bound::Excluded(evaluation_datetime) => {
-            return !split.split_metadata.is_mature(*evaluation_datetime);
+        Bound::Excluded(evaluation_datetime)
+            if split.split_metadata.is_mature(*evaluation_datetime) =>
+        {
+            return false;
         }
-        Bound::Unbounded => {}
+        _ => {}
     }
 
     if let Some(range) = &split.split_metadata.time_range {
@@ -989,6 +1001,33 @@ mod tests {
         assert!(!split_query_predicate(&&split_1, &query));
         assert!(!split_query_predicate(&&split_2, &query));
         assert!(!split_query_predicate(&&split_3, &query));
+    }
+
+    #[test]
+    fn test_maturity_preserves_remaining_filters() {
+        let [_, _, mut split] = make_splits();
+        split.split_metadata.node_id = "owner".to_string();
+        split.split_metadata.maturity = crate::SplitMaturity::Immature {
+            maturation_period: std::time::Duration::from_secs(60),
+        };
+        for timestamp in [64, 124] {
+            let now = time::OffsetDateTime::from_unix_timestamp(timestamp).unwrap();
+            let mut query = ListSplitsQuery::for_index(split.split_metadata.index_uid.clone());
+            query = if timestamp == 64 {
+                query.retain_immature(now)
+            } else {
+                query.retain_mature(now)
+            };
+            assert!(split_query_predicate(&&split, &query));
+            let other_node = query
+                .clone()
+                .with_node_id(quickwit_proto::types::NodeId::from_str("other"));
+            assert!(!split_query_predicate(&&split, &other_node));
+            let other_range = query.clone().with_time_range_start_gt(90);
+            assert!(!split_query_predicate(&&split, &other_range));
+            query.after_split = Some((split.split_metadata.index_uid.clone(), "split-z".into()));
+            assert!(!split_query_predicate(&&split, &query));
+        }
     }
 
     #[test]

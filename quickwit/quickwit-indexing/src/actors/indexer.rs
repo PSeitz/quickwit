@@ -14,7 +14,6 @@
 
 use std::collections::hash_map::Entry;
 use std::num::NonZeroU32;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -38,13 +37,7 @@ use quickwit_proto::indexing::{IndexingPipelineId, PipelineMetrics};
 use quickwit_proto::metastore::{
     LastDeleteOpstampRequest, MetastoreService, MetastoreServiceClient,
 };
-use quickwit_proto::types::DocMappingUid;
-use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use serde::Serialize;
-use tantivy::schema::Schema;
-use tantivy::store::{Compressor, ZstdCompressor};
-use tantivy::tokenizer::TokenizerManager;
-use tantivy::{DateTime, DocId, IndexBuilder, IndexSettings};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{Span, debug, info_span, warn};
@@ -52,11 +45,11 @@ use ulid::Ulid;
 
 use super::IndexSerializer;
 use super::cooperative_indexing::{CooperativeIndexingCycle, CooperativeIndexingPeriod};
-use crate::docs_clustering::{DocIdClusterer, Fingerprinter};
+use crate::docs_clustering::Fingerprinter;
 use crate::metrics::SPLIT_BUILDERS;
 use crate::models::{
     CommitTrigger, EmptySplit, IndexedSplitBatchBuilder, IndexedSplitBuilder, NewPublishLock,
-    ProcessedDoc, ProcessedDocBatch, PublishLock,
+    ProcessedDocBatch, PublishLock,
 };
 
 // Random partition ID used to gather partitions exceeding the maximum number of partitions.
@@ -95,11 +88,8 @@ struct IndexerState {
     indexing_settings: IndexingSettings,
     fingerprinter_opt: Option<Fingerprinter>,
     publish_lock: PublishLock,
-    schema: Schema,
-    doc_mapping_uid: DocMappingUid,
-    tokenizer_manager: TokenizerManager,
+    doc_mapper: Arc<DocMapper>,
     max_num_partitions: NonZeroU32,
-    index_settings: IndexSettings,
     cooperative_indexing_opt: Option<CooperativeIndexingCycle>,
     indexing_io_throughput_limiter_opt: Option<Limiter>,
 }
@@ -111,36 +101,20 @@ impl IndexerState {
         last_delete_opstamp: u64,
         ctx: &ActorContext<Indexer>,
     ) -> anyhow::Result<IndexedSplitBuilder> {
-        let index_builder = IndexBuilder::new()
-            .settings(self.index_settings.clone())
-            .schema(self.schema.clone())
-            .tokenizers(self.tokenizer_manager.clone())
-            .fast_field_tokenizers(
-                get_quickwit_fastfield_normalizer_manager()
-                    .tantivy_manager()
-                    .clone(),
-            );
-
         let io_controls = IoControls::default()
             .set_throughput_limiter_opt(self.indexing_io_throughput_limiter_opt.clone())
             .set_progress(ctx.progress().clone())
             .set_kill_switch(ctx.kill_switch().clone())
             .set_component("indexer");
-        let doc_id_clusterer_opt = if self.fingerprinter_opt.is_some() {
-            Some(DocIdClusterer::default())
-        } else {
-            None
-        };
-
-        let indexed_split = IndexedSplitBuilder::new_in_dir(
+        let indexed_split = IndexedSplitBuilder::from_doc_mapper(
             self.pipeline_id.clone(),
             partition_id,
             last_delete_opstamp,
-            self.doc_mapping_uid,
+            &self.doc_mapper,
+            &self.indexing_settings,
             self.indexing_directory.clone(),
-            index_builder,
             io_controls,
-            doc_id_clusterer_opt,
+            self.fingerprinter_opt.is_some(),
         )?;
         debug!(
             split_id=%indexed_split.split_id(),
@@ -303,16 +277,9 @@ impl IndexerState {
         let mut memory_usage_delta: i64 = 0;
         counters.num_doc_batches_in_workbench += 1;
         for doc in batch.docs {
-            let ProcessedDoc {
-                doc,
-                fingerprint_opt,
-                timestamp_opt,
-                partition,
-                num_bytes,
-            } = doc;
             counters.num_docs_in_workbench += 1;
             let (indexed_split, split_created) = self.get_or_create_indexed_split(
-                partition,
+                doc.partition,
                 *last_delete_opstamp,
                 indexed_splits,
                 other_indexed_split_opt,
@@ -325,21 +292,8 @@ impl IndexerState {
                 // memory usage.
                 memory_usage_delta += mem_usage_before as i64;
             }
-            indexed_split.split_attrs.uncompressed_docs_size_in_bytes += num_bytes as u64;
-            // Tantivy doc IDs are local to the split and continue across processed-doc batches.
-            let split_doc_id = indexed_split.split_attrs.num_docs as DocId;
-            indexed_split.split_attrs.num_docs += 1;
-            if let Some(doc_id_clusterer) = indexed_split.doc_id_clusterer_opt.as_mut() {
-                doc_id_clusterer.push(fingerprint_opt, split_doc_id);
-            }
-            if let Some(timestamp) = timestamp_opt {
-                record_timestamp(timestamp, &mut indexed_split.split_attrs.time_range);
-            }
             let _protect_guard = ctx.protect_zone();
-            indexed_split
-                .index_writer
-                .add_document(doc)
-                .context("failed to add document")?;
+            indexed_split.add_document(doc)?;
             let mem_usage_after = indexed_split.mem_usage() as u64;
             memory_usage_delta += mem_usage_after as i64 - mem_usage_before as i64;
             ctx.record_progress();
@@ -468,14 +422,6 @@ impl Actor for Indexer {
     }
 }
 
-fn record_timestamp(timestamp: DateTime, time_range: &mut Option<RangeInclusive<DateTime>>) {
-    let new_timestamp_range = match time_range {
-        Some(range) => timestamp.min(*range.start())..=timestamp.max(*range.end()),
-        None => timestamp..=timestamp,
-    };
-    *time_range = Some(new_timestamp_range);
-}
-
 #[async_trait]
 impl Handler<CommitTimeout> for Indexer {
     type Reply = ();
@@ -538,19 +484,6 @@ impl Indexer {
         fingerprinter_opt: Option<Fingerprinter>,
         indexing_io_throughput_limiter_opt: Option<Limiter>,
     ) -> Self {
-        let schema = doc_mapper.schema();
-        let tokenizer_manager = doc_mapper.tokenizer_manager().clone();
-        let docstore_compression = Compressor::Zstd(ZstdCompressor {
-            compression_level: Some(indexing_settings.docstore_compression_level),
-        });
-        let index_settings = IndexSettings {
-            sort_by_field: None,
-            docstore_blocksize: indexing_settings.docstore_blocksize,
-            docstore_compression,
-            docstore_compress_dedicated_thread: true,
-            // A configured fingerprinter supplies the mapping when the split is finalized.
-            manual_doc_id_mapping: fingerprinter_opt.is_some(),
-        };
         let cooperative_indexing_opt: Option<CooperativeIndexingCycle> =
             cooperative_indexing_permits_opt.map(|cooperative_indexing_permits| {
                 CooperativeIndexingCycle::new(
@@ -567,11 +500,8 @@ impl Indexer {
                 indexing_settings,
                 fingerprinter_opt,
                 publish_lock: PublishLock::default(),
-                schema,
-                doc_mapping_uid: doc_mapper.doc_mapping_uid(),
-                tokenizer_manager: tokenizer_manager.tantivy_manager().clone(),
-                index_settings,
                 max_num_partitions: doc_mapper.max_num_partitions(),
+                doc_mapper,
                 cooperative_indexing_opt,
                 indexing_io_throughput_limiter_opt,
             },
@@ -714,8 +644,9 @@ mod tests {
     use tantivy::schema::Value;
     use tantivy::{DateTime, DocAddress, TantivyDocument, doc};
 
-    use super::{IndexerCounters, record_timestamp, *};
+    use super::*;
     use crate::docs_clustering::Fingerprint;
+    use crate::models::ProcessedDoc;
 
     #[allow(clippy::too_many_arguments)]
     fn create_indexer_for_test(
@@ -738,35 +669,6 @@ mod tests {
             index_serializer_mailbox,
             fingerprinter_opt,
             None,
-        )
-    }
-
-    #[test]
-    fn test_record_timestamp() {
-        let mut time_range = None;
-        record_timestamp(DateTime::from_timestamp_secs(1628664679), &mut time_range);
-        assert_eq!(
-            time_range,
-            Some(
-                DateTime::from_timestamp_secs(1628664679)
-                    ..=DateTime::from_timestamp_secs(1628664679)
-            )
-        );
-        record_timestamp(DateTime::from_timestamp_secs(1628664112), &mut time_range);
-        assert_eq!(
-            time_range,
-            Some(
-                DateTime::from_timestamp_secs(1628664112)
-                    ..=DateTime::from_timestamp_secs(1628664679)
-            )
-        );
-        record_timestamp(DateTime::from_timestamp_secs(1628665112), &mut time_range);
-        assert_eq!(
-            time_range,
-            Some(
-                DateTime::from_timestamp_secs(1628664112)
-                    ..=DateTime::from_timestamp_secs(1628665112)
-            )
         )
     }
 

@@ -58,6 +58,38 @@ use crate::split_store::IndexingSplitStore;
 static CONCURRENT_UPLOAD_PERMITS_INDEX: OnceLock<Semaphore> = OnceLock::new();
 static CONCURRENT_UPLOAD_PERMITS_MERGE: OnceLock<Semaphore> = OnceLock::new();
 
+/// Acquires a permit from the node-wide indexing upload budget.
+/// The first caller initializes the budget, which is shared with indexing actors.
+pub(crate) async fn acquire_indexing_upload_permit(
+    max_concurrent_uploads: usize,
+) -> anyhow::Result<SemaphorePermit<'static>> {
+    acquire_upload_permit(UploaderType::IndexUploader, max_concurrent_uploads).await
+}
+
+async fn acquire_upload_permit(
+    uploader_type: UploaderType,
+    max_concurrent_uploads: usize,
+) -> anyhow::Result<SemaphorePermit<'static>> {
+    let (concurrent_upload_permits_once_cell, concurrent_upload_permits_gauge) = match uploader_type
+    {
+        UploaderType::IndexUploader => (
+            &CONCURRENT_UPLOAD_PERMITS_INDEX,
+            gauge!(parent: AVAILABLE_CONCURRENT_UPLOAD_PERMITS, labels: [label_values!(COMPONENT => "indexer")]),
+        ),
+        UploaderType::MergeUploader | UploaderType::DeleteUploader => (
+            &CONCURRENT_UPLOAD_PERMITS_MERGE,
+            gauge!(parent: AVAILABLE_CONCURRENT_UPLOAD_PERMITS, labels: [label_values!(COMPONENT => "merger")]),
+        ),
+    };
+    let concurrent_upload_permits = concurrent_upload_permits_once_cell
+        .get_or_init(|| Semaphore::const_new(max_concurrent_uploads));
+    concurrent_upload_permits_gauge.set(concurrent_upload_permits.available_permits() as f64);
+    concurrent_upload_permits
+        .acquire()
+        .await
+        .context("the uploader semaphore is closed. (this should never happen)")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum UploaderType {
     IndexUploader,
@@ -202,29 +234,7 @@ impl Uploader {
         ctx: &ActorContext<Self>,
     ) -> anyhow::Result<SemaphorePermit<'static>> {
         let _guard = ctx.protect_zone();
-        let (concurrent_upload_permits_once_cell, concurrent_upload_permits_gauge) = match self
-            .uploader_type
-        {
-            UploaderType::IndexUploader => (
-                &CONCURRENT_UPLOAD_PERMITS_INDEX,
-                gauge!(parent: AVAILABLE_CONCURRENT_UPLOAD_PERMITS, labels: [label_values!(COMPONENT => "indexer")]),
-            ),
-            UploaderType::MergeUploader => (
-                &CONCURRENT_UPLOAD_PERMITS_MERGE,
-                gauge!(parent: AVAILABLE_CONCURRENT_UPLOAD_PERMITS, labels: [label_values!(COMPONENT => "merger")]),
-            ),
-            UploaderType::DeleteUploader => (
-                &CONCURRENT_UPLOAD_PERMITS_MERGE,
-                gauge!(parent: AVAILABLE_CONCURRENT_UPLOAD_PERMITS, labels: [label_values!(COMPONENT => "merger")]),
-            ),
-        };
-        let concurrent_upload_permits = concurrent_upload_permits_once_cell
-            .get_or_init(|| Semaphore::const_new(self.max_concurrent_split_uploads));
-        concurrent_upload_permits_gauge.set(concurrent_upload_permits.available_permits() as f64);
-        concurrent_upload_permits
-            .acquire()
-            .await
-            .context("the uploader semaphore is closed. (this should never happen)")
+        acquire_upload_permit(self.uploader_type, self.max_concurrent_split_uploads).await
     }
 }
 
@@ -464,7 +474,9 @@ fn create_split_recovery_metadata(
     }
 }
 
-fn prepare_split_for_upload(
+/// Builds metadata and an upload payload referencing the packaged split's files.
+/// Keep its scratch directory alive and unchanged until the upload finishes.
+pub(crate) fn prepare_split_for_upload(
     packaged_split: &PackagedSplit,
     merge_policy: &Arc<dyn MergePolicy>,
     retention_policy: Option<&RetentionPolicy>,

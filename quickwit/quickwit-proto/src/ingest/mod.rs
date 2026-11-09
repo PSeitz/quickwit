@@ -29,6 +29,13 @@ use crate::{ServiceError, ServiceErrorCode};
 pub mod ingester;
 pub mod router;
 
+pub mod ingesthree {
+    include!("../codegen/quickwit/quickwit.ingest.ingesthree.rs");
+
+    pub const INGESTHREE_FILE_DESCRIPTOR_SET: &[u8] =
+        include_bytes!("../codegen/quickwit/ingesthree_descriptor.bin");
+}
+
 include!("../codegen/quickwit/quickwit.ingest.rs");
 
 pub const INGEST_FILE_DESCRIPTOR_SET: &[u8] =

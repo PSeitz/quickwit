@@ -207,6 +207,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run()
         .unwrap();
 
+    // Ingesthree has a distinct wire service and retains tonic request metadata so
+    // the version guard runs before admission. Shared messages keep public adapters reusable.
+    println!("cargo:rerun-if-changed=protos/quickwit/ingesthree.proto");
+    tonic_prost_build::configure()
+        .file_descriptor_set_path("src/codegen/quickwit/ingesthree_descriptor.bin")
+        .extern_path(".quickwit.ingest.router", "crate::ingest::router")
+        // Keep imported service output separate from Quickwit's generated adapters.
+        .out_dir(std::env::var("OUT_DIR")?)
+        .compile_protos(&["protos/quickwit/ingesthree.proto"], &["protos"])?;
+    std::fs::copy(
+        PathBuf::from(std::env::var("OUT_DIR")?).join("quickwit.ingest.ingesthree.rs"),
+        "src/codegen/quickwit/quickwit.ingest.ingesthree.rs",
+    )?;
+
     // Search service.
     //
     // Unlike the other services above, search goes through `tonic_prost_build` directly

@@ -102,6 +102,7 @@ pub(crate) async fn start_grpc_server(
     let ingest_api_grpc_service = if services
         .node_config
         .is_service_enabled(QuickwitService::Indexer)
+        && !services.node_config.ingest_api_config.enable_ingesthree
     {
         enabled_grpc_services.insert("ingest-api");
         Some(
@@ -116,12 +117,13 @@ pub(crate) async fn start_grpc_server(
         .node_config
         .is_service_enabled(QuickwitService::Indexer)
     {
-        enabled_grpc_services.insert("ingest-router");
-
-        let ingest_router_service = services
-            .ingest_router_service
-            .as_grpc_service(grpc_config.max_message_size);
-        Some(ingest_router_service)
+        match &services.ingest_router_service {
+            quickwit_ingest::router_client::IngestRouterClient::V2(client) => {
+                enabled_grpc_services.insert("ingest-router");
+                Some(client.as_grpc_service(grpc_config.max_message_size))
+            }
+            quickwit_ingest::router_client::IngestRouterClient::Ingesthree(_) => None,
+        }
     } else {
         None
     };
@@ -134,6 +136,18 @@ pub(crate) async fn start_grpc_server(
     } else {
         None
     };
+
+    let ingesthree_grpc_service = services.ingesthree_service_opt.clone().map(|service| {
+        enabled_grpc_services.insert("ingesthree");
+        file_descriptor_sets
+            .push(quickwit_proto::ingest::ingesthree::INGESTHREE_FILE_DESCRIPTOR_SET);
+        service
+            .into_grpc_server()
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .max_decoding_message_size(grpc_config.max_message_size.0 as usize)
+            .max_encoding_message_size(grpc_config.max_message_size.0 as usize)
+    });
 
     // Mount gRPC compaction service if this node is a janitor with the compaction service enabled.
     let compaction_grpc_service = if services
@@ -253,6 +267,7 @@ pub(crate) async fn start_grpc_server(
         .add_optional_service(ingest_api_grpc_service)
         .add_optional_service(ingest_router_grpc_service)
         .add_optional_service(ingester_grpc_service)
+        .add_optional_service(ingesthree_grpc_service)
         .add_optional_service(jaeger_grpc_service)
         .add_optional_service(jaeger_v2_grpc_service)
         .add_optional_service(metastore_grpc_service)

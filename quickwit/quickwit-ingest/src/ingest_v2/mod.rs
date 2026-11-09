@@ -55,6 +55,7 @@ use serde::Serialize;
 use tracing::{error, info};
 use workbench::pending_subrequests;
 
+pub(crate) use self::doc_mapper::{is_document_validation_enabled, validate_doc_batch_impl};
 pub use self::fetch::{FetchStreamError, MultiFetchStream};
 pub use self::ingester::Ingester;
 use self::mrecord::MRECORD_HEADER_LEN;

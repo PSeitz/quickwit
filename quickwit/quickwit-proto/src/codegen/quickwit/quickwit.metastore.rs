@@ -42,6 +42,119 @@ pub struct SplitRecoveryMetadata {
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EmptyResponse {}
+/// Documents staged together for upload in an immutable ingesthree file.
+/// Registration follows upload. Completed records remain as evidence against replay.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DocumentsStagedForUpload {
+    #[prost(message, optional, tag = "1")]
+    pub index_uid: ::core::option::Option<crate::types::IndexUid>,
+    /// Canonical ULID, preserved across local recovery and upload retries.
+    #[prost(string, tag = "2")]
+    pub file_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub file_uri: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub num_bytes: u64,
+    /// Metastore registration time, in Unix seconds. Retries preserve this value.
+    #[prost(int64, tag = "5")]
+    pub create_timestamp: i64,
+    /// Neither timestamp set means ready. Processing without completion means in flight.
+    /// Completion takes precedence, including after a competing attempt finishes.
+    #[prost(int64, optional, tag = "6")]
+    pub processing_started_timestamp: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub completed_timestamp: ::core::option::Option<i64>,
+    /// Winning publication, retained with completion evidence even after output cleanup.
+    #[prost(string, optional, tag = "8")]
+    pub publication_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RegisterFileForIndexing {
+    #[prost(message, optional, tag = "1")]
+    pub index_uid: ::core::option::Option<crate::types::IndexUid>,
+    #[prost(string, tag = "2")]
+    pub file_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub file_uri: ::prost::alloc::string::String,
+    /// Positive size of the uploaded file, including framing, at most INT64_MAX.
+    #[prost(uint64, tag = "4")]
+    pub num_bytes: u64,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RegisterFileForIndexingResponse {
+    #[prost(message, optional, tag = "1")]
+    pub staged_file: ::core::option::Option<DocumentsStagedForUpload>,
+}
+/// Select the globally oldest eligible file, then a same-index prefix. Eligibility
+/// means unfinished and either never assigned or started strictly before
+/// metastore time minus retry_after_secs. Ordering is registration time, then file ID.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AssignFilesForIndexing {
+    /// Between 1 and 1000 files. Claims never wait for a group to fill.
+    #[prost(uint32, tag = "1")]
+    pub max_num_files: u32,
+    /// Between 1 and INT64_MAX bytes. The oldest file is always included, even if it
+    /// alone exceeds this target. Stop before the first additional file that would exceed it.
+    #[prost(uint64, tag = "2")]
+    pub max_num_bytes: u64,
+    /// Positive retry delay. All workers should use the same configured value.
+    #[prost(uint32, tag = "3")]
+    pub retry_after_secs: u32,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AssignFilesForIndexingResponse {
+    /// Empty when no eligible work is available. Processing start is recorded before reply.
+    #[prost(message, repeated, tag = "1")]
+    pub staged_files: ::prost::alloc::vec::Vec<DocumentsStagedForUpload>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListCompletedFilesRequest {
+    /// Exclusive file-ID cursor. Empty starts a new scan.
+    #[prost(string, tag = "1")]
+    pub after_file_id: ::prost::alloc::string::String,
+    /// Page size, between 1 and 1000.
+    #[prost(uint32, tag = "2")]
+    pub max_num_files: u32,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCompletedFilesResponse {
+    /// Completed records ordered by file_id ascending, strictly after the cursor.
+    #[prost(message, repeated, tag = "1")]
+    pub staged_files: ::prost::alloc::vec::Vec<DocumentsStagedForUpload>,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PublishFileSplits {
+    #[prost(message, optional, tag = "1")]
+    pub index_uid: ::core::option::Option<crate::types::IndexUid>,
+    /// Between 1 and 1000 distinct registered inputs, all belonging to this incarnation.
+    #[prost(string, repeated, tag = "2")]
+    pub file_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// At most 1000 distinct staged output splits. Empty output is valid.
+    #[prost(string, repeated, tag = "3")]
+    pub staged_split_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Canonical globally unique ULID generated per attempt. The caller MUST retain
+    /// the same publication ID, input set, and output set across retries. Each attempt
+    /// uses its own output split IDs, so losing cleanup cannot delete a winner's outputs.
+    #[prost(string, tag = "4")]
+    pub publication_id: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PublishFileSplitsResponse {
+    /// True for the winning commit and its retries, even after output splits are gone.
+    /// False if any input was completed by another publication. No rows change then.
+    /// An error or lost response is ambiguous: retry the SAME request before cleanup.
+    #[prost(bool, tag = "1")]
+    pub published: bool,
+}
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateIndexRequest {
@@ -711,6 +824,26 @@ impl RpcName for ListSplitsRequest {
         "list_splits"
     }
 }
+impl RpcName for RegisterFileForIndexing {
+    fn rpc_name() -> &'static str {
+        "register_file_for_indexing"
+    }
+}
+impl RpcName for AssignFilesForIndexing {
+    fn rpc_name() -> &'static str {
+        "assign_files_for_indexing"
+    }
+}
+impl RpcName for PublishFileSplits {
+    fn rpc_name() -> &'static str {
+        "publish_file_splits"
+    }
+}
+impl RpcName for ListCompletedFilesRequest {
+    fn rpc_name() -> &'static str {
+        "list_completed_files"
+    }
+}
 impl RpcName for StageSplitsRequest {
     fn rpc_name() -> &'static str {
         "stage_splits"
@@ -885,6 +1018,34 @@ pub trait MetastoreService: std::fmt::Debug + Send + Sync + 'static {
         &self,
         request: ListSplitsRequest,
     ) -> crate::metastore::MetastoreResult<MetastoreServiceStream<ListSplitsResponse>>;
+    ///Registers an immutable file for indexing after upload has succeeded. The caller
+    ///generates a globally unique file_id and retains it across retries. Repeated
+    ///registration returns the existing record unchanged, including processing and
+    ///completion timestamps. The caller keeps index UID, URI, and size unchanged;
+    ///registration does not compare them with the stored metadata.
+    ///The metastore records the caller's upload assertion; it does not check storage.
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> crate::metastore::MetastoreResult<RegisterFileForIndexingResponse>;
+    ///Claims eligible files from one index, oldest first. Assignment limits duplicate
+    ///work without fencing publication. A lost response recovers through retry eligibility.
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> crate::metastore::MetastoreResult<AssignFilesForIndexingResponse>;
+    ///Atomically publishes an attempt's output splits and completes all its inputs.
+    ///The first commit wins, including an older attempt after reassignment.
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> crate::metastore::MetastoreResult<PublishFileSplitsResponse>;
+    ///Lists completed inputs globally without changing retained completion evidence.
+    ///Callers repeat whole scans to catch late reuploads, including crashes before registration.
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> crate::metastore::MetastoreResult<ListCompletedFilesResponse>;
     ///Stages several splits.
     async fn stage_splits(
         &self,
@@ -1189,6 +1350,34 @@ impl MetastoreService for MetastoreServiceClient {
     ) -> crate::metastore::MetastoreResult<MetastoreServiceStream<ListSplitsResponse>> {
         self.inner.0.list_splits(request).await
     }
+    #[tracing::instrument(skip_all, name = "metastore.register_file_for_indexing")]
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> crate::metastore::MetastoreResult<RegisterFileForIndexingResponse> {
+        self.inner.0.register_file_for_indexing(request).await
+    }
+    #[tracing::instrument(skip_all, name = "metastore.assign_files_for_indexing")]
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> crate::metastore::MetastoreResult<AssignFilesForIndexingResponse> {
+        self.inner.0.assign_files_for_indexing(request).await
+    }
+    #[tracing::instrument(skip_all, name = "metastore.publish_file_splits")]
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> crate::metastore::MetastoreResult<PublishFileSplitsResponse> {
+        self.inner.0.publish_file_splits(request).await
+    }
+    #[tracing::instrument(skip_all, name = "metastore.list_completed_files")]
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> crate::metastore::MetastoreResult<ListCompletedFilesResponse> {
+        self.inner.0.list_completed_files(request).await
+    }
     #[tracing::instrument(skip_all, name = "metastore.stage_splits")]
     async fn stage_splits(
         &self,
@@ -1429,6 +1618,30 @@ pub mod mock_metastore_service {
             MetastoreServiceStream<super::ListSplitsResponse>,
         > {
             self.inner.lock().await.list_splits(request).await
+        }
+        async fn register_file_for_indexing(
+            &self,
+            request: super::RegisterFileForIndexing,
+        ) -> crate::metastore::MetastoreResult<super::RegisterFileForIndexingResponse> {
+            self.inner.lock().await.register_file_for_indexing(request).await
+        }
+        async fn assign_files_for_indexing(
+            &self,
+            request: super::AssignFilesForIndexing,
+        ) -> crate::metastore::MetastoreResult<super::AssignFilesForIndexingResponse> {
+            self.inner.lock().await.assign_files_for_indexing(request).await
+        }
+        async fn publish_file_splits(
+            &self,
+            request: super::PublishFileSplits,
+        ) -> crate::metastore::MetastoreResult<super::PublishFileSplitsResponse> {
+            self.inner.lock().await.publish_file_splits(request).await
+        }
+        async fn list_completed_files(
+            &self,
+            request: super::ListCompletedFilesRequest,
+        ) -> crate::metastore::MetastoreResult<super::ListCompletedFilesResponse> {
+            self.inner.lock().await.list_completed_files(request).await
         }
         async fn stage_splits(
             &self,
@@ -1718,6 +1931,70 @@ impl tower::Service<ListSplitsRequest> for InnerMetastoreServiceClient {
     fn call(&mut self, request: ListSplitsRequest) -> Self::Future {
         let svc = self.clone();
         let fut = async move { svc.0.list_splits(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<RegisterFileForIndexing> for InnerMetastoreServiceClient {
+    type Response = RegisterFileForIndexingResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: RegisterFileForIndexing) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.register_file_for_indexing(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<AssignFilesForIndexing> for InnerMetastoreServiceClient {
+    type Response = AssignFilesForIndexingResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: AssignFilesForIndexing) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.assign_files_for_indexing(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<PublishFileSplits> for InnerMetastoreServiceClient {
+    type Response = PublishFileSplitsResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: PublishFileSplits) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.publish_file_splits(request).await };
+        Box::pin(fut)
+    }
+}
+impl tower::Service<ListCompletedFilesRequest> for InnerMetastoreServiceClient {
+    type Response = ListCompletedFilesResponse;
+    type Error = crate::metastore::MetastoreError;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, request: ListCompletedFilesRequest) -> Self::Future {
+        let svc = self.clone();
+        let fut = async move { svc.0.list_completed_files(request).await };
         Box::pin(fut)
     }
 }
@@ -2166,6 +2443,26 @@ struct MetastoreServiceTowerServiceStack {
         MetastoreServiceStream<ListSplitsResponse>,
         crate::metastore::MetastoreError,
     >,
+    register_file_for_indexing_svc: quickwit_common::tower::BoxService<
+        RegisterFileForIndexing,
+        RegisterFileForIndexingResponse,
+        crate::metastore::MetastoreError,
+    >,
+    assign_files_for_indexing_svc: quickwit_common::tower::BoxService<
+        AssignFilesForIndexing,
+        AssignFilesForIndexingResponse,
+        crate::metastore::MetastoreError,
+    >,
+    publish_file_splits_svc: quickwit_common::tower::BoxService<
+        PublishFileSplits,
+        PublishFileSplitsResponse,
+        crate::metastore::MetastoreError,
+    >,
+    list_completed_files_svc: quickwit_common::tower::BoxService<
+        ListCompletedFilesRequest,
+        ListCompletedFilesResponse,
+        crate::metastore::MetastoreError,
+    >,
     stage_splits_svc: quickwit_common::tower::BoxService<
         StageSplitsRequest,
         EmptyResponse,
@@ -2341,6 +2638,30 @@ impl MetastoreService for MetastoreServiceTowerServiceStack {
         request: ListSplitsRequest,
     ) -> crate::metastore::MetastoreResult<MetastoreServiceStream<ListSplitsResponse>> {
         self.list_splits_svc.clone().ready().await?.call(request).await
+    }
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> crate::metastore::MetastoreResult<RegisterFileForIndexingResponse> {
+        self.register_file_for_indexing_svc.clone().ready().await?.call(request).await
+    }
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> crate::metastore::MetastoreResult<AssignFilesForIndexingResponse> {
+        self.assign_files_for_indexing_svc.clone().ready().await?.call(request).await
+    }
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> crate::metastore::MetastoreResult<PublishFileSplitsResponse> {
+        self.publish_file_splits_svc.clone().ready().await?.call(request).await
+    }
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> crate::metastore::MetastoreResult<ListCompletedFilesResponse> {
+        self.list_completed_files_svc.clone().ready().await?.call(request).await
     }
     async fn stage_splits(
         &self,
@@ -2577,6 +2898,46 @@ type ListSplitsLayer = quickwit_common::tower::BoxLayer<
     >,
     ListSplitsRequest,
     MetastoreServiceStream<ListSplitsResponse>,
+    crate::metastore::MetastoreError,
+>;
+type RegisterFileForIndexingLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        RegisterFileForIndexing,
+        RegisterFileForIndexingResponse,
+        crate::metastore::MetastoreError,
+    >,
+    RegisterFileForIndexing,
+    RegisterFileForIndexingResponse,
+    crate::metastore::MetastoreError,
+>;
+type AssignFilesForIndexingLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        AssignFilesForIndexing,
+        AssignFilesForIndexingResponse,
+        crate::metastore::MetastoreError,
+    >,
+    AssignFilesForIndexing,
+    AssignFilesForIndexingResponse,
+    crate::metastore::MetastoreError,
+>;
+type PublishFileSplitsLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        PublishFileSplits,
+        PublishFileSplitsResponse,
+        crate::metastore::MetastoreError,
+    >,
+    PublishFileSplits,
+    PublishFileSplitsResponse,
+    crate::metastore::MetastoreError,
+>;
+type ListCompletedFilesLayer = quickwit_common::tower::BoxLayer<
+    quickwit_common::tower::BoxService<
+        ListCompletedFilesRequest,
+        ListCompletedFilesResponse,
+        crate::metastore::MetastoreError,
+    >,
+    ListCompletedFilesRequest,
+    ListCompletedFilesResponse,
     crate::metastore::MetastoreError,
 >;
 type StageSplitsLayer = quickwit_common::tower::BoxLayer<
@@ -2839,6 +3200,10 @@ pub struct MetastoreServiceTowerLayerStack {
     delete_index_layers: Vec<DeleteIndexLayer>,
     list_index_stats_layers: Vec<ListIndexStatsLayer>,
     list_splits_layers: Vec<ListSplitsLayer>,
+    register_file_for_indexing_layers: Vec<RegisterFileForIndexingLayer>,
+    assign_files_for_indexing_layers: Vec<AssignFilesForIndexingLayer>,
+    publish_file_splits_layers: Vec<PublishFileSplitsLayer>,
+    list_completed_files_layers: Vec<ListCompletedFilesLayer>,
     stage_splits_layers: Vec<StageSplitsLayer>,
     publish_splits_layers: Vec<PublishSplitsLayer>,
     mark_splits_for_deletion_layers: Vec<MarkSplitsForDeletionLayer>,
@@ -3070,6 +3435,108 @@ impl MetastoreServiceTowerLayerStack {
                 crate::metastore::MetastoreError,
             >,
         >>::Service as tower::Service<ListSplitsRequest>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    RegisterFileForIndexing,
+                    RegisterFileForIndexingResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                RegisterFileForIndexing,
+                RegisterFileForIndexingResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                RegisterFileForIndexing,
+                Response = RegisterFileForIndexingResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                RegisterFileForIndexing,
+                RegisterFileForIndexingResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<RegisterFileForIndexing>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    AssignFilesForIndexing,
+                    AssignFilesForIndexingResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                AssignFilesForIndexing,
+                AssignFilesForIndexingResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                AssignFilesForIndexing,
+                Response = AssignFilesForIndexingResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                AssignFilesForIndexing,
+                AssignFilesForIndexingResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<AssignFilesForIndexing>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    PublishFileSplits,
+                    PublishFileSplitsResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                PublishFileSplits,
+                PublishFileSplitsResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                PublishFileSplits,
+                Response = PublishFileSplitsResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                PublishFileSplits,
+                PublishFileSplitsResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<PublishFileSplits>>::Future: Send + 'static,
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    ListCompletedFilesRequest,
+                    ListCompletedFilesResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Clone + Send + Sync + 'static,
+        <L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                ListCompletedFilesRequest,
+                ListCompletedFilesResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service: tower::Service<
+                ListCompletedFilesRequest,
+                Response = ListCompletedFilesResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <<L as tower::Layer<
+            quickwit_common::tower::BoxService<
+                ListCompletedFilesRequest,
+                ListCompletedFilesResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >>::Service as tower::Service<
+            ListCompletedFilesRequest,
+        >>::Future: Send + 'static,
         L: tower::Layer<
                 quickwit_common::tower::BoxService<
                     StageSplitsRequest,
@@ -3728,6 +4195,14 @@ impl MetastoreServiceTowerLayerStack {
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.list_splits_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.register_file_for_indexing_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.assign_files_for_indexing_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.publish_file_splits_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
+        self.list_completed_files_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.stage_splits_layers
             .push(quickwit_common::tower::BoxLayer::new(layer.clone()));
         self.publish_splits_layers
@@ -3933,6 +4408,88 @@ impl MetastoreServiceTowerLayerStack {
         <L::Service as tower::Service<ListSplitsRequest>>::Future: Send + 'static,
     {
         self.list_splits_layers.push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_register_file_for_indexing_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    RegisterFileForIndexing,
+                    RegisterFileForIndexingResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                RegisterFileForIndexing,
+                Response = RegisterFileForIndexingResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<RegisterFileForIndexing>>::Future: Send + 'static,
+    {
+        self.register_file_for_indexing_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_assign_files_for_indexing_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    AssignFilesForIndexing,
+                    AssignFilesForIndexingResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                AssignFilesForIndexing,
+                Response = AssignFilesForIndexingResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<AssignFilesForIndexing>>::Future: Send + 'static,
+    {
+        self.assign_files_for_indexing_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_publish_file_splits_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    PublishFileSplits,
+                    PublishFileSplitsResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                PublishFileSplits,
+                Response = PublishFileSplitsResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<PublishFileSplits>>::Future: Send + 'static,
+    {
+        self.publish_file_splits_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
+        self
+    }
+    pub fn stack_list_completed_files_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<
+                quickwit_common::tower::BoxService<
+                    ListCompletedFilesRequest,
+                    ListCompletedFilesResponse,
+                    crate::metastore::MetastoreError,
+                >,
+            > + Send + Sync + 'static,
+        L::Service: tower::Service<
+                ListCompletedFilesRequest,
+                Response = ListCompletedFilesResponse,
+                Error = crate::metastore::MetastoreError,
+            > + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<
+            ListCompletedFilesRequest,
+        >>::Future: Send + 'static,
+    {
+        self.list_completed_files_layers
+            .push(quickwit_common::tower::BoxLayer::new(layer));
         self
     }
     pub fn stack_stage_splits_layer<L>(mut self, layer: L) -> Self
@@ -4561,6 +5118,38 @@ impl MetastoreServiceTowerLayerStack {
                 quickwit_common::tower::BoxService::new(inner_client.clone()),
                 |svc, layer| layer.layer(svc),
             );
+        let register_file_for_indexing_svc = self
+            .register_file_for_indexing_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let assign_files_for_indexing_svc = self
+            .assign_files_for_indexing_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let publish_file_splits_svc = self
+            .publish_file_splits_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
+        let list_completed_files_svc = self
+            .list_completed_files_layers
+            .into_iter()
+            .rev()
+            .fold(
+                quickwit_common::tower::BoxService::new(inner_client.clone()),
+                |svc, layer| layer.layer(svc),
+            );
         let stage_splits_svc = self
             .stage_splits_layers
             .into_iter()
@@ -4771,6 +5360,10 @@ impl MetastoreServiceTowerLayerStack {
             delete_index_svc,
             list_index_stats_svc,
             list_splits_svc,
+            register_file_for_indexing_svc,
+            assign_files_for_indexing_svc,
+            publish_file_splits_svc,
+            list_completed_files_svc,
             stage_splits_svc,
             publish_splits_svc,
             mark_splits_for_deletion_svc,
@@ -4923,6 +5516,42 @@ where
             Error = crate::metastore::MetastoreError,
             Future = BoxFuture<
                 MetastoreServiceStream<ListSplitsResponse>,
+                crate::metastore::MetastoreError,
+            >,
+        >
+        + tower::Service<
+            RegisterFileForIndexing,
+            Response = RegisterFileForIndexingResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                RegisterFileForIndexingResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >
+        + tower::Service<
+            AssignFilesForIndexing,
+            Response = AssignFilesForIndexingResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                AssignFilesForIndexingResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >
+        + tower::Service<
+            PublishFileSplits,
+            Response = PublishFileSplitsResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                PublishFileSplitsResponse,
+                crate::metastore::MetastoreError,
+            >,
+        >
+        + tower::Service<
+            ListCompletedFilesRequest,
+            Response = ListCompletedFilesResponse,
+            Error = crate::metastore::MetastoreError,
+            Future = BoxFuture<
+                ListCompletedFilesResponse,
                 crate::metastore::MetastoreError,
             >,
         >
@@ -5141,6 +5770,30 @@ where
         &self,
         request: ListSplitsRequest,
     ) -> crate::metastore::MetastoreResult<MetastoreServiceStream<ListSplitsResponse>> {
+        self.clone().call(request).await
+    }
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> crate::metastore::MetastoreResult<RegisterFileForIndexingResponse> {
+        self.clone().call(request).await
+    }
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> crate::metastore::MetastoreResult<AssignFilesForIndexingResponse> {
+        self.clone().call(request).await
+    }
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> crate::metastore::MetastoreResult<PublishFileSplitsResponse> {
+        self.clone().call(request).await
+    }
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> crate::metastore::MetastoreResult<ListCompletedFilesResponse> {
         self.clone().call(request).await
     }
     async fn stage_splits(
@@ -5490,6 +6143,78 @@ where
             .map_err(|status| crate::error::grpc_status_to_service_error(
                 status,
                 ListSplitsRequest::rpc_name(),
+            ))
+    }
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> crate::metastore::MetastoreResult<RegisterFileForIndexingResponse> {
+        let mut tonic_request = tonic::Request::new(request);
+        quickwit_common::tracing_utils::inject_current_context(
+            tonic_request.metadata_mut(),
+        );
+        self.inner
+            .clone()
+            .register_file_for_indexing(tonic_request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                RegisterFileForIndexing::rpc_name(),
+            ))
+    }
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> crate::metastore::MetastoreResult<AssignFilesForIndexingResponse> {
+        let mut tonic_request = tonic::Request::new(request);
+        quickwit_common::tracing_utils::inject_current_context(
+            tonic_request.metadata_mut(),
+        );
+        self.inner
+            .clone()
+            .assign_files_for_indexing(tonic_request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                AssignFilesForIndexing::rpc_name(),
+            ))
+    }
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> crate::metastore::MetastoreResult<PublishFileSplitsResponse> {
+        let mut tonic_request = tonic::Request::new(request);
+        quickwit_common::tracing_utils::inject_current_context(
+            tonic_request.metadata_mut(),
+        );
+        self.inner
+            .clone()
+            .publish_file_splits(tonic_request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                PublishFileSplits::rpc_name(),
+            ))
+    }
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> crate::metastore::MetastoreResult<ListCompletedFilesResponse> {
+        let mut tonic_request = tonic::Request::new(request);
+        quickwit_common::tracing_utils::inject_current_context(
+            tonic_request.metadata_mut(),
+        );
+        self.inner
+            .clone()
+            .list_completed_files(tonic_request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| crate::error::grpc_status_to_service_error(
+                status,
+                ListCompletedFilesRequest::rpc_name(),
             ))
     }
     async fn stage_splits(
@@ -6160,6 +6885,98 @@ for MetastoreServiceGrpcServerAdapter {
                 .map(|stream| tonic::Response::new(
                     stream.map_err(crate::error::grpc_error_to_grpc_status),
                 ))
+                .map_err(crate::error::grpc_error_to_grpc_status)
+        };
+        <_ as tracing::Instrument>::instrument(fut, span).await
+    }
+    async fn register_file_for_indexing(
+        &self,
+        tonic_request: tonic::Request<RegisterFileForIndexing>,
+    ) -> Result<tonic::Response<RegisterFileForIndexingResponse>, tonic::Status> {
+        let parent_context = quickwit_common::tracing_utils::extract_context(
+            tonic_request.metadata(),
+        );
+        let request = tonic_request.into_inner();
+        let span = tracing::info_span!("metastore.register_file_for_indexing");
+        let _ = <tracing::Span as tracing_opentelemetry::OpenTelemetrySpanExt>::set_parent(
+            &span,
+            parent_context,
+        );
+        let fut = async move {
+            self.inner
+                .0
+                .register_file_for_indexing(request)
+                .await
+                .map(tonic::Response::new)
+                .map_err(crate::error::grpc_error_to_grpc_status)
+        };
+        <_ as tracing::Instrument>::instrument(fut, span).await
+    }
+    async fn assign_files_for_indexing(
+        &self,
+        tonic_request: tonic::Request<AssignFilesForIndexing>,
+    ) -> Result<tonic::Response<AssignFilesForIndexingResponse>, tonic::Status> {
+        let parent_context = quickwit_common::tracing_utils::extract_context(
+            tonic_request.metadata(),
+        );
+        let request = tonic_request.into_inner();
+        let span = tracing::info_span!("metastore.assign_files_for_indexing");
+        let _ = <tracing::Span as tracing_opentelemetry::OpenTelemetrySpanExt>::set_parent(
+            &span,
+            parent_context,
+        );
+        let fut = async move {
+            self.inner
+                .0
+                .assign_files_for_indexing(request)
+                .await
+                .map(tonic::Response::new)
+                .map_err(crate::error::grpc_error_to_grpc_status)
+        };
+        <_ as tracing::Instrument>::instrument(fut, span).await
+    }
+    async fn publish_file_splits(
+        &self,
+        tonic_request: tonic::Request<PublishFileSplits>,
+    ) -> Result<tonic::Response<PublishFileSplitsResponse>, tonic::Status> {
+        let parent_context = quickwit_common::tracing_utils::extract_context(
+            tonic_request.metadata(),
+        );
+        let request = tonic_request.into_inner();
+        let span = tracing::info_span!("metastore.publish_file_splits");
+        let _ = <tracing::Span as tracing_opentelemetry::OpenTelemetrySpanExt>::set_parent(
+            &span,
+            parent_context,
+        );
+        let fut = async move {
+            self.inner
+                .0
+                .publish_file_splits(request)
+                .await
+                .map(tonic::Response::new)
+                .map_err(crate::error::grpc_error_to_grpc_status)
+        };
+        <_ as tracing::Instrument>::instrument(fut, span).await
+    }
+    async fn list_completed_files(
+        &self,
+        tonic_request: tonic::Request<ListCompletedFilesRequest>,
+    ) -> Result<tonic::Response<ListCompletedFilesResponse>, tonic::Status> {
+        let parent_context = quickwit_common::tracing_utils::extract_context(
+            tonic_request.metadata(),
+        );
+        let request = tonic_request.into_inner();
+        let span = tracing::info_span!("metastore.list_completed_files");
+        let _ = <tracing::Span as tracing_opentelemetry::OpenTelemetrySpanExt>::set_parent(
+            &span,
+            parent_context,
+        );
+        let fut = async move {
+            self.inner
+                .0
+                .list_completed_files(request)
+                .await
+                .map(tonic::Response::new)
                 .map_err(crate::error::grpc_error_to_grpc_status)
         };
         <_ as tracing::Instrument>::instrument(fut, span).await
@@ -7113,6 +7930,134 @@ pub mod metastore_service_grpc_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Registers an immutable file for indexing after upload has succeeded. The caller
+        /// generates a globally unique file_id and retains it across retries. Repeated
+        /// registration returns the existing record unchanged, including processing and
+        /// completion timestamps. The caller keeps index UID, URI, and size unchanged;
+        /// registration does not compare them with the stored metadata.
+        /// The metastore records the caller's upload assertion; it does not check storage.
+        pub async fn register_file_for_indexing(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RegisterFileForIndexing>,
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterFileForIndexingResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/RegisterFileForIndexing",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "RegisterFileForIndexing",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Claims eligible files from one index, oldest first. Assignment limits duplicate
+        /// work without fencing publication. A lost response recovers through retry eligibility.
+        pub async fn assign_files_for_indexing(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AssignFilesForIndexing>,
+        ) -> std::result::Result<
+            tonic::Response<super::AssignFilesForIndexingResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/AssignFilesForIndexing",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "AssignFilesForIndexing",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Atomically publishes an attempt's output splits and completes all its inputs.
+        /// The first commit wins, including an older attempt after reassignment.
+        pub async fn publish_file_splits(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PublishFileSplits>,
+        ) -> std::result::Result<
+            tonic::Response<super::PublishFileSplitsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/PublishFileSplits",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "PublishFileSplits",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Lists completed inputs globally without changing retained completion evidence.
+        /// Callers repeat whole scans to catch late reuploads, including crashes before registration.
+        pub async fn list_completed_files(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListCompletedFilesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListCompletedFilesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/quickwit.metastore.MetastoreService/ListCompletedFiles",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "quickwit.metastore.MetastoreService",
+                        "ListCompletedFiles",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Stages several splits.
         pub async fn stage_splits(
             &mut self,
@@ -7904,6 +8849,46 @@ pub mod metastore_service_grpc_server {
             &self,
             request: tonic::Request<super::ListSplitsRequest>,
         ) -> std::result::Result<tonic::Response<Self::ListSplitsStream>, tonic::Status>;
+        /// Registers an immutable file for indexing after upload has succeeded. The caller
+        /// generates a globally unique file_id and retains it across retries. Repeated
+        /// registration returns the existing record unchanged, including processing and
+        /// completion timestamps. The caller keeps index UID, URI, and size unchanged;
+        /// registration does not compare them with the stored metadata.
+        /// The metastore records the caller's upload assertion; it does not check storage.
+        async fn register_file_for_indexing(
+            &self,
+            request: tonic::Request<super::RegisterFileForIndexing>,
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterFileForIndexingResponse>,
+            tonic::Status,
+        >;
+        /// Claims eligible files from one index, oldest first. Assignment limits duplicate
+        /// work without fencing publication. A lost response recovers through retry eligibility.
+        async fn assign_files_for_indexing(
+            &self,
+            request: tonic::Request<super::AssignFilesForIndexing>,
+        ) -> std::result::Result<
+            tonic::Response<super::AssignFilesForIndexingResponse>,
+            tonic::Status,
+        >;
+        /// Atomically publishes an attempt's output splits and completes all its inputs.
+        /// The first commit wins, including an older attempt after reassignment.
+        async fn publish_file_splits(
+            &self,
+            request: tonic::Request<super::PublishFileSplits>,
+        ) -> std::result::Result<
+            tonic::Response<super::PublishFileSplitsResponse>,
+            tonic::Status,
+        >;
+        /// Lists completed inputs globally without changing retained completion evidence.
+        /// Callers repeat whole scans to catch late reuploads, including crashes before registration.
+        async fn list_completed_files(
+            &self,
+            request: tonic::Request<super::ListCompletedFilesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListCompletedFilesResponse>,
+            tonic::Status,
+        >;
         /// Stages several splits.
         async fn stage_splits(
             &self,
@@ -8584,6 +9569,206 @@ pub mod metastore_service_grpc_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/RegisterFileForIndexing" => {
+                    #[allow(non_camel_case_types)]
+                    struct RegisterFileForIndexingSvc<T: MetastoreServiceGrpc>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::RegisterFileForIndexing>
+                    for RegisterFileForIndexingSvc<T> {
+                        type Response = super::RegisterFileForIndexingResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RegisterFileForIndexing>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::register_file_for_indexing(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RegisterFileForIndexingSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/AssignFilesForIndexing" => {
+                    #[allow(non_camel_case_types)]
+                    struct AssignFilesForIndexingSvc<T: MetastoreServiceGrpc>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::AssignFilesForIndexing>
+                    for AssignFilesForIndexingSvc<T> {
+                        type Response = super::AssignFilesForIndexingResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AssignFilesForIndexing>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::assign_files_for_indexing(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AssignFilesForIndexingSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/PublishFileSplits" => {
+                    #[allow(non_camel_case_types)]
+                    struct PublishFileSplitsSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::PublishFileSplits>
+                    for PublishFileSplitsSvc<T> {
+                        type Response = super::PublishFileSplitsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PublishFileSplits>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::publish_file_splits(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PublishFileSplitsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/quickwit.metastore.MetastoreService/ListCompletedFiles" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListCompletedFilesSvc<T: MetastoreServiceGrpc>(pub Arc<T>);
+                    impl<
+                        T: MetastoreServiceGrpc,
+                    > tonic::server::UnaryService<super::ListCompletedFilesRequest>
+                    for ListCompletedFilesSvc<T> {
+                        type Response = super::ListCompletedFilesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListCompletedFilesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MetastoreServiceGrpc>::list_completed_files(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListCompletedFilesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

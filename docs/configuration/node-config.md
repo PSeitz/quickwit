@@ -264,7 +264,8 @@ indexer:
 
 | Property | Description | Default value |
 | --- | --- | --- |
-| `max_queue_memory_usage` | Maximum size in bytes of the in-memory Ingest queue. | `2GiB` |
+| `enable_ingesthree` | Experimental file-based ingest routing. On indexer nodes, also starts local file intake and one S3 indexing worker per CPU (`QW_NUM_CPUS`), requiring `enable_standalone_compactors: true`. | `false` |
+| `max_queue_memory_usage` | Maximum size in bytes of the in-memory Ingest queue. Also limits queued/processing input in ingesthree. | `2GiB` |
 | `max_queue_disk_usage` | Maximum disk-space in bytes taken by the Ingest queue. The minimum size is at least `256M` and be at least `max_queue_memory_usage`. | `4GiB` |
 | `content_length_limit` | Maximum payload size uncompressed. Increasing this is discouraged, use a [file source](../ingest-data/sqs-files.md) instead. | `10MiB` |
 | `grpc_compression_algorithm` | Compression algorithm (`gzip` or `zstd`) to use for gRPC traffic between nodes for the ingest service | `None` |
@@ -280,6 +281,48 @@ ingest_api:
   grpc_compression_algorithm: zstd
   decommission_timeout: 300s
 ```
+
+### Experimental ingesthree
+
+Enable this on nodes receiving public ingest requests and on the indexer nodes that
+will accept and index their input:
+
+```yaml
+enable_standalone_compactors: true  # Required on ingesthree indexers.
+ingest_api:
+  enable_ingesthree: true
+```
+
+Ingesthree supports standalone compaction on separate compactor nodes. An ingesthree
+indexer fails startup unless `enable_standalone_compactors` is true. Router-only nodes
+need no compaction opt-in. Run the planner on a Janitor node and merge workers on Compactor
+nodes, with standalone compaction enabled. All live indexers, including v2 members during
+migration, must use standalone mode before the planner starts processing. The planner
+scans published splits in the metastore, including after restart, independently of the
+indexer that published them.
+
+The normal ingest and Elasticsearch bulk endpoints use the selected router. OTLP also
+uses it when its endpoint is enabled. Internal ingesthree RPCs require
+`ingest-version: ingesthree`; public clients continue using the existing APIs.
+Gossip keeps ingesthree destinations separate from v2. Requests never fall back to v2.
+
+Local input lives in `<data_dir>/ingesthree`. Uploaded input lives under
+`<default_index_root_uri>/.ingesthree/<file_id>`. All ingesthree indexers must be able
+to read that storage. Use shared object storage for a distributed deployment. Keep the
+upload prefix unchanged while a node retains local input. Existing queue/disk limits
+and `decommission_timeout` apply. Recovery finishes before the node becomes ready.
+Shutdown stops worker restarts and drains accepted input to storage and the metastore.
+A timeout retains local input for recovery.
+
+This path supports JSON ingest sources without a source transform and Auto commits.
+Force, WaitFor, and legacy ingest requests are rejected. Acknowledgment means local
+append/kernel flush, rather than fsync, upload, or search visibility. Splits become
+searchable after file finishing, upload, and indexing.
+
+This is an experimental service path. Remote input/orphan cleanup, physical memory/disk
+admission and reserves, handling inputs that exceed the 1,000-output publication limit,
+and deployment/live-AWS/performance validation remain production prerequisites.
+Drain v2 backlog through v2 before retiring its nodes.
 
 ## Compactor configuration
 

@@ -33,7 +33,7 @@ use crate::metrics::OBJECT_STORAGE_GET_ERRORS_TOTAL;
 use crate::{StorageError, StorageErrorKind};
 
 impl<E> From<SdkError<E>> for StorageError
-where E: std::error::Error + ToStorageErrorKind + Send + Sync + 'static
+where E: std::error::Error + ProvideErrorMetadata + ToStorageErrorKind + Send + Sync + 'static
 {
     fn from(error: SdkError<E>) -> StorageError {
         let error_kind = match &error {
@@ -54,7 +54,21 @@ where E: std::error::Error + ToStorageErrorKind + Send + Sync + 'static
                     _ => StorageErrorKind::Internal,
                 }
             }
-            SdkError::ServiceError(service_error) => service_error.err().to_storage_error_kind(),
+            SdkError::ServiceError(service_error) => {
+                let kind = service_error.err().to_storage_error_kind();
+                // PutObject and multipart errors often use an unmodeled SDK variant.
+                // Preserve definite authorization/missing-resource failures for callers.
+                match service_error.raw().status().as_u16() {
+                    403 => StorageErrorKind::Unauthorized,
+                    // A lost completion response can leave a multipart retry addressing
+                    // an upload ID that has already been consumed. Replay the whole upload.
+                    404 if service_error.err().code() == Some("NoSuchUpload") => {
+                        StorageErrorKind::Service
+                    }
+                    404 => StorageErrorKind::NotFound,
+                    _ => kind,
+                }
+            }
             SdkError::TimeoutError(_) => StorageErrorKind::Timeout,
             _ => StorageErrorKind::Internal,
         };
@@ -159,6 +173,30 @@ mod tests {
     use std::io;
 
     use super::*;
+
+    #[test]
+    fn test_upload_errors_distinguish_permanent_failures_from_multipart_retries() {
+        for (status, code, expected) in [
+            (403, "AccessDenied", StorageErrorKind::Unauthorized),
+            (404, "NoSuchBucket", StorageErrorKind::NotFound),
+            (404, "NoSuchUpload", StorageErrorKind::Service),
+            (503, "SlowDown", StorageErrorKind::Service),
+        ] {
+            let response = http::Response::builder()
+                .status(status)
+                .body(aws_smithy_types::body::SdkBody::empty())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let error = PutObjectError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code(code)
+                    .build(),
+            );
+            let error = StorageError::from(SdkError::service_error(error, response));
+            assert_eq!(error.kind(), expected);
+        }
+    }
 
     #[test]
     fn test_list_objects_v2_timeout_error_is_preserved() {

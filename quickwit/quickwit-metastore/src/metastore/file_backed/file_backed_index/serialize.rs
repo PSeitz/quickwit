@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 use quickwit_proto::ingest::Shard;
-use quickwit_proto::metastore::SourceType;
+use quickwit_proto::metastore::{DocumentsStagedForUpload, SourceType};
 use quickwit_proto::types::{DocMappingUid, SourceId};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,8 @@ pub(crate) struct FileBackedIndexV0_8 {
     #[serde(rename = "index")]
     metadata: IndexMetadata,
     splits: Vec<Split>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    staged_files: HashMap<String, DocumentsStagedForUpload>,
     // TODO: Remove `skip_serializing_if` when we release ingest v2.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     shards: HashMap<SourceId, Vec<Shard>>,
@@ -100,6 +102,7 @@ impl From<FileBackedIndex> for FileBackedIndexV0_8 {
         Self {
             metadata: index.metadata,
             splits,
+            staged_files: index.staged_files,
             shards,
             delete_tasks,
         }
@@ -129,11 +132,13 @@ impl From<FileBackedIndexV0_8> for FileBackedIndex {
                 per_source_shards.insert(source_id.clone(), Shards::empty(index_uid, source_id));
             }
         }
-        Self::new(
+        let mut file_backed_index = Self::new(
             index.metadata,
             index.splits,
             per_source_shards,
             index.delete_tasks,
-        )
+        );
+        file_backed_index.staged_files = index.staged_files;
+        file_backed_index
     }
 }

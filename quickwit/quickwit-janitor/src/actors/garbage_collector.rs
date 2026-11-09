@@ -234,6 +234,18 @@ impl Handler<Loop> for GarbageCollector {
         ctx: &ActorContext<Self>,
     ) -> Result<(), quickwit_actors::ActorExitStatus> {
         self.handle_inner(ctx).await;
+        if let Err(error) = crate::completed_file_cleanup::cleanup_completed_files(
+            &self.metastore,
+            &self.storage_resolver,
+            ctx.progress(),
+        )
+        .await
+        {
+            error!(
+                ?error,
+                "failed to clean up completed inputs; retrying next GC pass"
+            );
+        }
         ctx.schedule_self_msg(RUN_INTERVAL, Loop);
         Ok(())
     }
@@ -263,6 +275,14 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    fn mock_metastore() -> MockMetastoreService {
+        let mut metastore = MockMetastoreService::new();
+        metastore
+            .expect_list_completed_files()
+            .returning(|_| Ok(Default::default()));
+        metastore
+    }
 
     async fn observe_after_pass(
         handle: &ActorHandle<GarbageCollector>,
@@ -406,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn test_garbage_collect_calls_dependencies_appropriately() {
         let storage_resolver = StorageResolver::unconfigured();
-        let mut mock_metastore = MockMetastoreService::new();
+        let mut mock_metastore = mock_metastore();
         mock_metastore
             .expect_list_indexes_metadata()
             .times(1)
@@ -486,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn test_garbage_collect_get_calls_repeatedly() {
         let storage_resolver = StorageResolver::unconfigured();
-        let mut mock_metastore = MockMetastoreService::new();
+        let mut mock_metastore = mock_metastore();
         mock_metastore
             .expect_list_indexes_metadata()
             .times(3)
@@ -589,6 +609,14 @@ mod tests {
         let storage_resolver = StorageResolver::unconfigured();
         let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
+            .expect_list_completed_files()
+            .times(4)
+            .returning(|_| {
+                Err(MetastoreError::Db {
+                    message: "fail to list completed inputs".to_string(),
+                })
+            });
+        mock_metastore
             .expect_list_indexes_metadata()
             .times(4)
             .returning(|_list_indexes_request| {
@@ -620,7 +648,7 @@ mod tests {
     #[tokio::test]
     async fn test_garbage_collect_fails_to_resolve_storage() {
         let storage_resolver = StorageResolver::unconfigured();
-        let mut mock_metastore = MockMetastoreService::new();
+        let mut mock_metastore = mock_metastore();
         mock_metastore
             .expect_list_indexes_metadata()
             .times(1)
@@ -653,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn test_garbage_collect_fails_to_run_delete_on_one_index() {
         let storage_resolver = StorageResolver::unconfigured();
-        let mut mock_metastore = MockMetastoreService::new();
+        let mut mock_metastore = mock_metastore();
         mock_metastore
             .expect_list_indexes_metadata()
             .times(1)

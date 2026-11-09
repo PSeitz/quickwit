@@ -16,6 +16,7 @@ use elasticsearch_dsl::search::ErrorCause;
 use quickwit_common::{rate_limited_debug, rate_limited_error};
 use quickwit_index_management::IndexServiceError;
 use quickwit_ingest::IngestServiceError;
+use quickwit_ingest::router_client::IngestRouterError;
 use quickwit_proto::ServiceError;
 use quickwit_proto::ingest::IngestV2Error;
 use quickwit_search::SearchError;
@@ -91,6 +92,15 @@ impl From<IngestServiceError> for ElasticsearchError {
         ElasticsearchError {
             status,
             error: reason,
+        }
+    }
+}
+
+impl From<IngestRouterError> for ElasticsearchError {
+    fn from(error: IngestRouterError) -> Self {
+        match error {
+            IngestRouterError::V2(error) => error.into(),
+            IngestRouterError::Ingesthree(error) => error.into(),
         }
     }
 }

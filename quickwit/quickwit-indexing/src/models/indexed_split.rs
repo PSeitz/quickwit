@@ -13,24 +13,30 @@
 // limitations under the License.
 
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::path::Path;
 
+use anyhow::Context;
 use quickwit_common::io::IoControls;
 use quickwit_common::metrics::index_label;
 use quickwit_common::temp_dir::TempDirectory;
+use quickwit_config::IndexingSettings;
+use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
 use quickwit_metrics::{GaugeGuard, label_values};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
-use tantivy::IndexBuilder;
+use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::directory::{MmapDirectory, RamDirectory};
+use tantivy::store::{Compressor, ZstdCompressor};
+use tantivy::{DateTime, DocId, IndexBuilder, IndexSettings};
 use tracing::{Span, error, instrument};
 
 use crate::controlled_directory::ControlledDirectory;
 use crate::docs_clustering::DocIdClusterer;
 use crate::merge_policy::MergeTask;
 use crate::metrics::INDEX_SOURCE;
-use crate::models::{PublishLock, SplitAttrs};
+use crate::models::{ProcessedDoc, PublishLock, SplitAttrs};
 
 pub struct IndexedSplitBuilder {
     pub split_attrs: SplitAttrs,
@@ -78,6 +84,50 @@ impl fmt::Debug for IndexedSplitBuilder {
 }
 
 impl IndexedSplitBuilder {
+    /// Creates a split using the mapper's schema, tokenizers, and mapping UID.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_doc_mapper(
+        pipeline_id: IndexingPipelineId,
+        partition_id: u64,
+        last_delete_opstamp: u64,
+        doc_mapper: &DocMapper,
+        indexing_settings: &IndexingSettings,
+        scratch_directory: TempDirectory,
+        io_controls: IoControls,
+        clustering_enabled: bool,
+    ) -> anyhow::Result<Self> {
+        let docstore_compression = Compressor::Zstd(ZstdCompressor {
+            compression_level: Some(indexing_settings.docstore_compression_level),
+        });
+        let index_settings = IndexSettings {
+            sort_by_field: None,
+            docstore_blocksize: indexing_settings.docstore_blocksize,
+            docstore_compression,
+            docstore_compress_dedicated_thread: true,
+            // The clusterer supplies the mapping when the split is finalized.
+            manual_doc_id_mapping: clustering_enabled,
+        };
+        let index_builder = IndexBuilder::new()
+            .settings(index_settings)
+            .schema(doc_mapper.schema())
+            .tokenizers(doc_mapper.tokenizer_manager().tantivy_manager().clone())
+            .fast_field_tokenizers(
+                get_quickwit_fastfield_normalizer_manager()
+                    .tantivy_manager()
+                    .clone(),
+            );
+        Self::new_in_dir(
+            pipeline_id,
+            partition_id,
+            last_delete_opstamp,
+            doc_mapper.doc_mapping_uid(),
+            scratch_directory,
+            index_builder,
+            io_controls,
+            clustering_enabled.then(DocIdClusterer::default),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_in_dir(
         pipeline_id: IndexingPipelineId,
@@ -131,6 +181,33 @@ impl IndexedSplitBuilder {
             controlled_directory,
             ram_directory_opt,
         })
+    }
+
+    /// Adds a document and updates the split's metadata and clustering.
+    /// The document must use this split's schema. The caller handles partition routing.
+    /// Discard the builder on error: its metadata is updated before writing the document.
+    pub(crate) fn add_document(&mut self, processed_doc: ProcessedDoc) -> anyhow::Result<()> {
+        let ProcessedDoc {
+            doc,
+            fingerprint_opt,
+            timestamp_opt,
+            num_bytes,
+            ..
+        } = processed_doc;
+        self.split_attrs.uncompressed_docs_size_in_bytes += num_bytes as u64;
+        // Tantivy doc IDs are local to the split and continue across processed-doc batches.
+        let split_doc_id = self.split_attrs.num_docs as DocId;
+        self.split_attrs.num_docs += 1;
+        if let Some(doc_id_clusterer) = self.doc_id_clusterer_opt.as_mut() {
+            doc_id_clusterer.push(fingerprint_opt, split_doc_id);
+        }
+        if let Some(timestamp) = timestamp_opt {
+            record_timestamp(timestamp, &mut self.split_attrs.time_range);
+        }
+        self.index_writer
+            .add_document(doc)
+            .context("failed to add document")?;
+        Ok(())
     }
 
     #[instrument(name="serialize_split",
@@ -205,6 +282,14 @@ impl IndexedSplitBuilder {
     }
 }
 
+fn record_timestamp(timestamp: DateTime, time_range: &mut Option<RangeInclusive<DateTime>>) {
+    let new_timestamp_range = match time_range {
+        Some(range) => timestamp.min(*range.start())..=timestamp.max(*range.end()),
+        None => timestamp..=timestamp,
+    };
+    *time_range = Some(new_timestamp_range);
+}
+
 #[derive(Debug)]
 pub struct IndexedSplitBatch {
     pub splits: Vec<IndexedSplit>,
@@ -255,6 +340,35 @@ mod tests {
     use tantivy::{Directory, DocAddress, TantivyDocument, doc};
 
     use super::*;
+
+    #[test]
+    fn test_record_timestamp() {
+        let mut time_range = None;
+        record_timestamp(DateTime::from_timestamp_secs(1628664679), &mut time_range);
+        assert_eq!(
+            time_range,
+            Some(
+                DateTime::from_timestamp_secs(1628664679)
+                    ..=DateTime::from_timestamp_secs(1628664679)
+            )
+        );
+        record_timestamp(DateTime::from_timestamp_secs(1628664112), &mut time_range);
+        assert_eq!(
+            time_range,
+            Some(
+                DateTime::from_timestamp_secs(1628664112)
+                    ..=DateTime::from_timestamp_secs(1628664679)
+            )
+        );
+        record_timestamp(DateTime::from_timestamp_secs(1628665112), &mut time_range);
+        assert_eq!(
+            time_range,
+            Some(
+                DateTime::from_timestamp_secs(1628664112)
+                    ..=DateTime::from_timestamp_secs(1628665112)
+            )
+        )
+    }
 
     #[test]
     fn test_finalize_ram_split_uses_disk() -> anyhow::Result<()> {

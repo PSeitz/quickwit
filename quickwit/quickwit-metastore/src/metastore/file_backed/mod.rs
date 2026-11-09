@@ -22,6 +22,7 @@ mod index_id_matcher;
 mod index_template_matcher;
 mod lazy_file_backed_index;
 pub(crate) mod manifest;
+mod staged_files;
 mod state;
 mod store_operations;
 
@@ -40,29 +41,32 @@ use itertools::Itertools;
 use quickwit_common::ServiceStream;
 use quickwit_config::IndexTemplate;
 use quickwit_proto::metastore::{
-    AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, CreateIndexRequest,
-    CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
-    DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
-    DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse, EntityKind,
-    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
-    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
-    IndexMetadataFailure, IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse,
-    IndexTemplateMatch, IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
-    LastDeleteOpstampResponse, ListDeleteTasksRequest, ListDeleteTasksResponse,
-    ListIndexStatsRequest, ListIndexStatsResponse, ListIndexTemplatesRequest,
-    ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
-    ListShardsRequest, ListShardsResponse, ListSplitsRequest, ListSplitsResponse,
-    ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError, MetastoreResult,
-    MetastoreService, MetastoreServiceStream, OpenShardSubrequest, OpenShardsRequest,
-    OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
-    StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest,
-    UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse, serde_utils,
+    AcquireShardsRequest, AcquireShardsResponse, AddSourceRequest, AssignFilesForIndexing,
+    AssignFilesForIndexingResponse, CreateIndexRequest, CreateIndexResponse,
+    CreateIndexTemplateRequest, DeleteIndexRequest, DeleteIndexTemplatesRequest, DeleteQuery,
+    DeleteShardsRequest, DeleteShardsResponse, DeleteSourceRequest, DeleteSplitsRequest,
+    DeleteTask, EmptyResponse, EntityKind, FindIndexTemplateMatchesRequest,
+    FindIndexTemplateMatchesResponse, GetClusterIdentityRequest, GetClusterIdentityResponse,
+    GetIndexTemplateRequest, GetIndexTemplateResponse, IndexMetadataFailure,
+    IndexMetadataFailureReason, IndexMetadataRequest, IndexMetadataResponse, IndexTemplateMatch,
+    IndexesMetadataRequest, IndexesMetadataResponse, LastDeleteOpstampRequest,
+    LastDeleteOpstampResponse, ListCompletedFilesRequest, ListCompletedFilesResponse,
+    ListDeleteTasksRequest, ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
+    ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
+    ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
+    ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError,
+    MetastoreResult, MetastoreService, MetastoreServiceStream, OpenShardSubrequest,
+    OpenShardsRequest, OpenShardsResponse, PruneShardsRequest, PublishFileSplits,
+    PublishFileSplitsResponse, PublishSplitsRequest, RegisterFileForIndexing,
+    RegisterFileForIndexingResponse, ResetSourceCheckpointRequest, StageSplitsRequest,
+    ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest, UpdateSplitsDeleteOpstampRequest,
+    UpdateSplitsDeleteOpstampResponse, serde_utils,
 };
 use quickwit_proto::types::{IndexId, IndexUid};
 use quickwit_storage::Storage;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -146,6 +150,10 @@ impl From<bool> for MutationOccurred<()> {
 #[derive(Clone)]
 pub struct FileBackedMetastore {
     state: Arc<RwLock<MetastoreState>>,
+    /// Ordinary mutations share this lock. Assignment and deletion take it exclusively.
+    /// Guards outlive cancelled requests through persistence and cache finalization, so
+    /// assignment sees a stable global snapshot and mutations cannot recreate deleted indexes.
+    mutation_lock: Arc<RwLock<()>>,
     storage: Arc<dyn Storage>,
     polling_interval_opt: Option<Duration>,
 }
@@ -165,6 +173,7 @@ impl FileBackedMetastore {
     pub fn for_test(storage: Arc<dyn Storage>) -> Self {
         Self {
             state: Default::default(),
+            mutation_lock: Default::default(),
             storage,
             polling_interval_opt: None,
         }
@@ -197,6 +206,7 @@ impl FileBackedMetastore {
             MetastoreState::try_from_manifest(storage.clone(), manifest, polling_interval_opt)?;
         let metastore = Self {
             state: Arc::new(RwLock::new(state)),
+            mutation_lock: Default::default(),
             storage,
             polling_interval_opt,
         };
@@ -207,6 +217,18 @@ impl FileBackedMetastore {
         &self,
         index_uid: &IndexUid,
         mutate_fn: impl FnOnce(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+    ) -> MetastoreResult<T> {
+        let guard = self.mutation_lock.clone().read_owned().await;
+        self.mutate_with_guard(index_uid, mutate_fn, guard).await
+    }
+
+    /// Assignment passes its exclusive guard directly. Reacquiring a read guard while holding
+    /// the write guard would deadlock. Both guards must be owned by the persistence task.
+    async fn mutate_with_guard<T>(
+        &self,
+        index_uid: &IndexUid,
+        mutate_fn: impl FnOnce(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+        guard: impl Send + 'static,
     ) -> MetastoreResult<T> {
         let index_id = &index_uid.index_id;
         let mut locked_index = self.get_locked_index(index_id).await?;
@@ -225,33 +247,47 @@ impl FileBackedMetastore {
         };
         locked_index.set_recently_modified();
 
-        let put_result = put_index(&*self.storage, &index).await;
-        match put_result {
-            Ok(()) => {
-                *locked_index = index;
-                Ok(value)
+        let storage = self.storage.clone();
+        let state = self.state.clone();
+        let polling_interval_opt = self.polling_interval_opt;
+        // Once persistence starts, finish it and reconcile the cache even if the caller drops
+        // its future. Keep both locks until then. The return value stays in the caller's task,
+        // so existing mutation closures and their results need no Send or 'static bounds.
+        tokio::spawn(
+            async move {
+                let _guard = guard;
+                match put_index(&*storage, &index).await {
+                    Ok(()) => {
+                        *locked_index = index;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        // A failed response can still mean the write committed. Discard the cache
+                        // before releasing the locks so subsequent mutations reload durable state.
+                        let mut state_wlock_guard = state.write().await;
+                        let index_id = index.index_id().to_string();
+                        state_wlock_guard.indexes.insert(
+                            index_id.clone(),
+                            LazyIndexStatus::Active(LazyFileBackedIndex::new(
+                                storage,
+                                index_id,
+                                polling_interval_opt,
+                                None,
+                            )),
+                        );
+                        locked_index.discarded = true;
+                        Err(error)
+                    }
+                }
             }
-            Err(error) => {
-                // For some of the error type here, we cannot know for sure
-                // whether the content was written or not.
-                //
-                // Just to be sure, let's discard the cache.
-                let mut state_wlock_guard = self.state.write().await;
-
-                // At this point, we hold both locks.
-                state_wlock_guard.indexes.insert(
-                    index_id.to_string(),
-                    LazyIndexStatus::Active(LazyFileBackedIndex::new(
-                        self.storage.clone(),
-                        index_id.to_string(),
-                        self.polling_interval_opt,
-                        None,
-                    )),
-                );
-                locked_index.discarded = true;
-                Err(error)
-            }
-        }
+            .in_current_span(),
+        )
+        .await
+        .map_err(|join_error| MetastoreError::Internal {
+            message: "failed to finish index mutation".to_string(),
+            cause: join_error.to_string(),
+        })??;
+        Ok(value)
     }
 
     async fn read<T, F>(&self, index_uid: &IndexUid, view: F) -> MetastoreResult<T>
@@ -593,6 +629,7 @@ impl MetastoreService for FileBackedMetastore {
 
     #[instrument(name = "metastore.file_backed.delete_index", skip_all, fields(index_uid = %request.index_uid()))]
     async fn delete_index(&self, request: DeleteIndexRequest) -> MetastoreResult<EmptyResponse> {
+        let _mutation_guard = self.mutation_lock.clone().write_owned().await;
         // We pick the outer lock here, so that we enter a critical section.
         let mut state_wlock_guard = self.state.write().await;
 
@@ -645,6 +682,71 @@ impl MetastoreService for FileBackedMetastore {
 
     // -------------------------------------------------------------------------------
     // Mutations over a single index
+
+    #[instrument(name = "metastore.file_backed.register_file_for_indexing", skip_all)]
+    async fn register_file_for_indexing(
+        &self,
+        request: RegisterFileForIndexing,
+    ) -> MetastoreResult<RegisterFileForIndexingResponse> {
+        crate::metastore::staged_file::validate_registration(&request)?;
+        let index_uid = request.index_uid().clone();
+        let staged_file = self
+            .mutate(&index_uid, |index| {
+                index.register_file_for_indexing(request)
+            })
+            .await?;
+        Ok(RegisterFileForIndexingResponse {
+            staged_file: Some(staged_file),
+        })
+    }
+
+    #[instrument(name = "metastore.file_backed.assign_files_for_indexing", skip_all)]
+    async fn assign_files_for_indexing(
+        &self,
+        request: AssignFilesForIndexing,
+    ) -> MetastoreResult<AssignFilesForIndexingResponse> {
+        crate::metastore::staged_file::validate_assignment(&request)?;
+        let staged_files = self.assign_files_for_indexing_inner(&request).await?;
+        Ok(AssignFilesForIndexingResponse { staged_files })
+    }
+
+    #[instrument(name = "metastore.file_backed.list_completed_files", skip_all)]
+    async fn list_completed_files(
+        &self,
+        request: ListCompletedFilesRequest,
+    ) -> MetastoreResult<ListCompletedFilesResponse> {
+        crate::metastore::staged_file::validate_completed_files_request(&request)?;
+        // Pin indexes against deletion. Concurrent completions may appear on a later scan.
+        let _guard = self.mutation_lock.read().await;
+        let mut staged_files = Vec::new();
+        for index_id in self.active_index_ids().await {
+            staged_files.extend(
+                self.read_any(&index_id, None, |index| {
+                    Ok(index.list_completed_files(
+                        &request.after_file_id,
+                        request.max_num_files as usize,
+                    ))
+                })
+                .await?,
+            );
+            staged_files.sort_unstable_by(|left, right| left.file_id.cmp(&right.file_id));
+            staged_files.truncate(request.max_num_files as usize);
+        }
+        Ok(ListCompletedFilesResponse { staged_files })
+    }
+
+    #[instrument(name = "metastore.file_backed.publish_file_splits", skip_all)]
+    async fn publish_file_splits(
+        &self,
+        request: PublishFileSplits,
+    ) -> MetastoreResult<PublishFileSplitsResponse> {
+        crate::metastore::staged_file::validate_publication(&request)?;
+        let index_uid = request.index_uid().clone();
+        let published = self
+            .mutate(&index_uid, |index| index.publish_file_splits(request))
+            .await?;
+        Ok(PublishFileSplitsResponse { published })
+    }
 
     #[instrument(name = "metastore.file_backed.stage_splits", skip_all, fields(index_uid = %request.index_uid()))]
     async fn stage_splits(&self, request: StageSplitsRequest) -> MetastoreResult<EmptyResponse> {

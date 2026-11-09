@@ -81,7 +81,7 @@ pub(super) async fn validate_doc_batch(
     Ok((doc_batch, Vec::new()))
 }
 
-fn is_document_validation_enabled() -> bool {
+pub(crate) fn is_document_validation_enabled() -> bool {
     !quickwit_common::get_bool_from_env_cached!("QW_DISABLE_DOCUMENT_VALIDATION", false)
 }
 
@@ -101,7 +101,7 @@ async fn validate_doc_batch_cpu_intensive(
 /// Validates a batch of docs.
 ///
 /// Returns a batch of valid docs and the list of errors.
-fn validate_doc_batch_impl(
+pub(crate) fn validate_doc_batch_impl(
     doc_batch: DocBatchV2,
     doc_mapper: &DocMapper,
 ) -> (DocBatchV2, Vec<ParseFailure>) {

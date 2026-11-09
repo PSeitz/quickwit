@@ -21,10 +21,10 @@ use prost::Message;
 use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
 use quickwit_config::{ConfigFormat, IndexConfig, load_index_config_from_user_config};
+use quickwit_ingest::router_client::IngestRouterClient;
 use quickwit_ingest::{CommitType, JsonDocBatchV2Builder};
 use quickwit_metrics::{counter, histogram, label_values};
 use quickwit_proto::ingest::DocBatchV2;
-use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceService;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -651,17 +651,17 @@ struct ParsedSpans {
 
 #[derive(Debug, Clone)]
 pub struct OtlpGrpcTracesService {
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
     commit_type: CommitType,
 }
 
 impl OtlpGrpcTracesService {
     pub fn new(
-        ingest_router: IngestRouterServiceClient,
+        ingest_router: impl Into<IngestRouterClient>,
         commit_type_opt: Option<CommitType>,
     ) -> Self {
         Self {
-            ingest_router,
+            ingest_router: ingest_router.into(),
             commit_type: commit_type_opt.unwrap_or_default(),
         }
     }

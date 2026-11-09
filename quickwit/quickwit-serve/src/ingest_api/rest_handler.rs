@@ -14,14 +14,13 @@
 
 use bytes::Buf;
 use quickwit_config::{INGEST_V2_SOURCE_ID, IngestApiConfig, validate_identifier};
+use quickwit_ingest::router_client::IngestRouterClient;
 use quickwit_ingest::{
     CommitType, DocBatchBuilder, FetchResponse, IngestRequest, IngestService, IngestServiceClient,
     IngestServiceError, TailRequest, doc_batch_v2_from_ndjson, split_ndjson_lines,
 };
 use quickwit_proto::ingest::CommitTypeV2;
-use quickwit_proto::ingest::router::{
-    IngestRequestV2, IngestRouterService, IngestRouterServiceClient, IngestSubrequest,
-};
+use quickwit_proto::ingest::router::{IngestRequestV2, IngestSubrequest};
 use quickwit_proto::types::IndexId;
 use serde::Deserialize;
 use warp::{Filter, Rejection};
@@ -72,14 +71,14 @@ impl IngestOptions {
 }
 
 pub(crate) fn ingest_api_handlers(
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: impl Into<IngestRouterClient>,
     ingest_service: IngestServiceClient,
     config: IngestApiConfig,
     enable_ingest_v1: bool,
     enable_ingest_v2: bool,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     ingest_handler(
-        ingest_router,
+        ingest_router.into(),
         ingest_service.clone(),
         config,
         enable_ingest_v1,
@@ -102,17 +101,26 @@ fn ingest_filter(
 }
 
 fn ingest_handler(
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
     ingest_service: IngestServiceClient,
     config: IngestApiConfig,
     enable_ingest_v1: bool,
     enable_ingest_v2: bool,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
+    let ingesthree_enabled = config.enable_ingesthree;
     ingest_filter(config)
         .and(with_arg(ingest_router))
         .and(with_arg(ingest_service))
         .then(
-            move |index_id, body, ingest_options, ingest_router, ingest_service| {
+            move |index_id, body, ingest_options: IngestOptions, ingest_router, ingest_service| async move {
+                if ingesthree_enabled
+                    && (ingest_options.use_legacy_ingest
+                        || ingest_options.commit_type != CommitTypeV2::Auto)
+                {
+                    return Err(IngestServiceError::BadRequest(
+                        "ingesthree supports Auto commits without legacy ingest".to_string(),
+                    ));
+                }
                 ingest(
                     index_id,
                     body,
@@ -122,6 +130,7 @@ fn ingest_handler(
                     enable_ingest_v1,
                     enable_ingest_v2,
                 )
+                .await
             },
         )
         .map(|result| into_rest_api_response(result, BodyFormat::default()))
@@ -146,7 +155,7 @@ async fn ingest(
     index_id: IndexId,
     body: Body,
     ingest_options: IngestOptions,
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
     ingest_service: IngestServiceClient,
     enable_ingest_v1: bool,
     enable_ingest_v2: bool,
@@ -191,7 +200,7 @@ async fn ingest_v2(
     index_id: IndexId,
     body: Body,
     ingest_options: IngestOptions,
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
 ) -> Result<RestIngestResponse, IngestServiceError> {
     let doc_batch_opt = doc_batch_v2_from_ndjson(body.content);
 

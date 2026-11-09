@@ -138,6 +138,26 @@ service MetastoreService {
   // Streams splits from index.
   rpc ListSplits(ListSplitsRequest) returns (stream ListSplitsResponse);
 
+  // Registers an immutable file for indexing after upload has succeeded. The caller
+  // generates a globally unique file_id and retains it across retries. Repeated
+  // registration returns the existing record unchanged, including processing and
+  // completion timestamps. The caller keeps index UID, URI, and size unchanged;
+  // registration does not compare them with the stored metadata.
+  // The metastore records the caller's upload assertion; it does not check storage.
+  rpc RegisterFileForIndexing(.quickwit.metastore.RegisterFileForIndexing) returns (RegisterFileForIndexingResponse);
+
+  // Claims eligible files from one index, oldest first. Assignment limits duplicate
+  // work without fencing publication. A lost response recovers through retry eligibility.
+  rpc AssignFilesForIndexing(.quickwit.metastore.AssignFilesForIndexing) returns (AssignFilesForIndexingResponse);
+
+  // Atomically publishes an attempt's output splits and completes all its inputs.
+  // The first commit wins, including an older attempt after reassignment.
+  rpc PublishFileSplits(.quickwit.metastore.PublishFileSplits) returns (PublishFileSplitsResponse);
+
+  // Lists completed inputs globally without changing retained completion evidence.
+  // Callers repeat whole scans to catch late reuploads, including crashes before registration.
+  rpc ListCompletedFiles(ListCompletedFilesRequest) returns (ListCompletedFilesResponse);
+
   // Stages several splits.
   rpc StageSplits(StageSplitsRequest) returns (EmptyResponse);
 
@@ -234,6 +254,85 @@ service MetastoreService {
 }
 
 message EmptyResponse {
+}
+
+// Documents staged together for upload in an immutable ingesthree file.
+// Registration follows upload. Completed records remain as evidence against replay.
+message DocumentsStagedForUpload {
+  quickwit.common.IndexUid index_uid = 1;
+  // Canonical ULID, preserved across local recovery and upload retries.
+  string file_id = 2;
+  string file_uri = 3;
+  uint64 num_bytes = 4;
+  // Metastore registration time, in Unix seconds. Retries preserve this value.
+  int64 create_timestamp = 5;
+  // Neither timestamp set means ready. Processing without completion means in flight.
+  // Completion takes precedence, including after a competing attempt finishes.
+  optional int64 processing_started_timestamp = 6;
+  optional int64 completed_timestamp = 7;
+  // Winning publication, retained with completion evidence even after output cleanup.
+  optional string publication_id = 8;
+}
+
+message RegisterFileForIndexing {
+  quickwit.common.IndexUid index_uid = 1;
+  string file_id = 2;
+  string file_uri = 3;
+  // Positive size of the uploaded file, including framing, at most INT64_MAX.
+  uint64 num_bytes = 4;
+}
+
+message RegisterFileForIndexingResponse {
+  DocumentsStagedForUpload staged_file = 1;
+}
+
+// Select the globally oldest eligible file, then a same-index prefix. Eligibility
+// means unfinished and either never assigned or started strictly before
+// metastore time minus retry_after_secs. Ordering is registration time, then file ID.
+message AssignFilesForIndexing {
+  // Between 1 and 1000 files. Claims never wait for a group to fill.
+  uint32 max_num_files = 1;
+  // Between 1 and INT64_MAX bytes. The oldest file is always included, even if it
+  // alone exceeds this target. Stop before the first additional file that would exceed it.
+  uint64 max_num_bytes = 2;
+  // Positive retry delay. All workers should use the same configured value.
+  uint32 retry_after_secs = 3;
+}
+
+message AssignFilesForIndexingResponse {
+  // Empty when no eligible work is available. Processing start is recorded before reply.
+  repeated DocumentsStagedForUpload staged_files = 1;
+}
+
+message ListCompletedFilesRequest {
+  // Exclusive file-ID cursor. Empty starts a new scan.
+  string after_file_id = 1;
+  // Page size, between 1 and 1000.
+  uint32 max_num_files = 2;
+}
+
+message ListCompletedFilesResponse {
+  // Completed records ordered by file_id ascending, strictly after the cursor.
+  repeated DocumentsStagedForUpload staged_files = 1;
+}
+
+message PublishFileSplits {
+  quickwit.common.IndexUid index_uid = 1;
+  // Between 1 and 1000 distinct registered inputs, all belonging to this incarnation.
+  repeated string file_ids = 2;
+  // At most 1000 distinct staged output splits. Empty output is valid.
+  repeated string staged_split_ids = 3;
+  // Canonical globally unique ULID generated per attempt. The caller MUST retain
+  // the same publication ID, input set, and output set across retries. Each attempt
+  // uses its own output split IDs, so losing cleanup cannot delete a winner's outputs.
+  string publication_id = 4;
+}
+
+message PublishFileSplitsResponse {
+  // True for the winning commit and its retries, even after output splits are gone.
+  // False if any input was completed by another publication. No rows change then.
+  // An error or lost response is ambiguous: retry the SAME request before cleanup.
+  bool published = 1;
 }
 
 message CreateIndexRequest {

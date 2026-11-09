@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use quickwit_ingest::router_client::IngestResponse as RouterResponse;
 use quickwit_ingest::{IngestResponse, IngestServiceError};
-use quickwit_proto::ingest::router::IngestResponseV2;
 use quickwit_proto::ingest::{DocBatchV2, ParseFailureReason};
 use quickwit_proto::types::DocUid;
 use serde::{Deserialize, Serialize};
@@ -52,15 +52,16 @@ impl RestIngestResponse {
         }
     }
 
-    /// Converts [`IngestResponseV2`] into [`RestIngestResponse`].
+    /// Converts a router response into [`RestIngestResponse`].
     ///
     /// Generates a detailed failure description (`parse_failures`) if
     /// `doc_batch_clone_opt.is_some()`
     pub(crate) fn from_ingest_v2(
-        mut ingest_response: IngestResponseV2,
+        ingest_response: impl Into<RouterResponse>,
         doc_batch_clone_opt: Option<&DocBatchV2>,
         num_docs_for_processing: u64,
     ) -> Result<Self, IngestServiceError> {
+        let mut ingest_response = ingest_response.into();
         let num_responses = ingest_response.successes.len() + ingest_response.failures.len();
         if num_responses != 1 {
             return Err(IngestServiceError::Internal(format!(
@@ -127,7 +128,9 @@ fn apply_op<T>(a: Option<T>, b: Option<T>, f: impl Fn(T, T) -> T) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use quickwit_proto::ingest::ParseFailure;
-    use quickwit_proto::ingest::router::{IngestFailure, IngestFailureReason, IngestSuccess};
+    use quickwit_proto::ingest::router::{
+        IngestFailure, IngestFailureReason, IngestResponseV2, IngestSuccess,
+    };
     use quickwit_proto::types::IndexUid;
 
     use super::*;

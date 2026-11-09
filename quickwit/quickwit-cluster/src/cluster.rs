@@ -378,6 +378,21 @@ impl Cluster {
             .await;
     }
 
+    /// Advertises ingesthree intake and excludes this node from v2 ingester discovery.
+    /// Set this before marking an ingesthree indexer ready. Updating the gossip key
+    /// emits a cluster update even though ClusterMember has no corresponding field.
+    pub async fn set_self_ingesthree_enabled(&self, enabled: bool) {
+        self.set_self_key_value(crate::node::INGESTHREE_ENABLED_KEY, enabled)
+            .await;
+    }
+
+    /// Advertises node-wide ingesthree capacity independently of v2 shard state.
+    pub async fn set_self_ingesthree_capacity(&self, score: usize) {
+        assert!(score <= 10, "invalid ingesthree capacity: {score}");
+        self.set_self_key_value(crate::node::INGESTHREE_CAPACITY_KEY, score)
+            .await;
+    }
+
     /// Sets a key-value pair on the cluster node's state.
     pub async fn set_self_key_value(&self, key: impl Display, value: impl Display) {
         self.chitchat()

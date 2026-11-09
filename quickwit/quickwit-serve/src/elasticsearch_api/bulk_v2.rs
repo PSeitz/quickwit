@@ -17,11 +17,13 @@ use std::time::Instant;
 
 use quickwit_common::rate_limited_error;
 use quickwit_config::{INGEST_V2_SOURCE_ID, validate_identifier};
-use quickwit_ingest::{IngestRequestV2Builder, split_ndjson_lines};
-use quickwit_proto::ingest::CommitTypeV2;
-use quickwit_proto::ingest::router::{
-    IngestFailureReason, IngestResponseV2, IngestRouterService, IngestRouterServiceClient,
+use quickwit_ingest::router_client::{
+    IngestFailure as RouterFailure, IngestResponse as RouterResponse, IngestRouterClient,
 };
+use quickwit_ingest::{IngestRequestV2Builder, IngestServiceError, split_ndjson_lines};
+use quickwit_proto::ServiceError;
+use quickwit_proto::ingest::CommitTypeV2;
+use quickwit_proto::ingest::router::IngestFailureReason;
 use quickwit_proto::types::{DocUid, IndexId};
 use serde::{Deserialize, Serialize};
 use warp::hyper::StatusCode;
@@ -83,8 +85,9 @@ pub(crate) async fn elastic_bulk_ingest_v2(
     default_index_id: Option<IndexId>,
     body: Body,
     bulk_options: ElasticBulkOptions,
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: impl Into<IngestRouterClient>,
 ) -> Result<ElasticBulkResponse, ElasticsearchError> {
+    let ingest_router = ingest_router.into();
     let now = Instant::now();
     let mut ingest_request_builder = IngestRequestV2Builder::default();
     let mut lines = split_ndjson_lines(&body.content).enumerate();
@@ -167,12 +170,13 @@ pub(crate) async fn elastic_bulk_ingest_v2(
 
 #[allow(clippy::result_large_err)]
 fn make_elastic_bulk_response_v2(
-    ingest_response_v2: IngestResponseV2,
+    ingest_response_v2: impl Into<RouterResponse>,
     mut per_subrequest_doc_handles: HashMap<u32, Vec<DocHandle>>,
     now: Instant,
     action_count: usize,
     invalid_index_id_items: Vec<(usize, ElasticBulkItem)>,
 ) -> Result<ElasticBulkResponse, ElasticsearchError> {
+    let ingest_response_v2 = ingest_response_v2.into();
     let mut positioned_actions: Vec<(usize, ElasticBulkAction)> = Vec::with_capacity(action_count);
     let mut errors = false;
 
@@ -250,64 +254,78 @@ fn make_elastic_bulk_response_v2(
 
         // Find the doc handles for the subrequest.
         let doc_handles =
-            remove_doc_handles(&mut per_subrequest_doc_handles, failure.subrequest_id)
+            remove_doc_handles(&mut per_subrequest_doc_handles, failure.subrequest_id())
                 .inspect_err(|_| {
                     rate_limited_error!(
                         limit_per_min = 6,
-                        subrequest = failure.subrequest_id,
+                        subrequest = failure.subrequest_id(),
                         "failed to find error subrequest"
                     );
                 })?;
 
         // Populate the response items with one error per doc handle.
-        let (exception, reason, status) = match failure.reason() {
-            IngestFailureReason::IndexNotFound => (
-                ElasticException::IndexNotFound,
-                format!("no such index [{}]", failure.index_id),
-                StatusCode::NOT_FOUND,
-            ),
-            IngestFailureReason::SourceNotFound => (
-                ElasticException::SourceNotFound,
-                format!("no such source [{}]", failure.index_id),
-                StatusCode::NOT_FOUND,
-            ),
-            IngestFailureReason::Timeout => (
-                ElasticException::Timeout,
-                format!("timeout [{}]", failure.index_id),
-                StatusCode::REQUEST_TIMEOUT,
-            ),
-            IngestFailureReason::ShardRateLimited => (
-                ElasticException::RateLimited,
-                format!("shard rate limiting [{}]", failure.index_id),
-                StatusCode::TOO_MANY_REQUESTS,
-            ),
-            IngestFailureReason::NoShardsAvailable => (
-                ElasticException::RateLimited,
-                format!("no shards available [{}]", failure.index_id),
-                StatusCode::TOO_MANY_REQUESTS,
-            ),
-            reason => {
-                let pretty_reason = reason
-                    .as_str_name()
-                    .strip_prefix("INGEST_FAILURE_REASON_")
-                    .unwrap_or("")
-                    .replace('_', " ")
-                    .to_ascii_lowercase();
+        let (exception, reason, status) = match &failure {
+            RouterFailure::Ingesthree { error, .. } => {
+                let exception = match error {
+                    IngestServiceError::BadRequest(_) => ElasticException::IllegalArgument,
+                    IngestServiceError::RateLimited(_) => ElasticException::RateLimited,
+                    _ => ElasticException::Internal,
+                };
                 (
-                    ElasticException::Internal,
-                    format!("{} error [{}]", pretty_reason, failure.index_id),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    exception,
+                    error.to_string(),
+                    error.error_code().http_status_code(),
                 )
             }
+            RouterFailure::V2(failure) => match failure.reason() {
+                IngestFailureReason::IndexNotFound => (
+                    ElasticException::IndexNotFound,
+                    format!("no such index [{}]", failure.index_id),
+                    StatusCode::NOT_FOUND,
+                ),
+                IngestFailureReason::SourceNotFound => (
+                    ElasticException::SourceNotFound,
+                    format!("no such source [{}]", failure.index_id),
+                    StatusCode::NOT_FOUND,
+                ),
+                IngestFailureReason::Timeout => (
+                    ElasticException::Timeout,
+                    format!("timeout [{}]", failure.index_id),
+                    StatusCode::REQUEST_TIMEOUT,
+                ),
+                IngestFailureReason::ShardRateLimited => (
+                    ElasticException::RateLimited,
+                    format!("shard rate limiting [{}]", failure.index_id),
+                    StatusCode::TOO_MANY_REQUESTS,
+                ),
+                IngestFailureReason::NoShardsAvailable => (
+                    ElasticException::RateLimited,
+                    format!("no shards available [{}]", failure.index_id),
+                    StatusCode::TOO_MANY_REQUESTS,
+                ),
+                reason => {
+                    let pretty_reason = reason
+                        .as_str_name()
+                        .strip_prefix("INGEST_FAILURE_REASON_")
+                        .unwrap_or("")
+                        .replace('_', " ")
+                        .to_ascii_lowercase();
+                    (
+                        ElasticException::Internal,
+                        format!("{} error [{}]", pretty_reason, failure.index_id),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                }
+            },
         };
         for mut doc_handle in doc_handles {
             let error = ElasticBulkError {
-                index_id: Some(failure.index_id.clone()),
+                index_id: Some(failure.index_id().to_string()),
                 exception,
                 reason: reason.clone(),
             };
             let item = ElasticBulkItem {
-                index_id: failure.index_id.clone(),
+                index_id: failure.index_id().to_string(),
                 es_doc_id: doc_handle.es_doc_id.take(),
                 status,
                 error: Some(error),
@@ -382,8 +400,8 @@ fn make_invalid_index_id_item(index_id: String, es_doc_id: Option<String>) -> El
 mod tests {
     use bytesize::ByteSize;
     use quickwit_proto::ingest::router::{
-        IngestFailure, IngestFailureReason, IngestResponseV2, IngestSuccess,
-        MockIngestRouterService,
+        IngestFailure, IngestFailureReason, IngestResponseV2, IngestRouterServiceClient,
+        IngestSuccess, MockIngestRouterService,
     };
     use quickwit_proto::ingest::{ParseFailure, ParseFailureReason};
     use quickwit_proto::types::{IndexUid, Position, ShardId};
@@ -732,6 +750,63 @@ mod tests {
         let bulk_response: ElasticBulkResponse = serde_json::from_slice(response.body()).unwrap();
         assert!(bulk_response.errors);
         assert_eq!(bulk_response.actions.len(), 3);
+    }
+
+    #[test]
+    fn test_file_intake_failure_statuses() {
+        let failures = [
+            IngestServiceError::BadRequest("unsupported source".into()),
+            IngestServiceError::Unavailable("no destination".into()),
+            IngestServiceError::RateLimited(
+                quickwit_proto::ingest::RateLimitingCause::LoadShedding,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, error)| RouterFailure::Ingesthree {
+            subrequest_id: index as u32 + 1,
+            index_id: "test-index".into(),
+            error,
+        })
+        .collect();
+        let handles = (0..4)
+            .map(|index| {
+                (
+                    index as u32,
+                    vec![DocHandle {
+                        doc_position: index,
+                        doc_uid: DocUid::for_test(index as u128),
+                        es_doc_id: Some(index.to_string()),
+                        is_parse_failure: false,
+                    }],
+                )
+            })
+            .collect();
+        let response = make_elastic_bulk_response_v2(
+            RouterResponse {
+                successes: vec![IngestSuccess {
+                    subrequest_id: 0,
+                    index_uid: Some(IndexUid::for_test("test-index", 0)),
+                    num_ingested_docs: 1,
+                    ..Default::default()
+                }],
+                failures,
+            },
+            handles,
+            Instant::now(),
+            4,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(response.errors);
+        assert_eq!(response.actions.len(), 4);
+        for (index, status) in [201, 400, 503, 429].into_iter().enumerate() {
+            assert_eq!(response.actions[index].status().as_u16(), status);
+            let ElasticBulkAction::Index(item) = &response.actions[index] else {
+                panic!("expected index action")
+            };
+            assert_eq!(item.es_doc_id.as_deref(), Some(index.to_string().as_str()));
+        }
     }
 
     #[test]

@@ -19,10 +19,10 @@ use prost::Message;
 use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
 use quickwit_config::{ConfigFormat, IndexConfig, load_index_config_from_user_config};
+use quickwit_ingest::router_client::IngestRouterClient;
 use quickwit_ingest::{CommitType, JsonDocBatchV2Builder};
 use quickwit_metrics::{counter, histogram, label_values};
 use quickwit_proto::ingest::DocBatchV2;
-use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::logs_service_server::LogsService;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -200,12 +200,14 @@ struct ParsedLogRecords {
 
 #[derive(Clone)]
 pub struct OtlpGrpcLogsService {
-    ingest_router: IngestRouterServiceClient,
+    ingest_router: IngestRouterClient,
 }
 
 impl OtlpGrpcLogsService {
-    pub fn new(ingest_router: IngestRouterServiceClient) -> Self {
-        Self { ingest_router }
+    pub fn new(ingest_router: impl Into<IngestRouterClient>) -> Self {
+        Self {
+            ingest_router: ingest_router.into(),
+        }
     }
 
     pub fn index_config(default_index_root_uri: &Uri) -> anyhow::Result<IndexConfig> {
