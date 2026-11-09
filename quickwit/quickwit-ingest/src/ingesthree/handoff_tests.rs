@@ -93,6 +93,7 @@ fn start_writer(
     mock: MockMetastoreService,
 ) -> (WriteQueue, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let worker = tokio::spawn(write_batches(
         core,
         receiver,
@@ -317,6 +318,7 @@ async fn test_registration_retry_and_restart_preserve_identity() {
         });
     let metastore = MetastoreServiceClient::from_mock(mock);
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let worker = tokio::spawn(write_batches(
         core,
         receiver,
@@ -524,6 +526,7 @@ async fn test_drain_closes_clones_and_finishes_queued_and_active_files() {
         .returning(|request| Ok(registration_response(request)));
     let (metastore, permits) = stalled_metastore(mock);
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let worker = tokio::spawn(write_batches(
         core,
         receiver,
@@ -612,6 +615,7 @@ async fn test_append_failure_cancels_registration_before_releasing_directory() {
         ))
         .build_from_mock(MockMetastoreService::new());
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let worker = tokio::spawn(write_batches(
         core,
         receiver,

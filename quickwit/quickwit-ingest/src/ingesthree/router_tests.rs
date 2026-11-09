@@ -35,6 +35,9 @@ use super::*;
 #[path = "router_error_tests.rs"]
 mod errors;
 
+#[path = "router_metrics_tests.rs"]
+mod metrics_tests;
+
 #[derive(Clone)]
 struct Intake {
     calls: Arc<AtomicUsize>,
@@ -59,6 +62,9 @@ impl IngesthreeService for Intake {
         let request = request.into_inner();
         assert_eq!(request.subrequests.len(), 1);
         let subrequest = &request.subrequests[0];
+        if subrequest.index_id == "pending" {
+            return std::future::pending().await;
+        }
         if let Some(response) = errors::index_response(subrequest) {
             return response.map(Response::new);
         }
@@ -262,7 +268,10 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
     let local = destination("local", true, true, "zone-a", None, false).await;
     let remote = destination("remote", true, true, "zone-b", None, false).await;
     let zone: AvailabilityZone = "zone-a".into();
-    let router = IngesthreeRouter::new(local.cluster.clone(), Some(zone.clone()), ByteSize::mb(1));
+    let mut router =
+        IngesthreeRouter::new(local.cluster.clone(), Some(zone.clone()), ByteSize::mb(1));
+    let metrics = RouterMetrics::for_test("capacity_filter");
+    router.metrics = metrics.clone();
     let request = IngestRequestV2 {
         subrequests: vec![subrequest()],
         commit_type: CommitTypeV2::Auto as i32,
@@ -282,7 +291,14 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
     let ordered = destinations(&nodes, "logs", Some(&zone));
     assert_eq!(ordered.len(), 2);
     assert_eq!(ordered[0].node_id, local.node.node_id);
-    let result = route_subrequest(&subrequest(), ordered, ByteSize::mb(1)).await;
+    let result = route_subrequest(
+        &subrequest(),
+        ordered,
+        ByteSize::mb(1),
+        Some(&zone),
+        &metrics,
+    )
+    .await;
     assert_eq!(result.successes.len(), 1);
     assert_eq!(local.calls.load(Ordering::SeqCst), 0);
     assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
@@ -299,8 +315,14 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
 
     // Gossip overload evidence survives an unavailable destination's response.
     let down = destination("down", true, true, "zone-b", Some(Code::Unavailable), false).await;
-    let result =
-        route_subrequest(&subrequest(), vec![&nodes[0], &down.node], ByteSize::mb(1)).await;
+    let result = route_subrequest(
+        &subrequest(),
+        vec![&nodes[0], &down.node],
+        ByteSize::mb(1),
+        Some(&zone),
+        &metrics,
+    )
+    .await;
     assert_eq!(
         IngestServiceError::from(result.failures[0].clone())
             .error_code()
@@ -319,6 +341,13 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
     );
     assert_eq!(router.ingest(request).await.unwrap().successes.len(), 1);
     assert_eq!(local.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(metrics.attempt_count("same_az"), 1);
+    assert_eq!(metrics.attempt_count("cross_az"), 2);
+    assert_eq!(metrics.attempt_count("az_unaware"), 0);
+    assert_eq!(metrics.result_count("unavailable"), 1);
+    assert_eq!(metrics.result_count("load_shedding"), 1);
+    assert_eq!(metrics.result_count("success"), 1);
+    assert_eq!(metrics.in_flight_bytes.get(), 0.0);
 }
 
 #[tokio::test]
@@ -334,10 +363,14 @@ async fn test_ingesthree_retries_capacity_and_unavailable_then_succeeds() {
     .await;
     let down = destination("down", true, true, "zone-a", Some(Code::Unavailable), false).await;
     let healthy = destination("healthy", true, true, "zone-b", None, false).await;
+    let metrics = RouterMetrics::for_test("retry_success");
+    let zone: AvailabilityZone = "zone-a".into();
     let response = route_subrequest(
         &subrequest(),
         vec![&full.node, &down.node, &healthy.node],
         ByteSize::mb(1),
+        Some(&zone),
+        &metrics,
     )
     .await;
     assert_eq!(response.successes.len(), 1);
@@ -345,6 +378,24 @@ async fn test_ingesthree_retries_capacity_and_unavailable_then_succeeds() {
     for node in [&full, &down, &healthy] {
         assert_eq!(node.calls.load(Ordering::SeqCst), 1);
     }
+    metrics.record_response(&response);
+    assert_eq!(metrics.attempt_count("same_az"), 2);
+    assert_eq!(metrics.attempt_count("cross_az"), 1);
+    assert_eq!(metrics.result_count("success"), 1);
+    assert_eq!(metrics.result_count("load_shedding"), 0);
+    assert_eq!(metrics.result_count("unavailable"), 0);
+    let (requests, in_flight) = metrics_tests::client_metrics("retry_success");
+    for code in ["resource_exhausted", "unavailable"] {
+        assert_eq!(
+            quickwit_metrics::counter!(parent: requests, "status" => "error", "code" => code).get(),
+            1
+        );
+    }
+    assert_eq!(
+        quickwit_metrics::counter!(parent: requests, "status" => "success", "code" => "ok").get(),
+        1
+    );
+    assert_eq!(in_flight.get(), 0.0);
 }
 
 #[tokio::test]
@@ -369,10 +420,13 @@ async fn test_ingesthree_exhausted_capacity_is_429_compatible_and_retries_are_li
     )
     .await;
     let fourth = destination("fourth", true, true, "zone-a", None, false).await;
+    let metrics = RouterMetrics::for_test("retry_limit");
     let response = route_subrequest(
         &subrequest(),
         vec![&full.node, &down.node, &third.node, &fourth.node],
         ByteSize::mb(1),
+        None,
+        &metrics,
     )
     .await;
     assert!(response.successes.is_empty());
@@ -388,6 +442,10 @@ async fn test_ingesthree_exhausted_capacity_is_429_compatible_and_retries_are_li
         ServiceErrorCode::TooManyRequests
     ));
     assert_eq!(fourth.calls.load(Ordering::SeqCst), 0);
+    metrics.record_response(&response);
+    assert_eq!(metrics.attempt_count("az_unaware"), 3);
+    assert_eq!(metrics.result_count("load_shedding"), 1);
+    assert_eq!(metrics.result_count("unavailable"), 0);
 
     // Advertised saturation skips payloads and leaves the three-attempt budget intact.
     let nodes = [
@@ -396,11 +454,19 @@ async fn test_ingesthree_exhausted_capacity_is_429_compatible_and_retries_are_li
         update_capacity(&third, Some(0)).await,
         fourth.node.clone(),
     ];
-    let response = route_subrequest(&subrequest(), nodes.iter().collect(), ByteSize::mb(1)).await;
+    let response = route_subrequest(
+        &subrequest(),
+        nodes.iter().collect(),
+        ByteSize::mb(1),
+        None,
+        &metrics,
+    )
+    .await;
     assert_eq!(response.successes.len(), 1);
     for destination in [&full, &down, &third, &fourth] {
         assert_eq!(destination.calls.load(Ordering::SeqCst), 1);
     }
+    assert_eq!(metrics.attempt_count("az_unaware"), 4);
 }
 
 #[tokio::test]

@@ -31,6 +31,12 @@ pub trait RpcName {
     fn rpc_name() -> &'static str;
 }
 
+impl<T: RpcName> RpcName for tonic::Request<T> {
+    fn rpc_name() -> &'static str {
+        T::rpc_name()
+    }
+}
+
 /// Returns the gRPC status code associated with a service error.
 pub trait GrpcStatusCode {
     fn grpc_status_code(&self) -> tonic::Code;
@@ -135,7 +141,7 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GrpcMetricsLayer {
     requests_total: Counter,
     requests_in_flight: Gauge,
@@ -328,6 +334,72 @@ mod tests {
     impl Retryable for RetryableError {
         fn is_retryable(&self) -> bool {
             true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tonic_request_grpc_metrics_errors_and_cancellation() {
+        for kind in ["client", "server"] {
+            let layer = GrpcMetricsLayer::new("tonic_request_test", kind);
+            let in_flight = gauge!(parent: layer.requests_in_flight, "rpc" => "hello");
+            let count = |status: &'static str, code: &'static str| {
+                counter!(parent: layer.requests_total, "rpc" => "hello", "status" => status, "code" => code).get()
+            };
+            let mut success = layer.layer(tower::service_fn(
+                |request: tonic::Request<HelloRequest>| async move {
+                    assert_eq!(
+                        request.metadata().get("ingest-version").unwrap(),
+                        "ingesthree"
+                    );
+                    Ok::<_, tonic::Status>(request.into_inner())
+                },
+            ));
+            let mut request = tonic::Request::new(HelloRequest);
+            request
+                .metadata_mut()
+                .insert("ingest-version", "ingesthree".parse().unwrap());
+            success.call(request).await.unwrap();
+            assert_eq!(count("success", "ok"), 1);
+            assert_eq!(in_flight.get(), 0.0);
+
+            let mut rejected =
+                layer.layer(tower::service_fn(|_: tonic::Request<HelloRequest>| async {
+                    Err::<(), _>(tonic::Status::failed_precondition("missing version"))
+                }));
+            rejected
+                .call(tonic::Request::new(HelloRequest))
+                .await
+                .unwrap_err();
+            assert_eq!(count("error", "failed_precondition"), 1);
+            assert_eq!(in_flight.get(), 0.0);
+
+            let mut timed_out =
+                layer.layer(tower::service_fn(|_: tonic::Request<HelloRequest>| async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        std::future::pending::<Result<(), tonic::Status>>(),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("intake timed out")))
+                }));
+            let status = timed_out
+                .call(tonic::Request::new(HelloRequest))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+            assert_eq!(count("error", "deadline_exceeded"), 1);
+            assert_eq!(count("cancelled", "cancelled"), 0);
+            assert_eq!(in_flight.get(), 0.0);
+
+            let mut pending = layer.layer(tower::service_fn(|_: tonic::Request<HelloRequest>| {
+                std::future::pending::<Result<(), tonic::Status>>()
+            }));
+            let mut response = Box::pin(pending.call(tonic::Request::new(HelloRequest)));
+            assert!(futures::poll!(&mut response).is_pending());
+            assert_eq!(in_flight.get(), 1.0);
+            drop(response);
+            assert_eq!(count("cancelled", "cancelled"), 1);
+            assert_eq!(in_flight.get(), 0.0);
         }
     }
 

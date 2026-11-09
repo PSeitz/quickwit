@@ -31,6 +31,7 @@ fn test_capacity_accounts_for_queue_disk_reservations_and_closed_intake() {
         disk_bytes: 0,
         reserved_disk_bytes: 0,
         closed: false,
+        metrics: QueueMetrics::new(100, 100, 0),
     };
     let mut tracker = CapacityTracker::new(100, 100);
     assert_eq!(admission.capacity_score(&mut tracker), 10);
@@ -241,6 +242,7 @@ async fn test_queue_budget_and_drain_are_shared_by_clones() {
     let core = Ingester::open(dir.path(), BUDGET).unwrap();
     let (queue_bytes, disk_bytes) = num_bytes(&index(), &batch()).unwrap();
     let (queue, receiver) = WriteQueue::channel(&core, queue_bytes);
+    let core = FileWriter::new(core, queue.admission.clone());
     let clone = queue.clone();
     let mut first = pin!(queue.append(index(), batch(), None));
     assert!(poll!(&mut first).is_pending());
@@ -296,6 +298,7 @@ async fn test_disk_budget_includes_queued_requests() {
     let (_, disk_bytes) = num_bytes(&index(), &batch()).unwrap();
     let core = Ingester::open(dir.path(), disk_bytes).unwrap();
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let mut first = pin!(queue.append(index(), batch(), None));
     assert!(poll!(&mut first).is_pending());
     assert!(matches!(
@@ -356,6 +359,7 @@ async fn test_dropped_callers_and_handles_still_drain() {
     let dir = tempfile::tempdir().unwrap();
     let core = Ingester::open(dir.path(), BUDGET).unwrap();
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     {
         let mut request = pin!(queue.append(index(), batch(), None));
         assert!(poll!(&mut request).is_pending());
@@ -380,6 +384,7 @@ async fn test_io_failure_stops_writer_and_releases_pending_requests() {
     let active = core.active.get_mut(&index()).unwrap();
     active.writer = BufWriter::new(File::open(&active.input.path).unwrap());
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let mut failing = pin!(queue.append(index(), batch(), None));
     let mut queued = pin!(queue.append(index(), batch(), None));
     assert!(poll!(&mut failing).is_pending());
@@ -403,6 +408,7 @@ async fn test_concurrent_admission_stays_within_both_budgets() {
     let (queue_bytes, disk_bytes) = num_bytes(&index(), &batch()).unwrap();
     let core = Ingester::open(dir.path(), 3 * disk_bytes).unwrap();
     let (queue, receiver) = WriteQueue::channel(&core, 3 * queue_bytes);
+    let core = FileWriter::new(core, queue.admission.clone());
     let (polled, mut observations) = mpsc::unbounded_channel();
     let mut tasks = Vec::new();
     for _ in 0..16 {

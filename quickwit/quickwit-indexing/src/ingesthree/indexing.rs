@@ -18,14 +18,50 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use quickwit_common::io::IoControls;
+use quickwit_common::metrics::IN_FLIGHT_INDEX_WRITER;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_config::{IndexConfig, IndexingSettings, SourceInputFormat, build_doc_mapper};
 use quickwit_doc_mapper::DocMapper;
+use quickwit_metrics::{Gauge, GaugeGuard};
 use quickwit_proto::indexing::IndexingPipelineId;
 
 use crate::actors::{DocumentConverter, OTHER_PARTITION_ID};
 use crate::docs_clustering::Fingerprinter;
-use crate::models::IndexedSplitBuilder;
+use crate::models::{IndexedSplit, IndexedSplitBuilder, ProcessedDoc};
+
+/// A split writer whose memory is counted until serialization finishes.
+/// Field order releases the builder before its memory guard on error or cancellation.
+pub(super) struct SplitWriter {
+    pub builder: IndexedSplitBuilder,
+    memory_usage: GaugeGuard,
+}
+
+impl SplitWriter {
+    fn new(builder: IndexedSplitBuilder, memory_gauge: &Gauge) -> Self {
+        let memory_usage = GaugeGuard::new(memory_gauge, builder.mem_usage() as f64);
+        Self {
+            builder,
+            memory_usage,
+        }
+    }
+
+    fn add_document(&mut self, document: ProcessedDoc) -> anyhow::Result<()> {
+        let result = self.builder.add_document(document);
+        self.memory_usage
+            .increment(self.builder.mem_usage() as f64 - self.memory_usage.delta());
+        result
+    }
+
+    pub fn finalize(self) -> anyhow::Result<IndexedSplit> {
+        let Self {
+            builder,
+            memory_usage,
+        } = self;
+        let result = builder.finalize();
+        drop(memory_usage);
+        result
+    }
+}
 
 /// Converts documents and accumulates splits until their document or memory target is reached.
 pub(super) struct SplitBuilders {
@@ -37,8 +73,9 @@ pub(super) struct SplitBuilders {
     directory: TempDirectory,
     pub io_controls: IoControls,
     clustering_enabled: bool,
-    splits: HashMap<u64, IndexedSplitBuilder>,
-    overflow: Option<IndexedSplitBuilder>,
+    splits: HashMap<u64, SplitWriter>,
+    overflow: Option<SplitWriter>,
+    writer_memory: Gauge,
 }
 
 impl SplitBuilders {
@@ -71,11 +108,12 @@ impl SplitBuilders {
             clustering_enabled: fingerprinter.is_some(),
             splits: HashMap::new(),
             overflow: None,
+            writer_memory: IN_FLIGHT_INDEX_WRITER.clone(),
         })
     }
 
-    fn create_split(&self, partition: u64) -> anyhow::Result<IndexedSplitBuilder> {
-        IndexedSplitBuilder::from_doc_mapper(
+    fn create_split(&self, partition: u64) -> anyhow::Result<SplitWriter> {
+        let builder = IndexedSplitBuilder::from_doc_mapper(
             self.pipeline_id.clone(),
             partition,
             self.delete_opstamp,
@@ -84,7 +122,8 @@ impl SplitBuilders {
             self.directory.clone(),
             self.io_controls.clone().set_component("indexer"),
             self.clustering_enabled,
-        )
+        )?;
+        Ok(SplitWriter::new(builder, &self.writer_memory))
     }
 
     pub fn add_documents(&mut self, documents: Vec<Bytes>) -> anyhow::Result<()> {
@@ -119,14 +158,14 @@ impl SplitBuilders {
         let mut num_docs = 0;
         let mut num_bytes = 0;
         for split in self.splits.values().chain(self.overflow.iter()) {
-            num_docs += split.split_attrs.num_docs;
-            num_bytes += split.mem_usage() as u64;
+            num_docs += split.builder.split_attrs.num_docs;
+            num_bytes += split.builder.mem_usage() as u64;
         }
         num_docs >= self.settings.split_num_docs_target as u64
             || num_bytes >= self.settings.resources.heap_size.as_u64()
     }
 
-    pub fn take_splits(&mut self) -> Vec<IndexedSplitBuilder> {
+    pub fn take_splits(&mut self) -> Vec<SplitWriter> {
         self.splits
             .drain()
             .map(|(_, split)| split)
@@ -174,6 +213,8 @@ mod tests {
             Some(Fingerprinter::new(&clustering)),
         )
         .unwrap();
+        let writer_memory = Gauge::local();
+        builders.writer_memory = writer_memory.clone();
         // Document IDs must continue across batches within each split.
         for owners in [["alice", "bob"], ["charlie", "alice"]] {
             let docs = owners
@@ -192,38 +233,137 @@ mod tests {
         assert!(builders.should_flush());
         assert_eq!(builders.splits.len(), 1);
         assert_eq!(
-            builders.overflow.as_ref().unwrap().split_attrs.partition_id,
+            builders
+                .overflow
+                .as_ref()
+                .unwrap()
+                .builder
+                .split_attrs
+                .partition_id,
             OTHER_PARTITION_ID
         );
-        assert_eq!(builders.overflow.as_ref().unwrap().split_attrs.num_docs, 2);
+        assert_eq!(
+            builders
+                .overflow
+                .as_ref()
+                .unwrap()
+                .builder
+                .split_attrs
+                .num_docs,
+            2
+        );
+        let expected_bytes: usize = builders
+            .splits
+            .values()
+            .chain(builders.overflow.iter())
+            .map(|split| split.builder.mem_usage())
+            .sum();
+        assert!(expected_bytes > 0);
+        assert_eq!(writer_memory.get(), expected_bytes as f64);
         let splits = builders.take_splits();
         assert!(!builders.should_flush());
+        assert_eq!(writer_memory.get(), expected_bytes as f64);
         for split in splits {
-            assert_eq!(split.split_attrs.num_docs, 2);
-            assert!(split.doc_id_clusterer_opt.is_some());
+            assert_eq!(split.builder.split_attrs.num_docs, 2);
+            assert!(split.builder.doc_id_clusterer_opt.is_some());
+            let memory_before = writer_memory.get();
+            let split_bytes = split.memory_usage.delta();
             let split = split.finalize().unwrap();
+            assert_eq!(writer_memory.get(), memory_before - split_bytes);
             assert_eq!(split.index.reader().unwrap().searcher().num_docs(), 2);
+        }
+        assert_eq!(writer_memory.get(), 0.0);
+    }
+
+    fn builders_for_test(directory: TempDirectory, writer_memory: Gauge) -> SplitBuilders {
+        let config = IndexConfig::for_test("writer-memory", "ram:///splits");
+        let mut builders = SplitBuilders::new(
+            config,
+            IndexingPipelineId {
+                node_id: NodeId::from_str("test-node"),
+                index_uid: IndexUid::for_test("writer-memory", 1),
+                source_id: "ingesthree".into(),
+                pipeline_uid: PipelineUid::random(),
+            },
+            0,
+            directory,
+            IoControls::default(),
+            None,
+        )
+        .unwrap();
+        builders.writer_memory = writer_memory;
+        builders
+            .add_documents(vec![Bytes::from_static(
+                br#"{"timestamp":"2024-01-01T00:00:00Z","body":"hello"}"#,
+            )])
+            .unwrap();
+        builders
+    }
+
+    #[test]
+    fn test_writer_memory_released_on_serialization_error() {
+        let writer_memory = Gauge::local();
+        let mut builders = builders_for_test(TempDirectory::for_test(), writer_memory.clone());
+        let writer = builders.take_splits().pop().unwrap();
+        assert_eq!(writer_memory.get(), writer.builder.mem_usage() as f64);
+        assert!(writer_memory.get() > 0.0);
+        builders.io_controls.kill();
+        assert!(writer.finalize().is_err());
+        assert_eq!(writer_memory.get(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_writer_memory_and_assignment_released_on_blocking_error_or_panic() {
+        for panic in [false, true] {
+            let writer_memory = Gauge::local();
+            let active_assignments = Gauge::local();
+            let directory = TempDirectory::for_test();
+            let builders = builders_for_test(directory.clone(), writer_memory.clone());
+            assert!(writer_memory.get() > 0.0);
+            let assignment = Arc::new(GaugeGuard::new(&active_assignments, 1.0));
+            let result: anyhow::Result<()> = run_indexing(directory, assignment, move || {
+                let _builders = builders;
+                if panic {
+                    panic!("injected blocking panic");
+                }
+                anyhow::bail!("injected blocking error");
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(writer_memory.get(), 0.0);
+            assert_eq!(active_assignments.get(), 0.0);
         }
     }
 
     #[tokio::test]
-    async fn test_cancelled_indexing_keeps_scratch_until_work_exits() {
+    async fn test_cancelled_indexing_keeps_scratch_memory_and_assignment_until_work_exits() {
         let directory = TempDirectory::for_test();
         let path = directory.path().to_path_buf();
         let (started, wait_started) = tokio::sync::oneshot::channel();
         let (release, wait_release) = std::sync::mpsc::channel();
         let (finished, wait_finished) = tokio::sync::oneshot::channel();
         let work_path = path.clone();
-        let task = tokio::spawn(run_indexing(directory, move || {
+        let writer_memory = Gauge::local();
+        let mut builders = builders_for_test(directory.clone(), writer_memory.clone());
+        let writer = builders.take_splits().pop().unwrap();
+        drop(builders);
+        let expected_bytes = writer.builder.mem_usage() as f64;
+        assert!(expected_bytes > 0.0);
+        let active_assignments = Gauge::local();
+        let assignment = Arc::new(GaugeGuard::new(&active_assignments, 1.0));
+        let task = tokio::spawn(run_indexing(directory, assignment, move || {
             started.send(()).unwrap();
             wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(work_path.try_exists().unwrap());
+            drop(writer.finalize().unwrap());
             finished.send(()).unwrap();
             Ok(())
         }));
         wait_started.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(active_assignments.get(), 1.0);
+        assert_eq!(writer_memory.get(), expected_bytes);
         assert!(
             path.try_exists().unwrap(),
             "scratch deleted while synchronous work was running"
@@ -237,5 +377,7 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(active_assignments.get(), 0.0);
+        assert_eq!(writer_memory.get(), 0.0);
     }
 }

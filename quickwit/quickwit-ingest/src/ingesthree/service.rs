@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 
 use quickwit_common::thread_pool::run_cpu_intensive;
+use quickwit_common::tower::GrpcMetricsLayer;
 use quickwit_config::{INGEST_V2_SOURCE_ID, SourceInputFormat, SourceParams, build_doc_mapper};
 use quickwit_metastore::IndexMetadataResponseExt;
 use quickwit_proto::ServiceError;
@@ -30,6 +31,7 @@ use quickwit_proto::metastore::{
     EntityKind, IndexMetadataRequest, MetastoreError, MetastoreService, MetastoreServiceClient,
 };
 use tonic::{Request, Response, Status};
+use tower::{Layer, Service};
 
 use super::{IngestError, WriteQueue};
 use crate::IngestServiceError;
@@ -44,11 +46,16 @@ pub(super) const VERSION: &str = "ingesthree";
 pub struct IngesthreeService {
     metastore: MetastoreServiceClient,
     queue: WriteQueue,
+    grpc_metrics: GrpcMetricsLayer,
 }
 
 impl IngesthreeService {
     pub fn new(metastore: MetastoreServiceClient, queue: WriteQueue) -> Self {
-        Self { metastore, queue }
+        Self {
+            metastore,
+            queue,
+            grpc_metrics: GrpcMetricsLayer::new("ingesthree", "server"),
+        }
     }
 
     /// Mount separately from the public router and v2 ingester services. The metadata
@@ -146,11 +153,8 @@ impl IngesthreeService {
             failures: Vec::new(),
         })
     }
-}
 
-#[async_trait::async_trait]
-impl GrpcIngesthreeService for IngesthreeService {
-    async fn ingest(
+    async fn ingest_request(
         &self,
         request: Request<IngestRequestV2>,
     ) -> Result<Response<IngestResponseV2>, Status> {
@@ -174,6 +178,19 @@ impl GrpcIngesthreeService for IngesthreeService {
         }
         let subrequest = request.subrequests.into_iter().next().unwrap();
         self.append(subrequest).await.map(Response::new)
+    }
+}
+
+#[async_trait::async_trait]
+impl GrpcIngesthreeService for IngesthreeService {
+    async fn ingest(
+        &self,
+        request: Request<IngestRequestV2>,
+    ) -> Result<Response<IngestResponseV2>, Status> {
+        self.grpc_metrics
+            .layer(tower::service_fn(|request| self.ingest_request(request)))
+            .call(request)
+            .await
     }
 }
 
@@ -226,6 +243,7 @@ pub(super) fn validate_request(request: &IngestRequestV2) -> Result<(), IngestSe
 mod tests {
     use quickwit_config::{IndexConfig, SourceConfig};
     use quickwit_metastore::IndexMetadata;
+    use quickwit_metrics::{Counter, Gauge, counter, gauge, labels};
     use quickwit_proto::ServiceErrorCode;
     use quickwit_proto::ingest::DocBatchV2;
     use quickwit_proto::metastore::{IndexMetadataResponse, MockMetastoreService};
@@ -279,6 +297,54 @@ mod tests {
         MetastoreServiceClient::from_mock(mock)
     }
 
+    fn service_metrics(service: &mut IngesthreeService, test: &'static str) -> (Counter, Gauge) {
+        service.grpc_metrics =
+            GrpcMetricsLayer::new_with_labels("ingesthree", "server", labels!("test" => test));
+        let requests = counter!(
+            name: "requests_total",
+            description: "Total number of gRPC requests processed.",
+            subsystem: "grpc",
+            "service" => "ingesthree", "grpc_service" => "ingesthree", "kind" => "server", "rpc" => "ingest",
+        );
+        let in_flight = gauge!(
+            name: "requests_in_flight",
+            description: "Number of gRPC requests in-flight.",
+            subsystem: "grpc",
+            "service" => "ingesthree", "grpc_service" => "ingesthree", "kind" => "server", "rpc" => "ingest",
+        );
+        (
+            counter!(parent: requests, "test" => test),
+            gauge!(parent: in_flight, "test" => test),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_ingesthree_service_cancellation_releases_grpc_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = WriteQueue::open(directory.path().into(), 100_000, 100_000, None)
+            .await
+            .unwrap();
+        let metastore = MetastoreServiceClient::tower()
+            .stack_index_metadata_layer(tower::layer::layer_fn(|_inner| {
+                tower::service_fn(|_: IndexMetadataRequest| {
+                    std::future::pending::<Result<IndexMetadataResponse, MetastoreError>>()
+                })
+            }))
+            .build_from_mock(MockMetastoreService::new());
+        let mut service = IngesthreeService::new(metastore, queue.clone());
+        let (requests, in_flight) = service_metrics(&mut service, "service_cancellation");
+        let mut response = Box::pin(service.ingest(request(payload())));
+        assert!(futures::poll!(&mut response).is_pending());
+        assert_eq!(in_flight.get(), 1.0);
+        drop(response);
+        assert_eq!(in_flight.get(), 0.0);
+        assert_eq!(
+            counter!(parent: requests, "status" => "cancelled", "code" => "cancelled").get(),
+            1
+        );
+        assert!(queue.finish().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_ingesthree_metadata_guard_precedes_lookup_and_writes() {
         let directory = tempfile::tempdir().unwrap();
@@ -286,10 +352,11 @@ mod tests {
             .await
             .unwrap();
         // Any unexpected metastore lookup fails this mock.
-        let service = IngesthreeService::new(
+        let mut service = IngesthreeService::new(
             MetastoreServiceClient::from_mock(MockMetastoreService::new()),
             queue.clone(),
         );
+        let (requests, in_flight) = service_metrics(&mut service, "metadata_guard");
         for version in [None, Some("v2"), Some("INGESTHREE"), Some("ingesthree ")] {
             let mut request = Request::new(payload());
             if let Some(version) = version {
@@ -308,6 +375,11 @@ mod tests {
             service.ingest(duplicate).await.unwrap_err().code(),
             tonic::Code::FailedPrecondition
         );
+        assert_eq!(
+            counter!(parent: requests, "status" => "error", "code" => "failed_precondition").get(),
+            5
+        );
+        assert_eq!(in_flight.get(), 0.0);
         assert!(queue.finish().await.unwrap().is_empty());
     }
 
@@ -369,7 +441,15 @@ mod tests {
                 .unwrap();
             let mut metadata = metadata();
             metadata.index_config.ingest_settings.validate_docs = validate_docs;
-            let service = IngesthreeService::new(metastore(metadata, 1), queue.clone());
+            let mut service = IngesthreeService::new(metastore(metadata, 1), queue.clone());
+            let (requests, in_flight) = service_metrics(
+                &mut service,
+                if validate_docs {
+                    "validation_enabled"
+                } else {
+                    "validation_disabled"
+                },
+            );
             let mut payload = payload();
             payload.subrequests[0].doc_batch = Some(DocBatchV2::for_test(documents));
             let response = service.ingest(request(payload)).await.unwrap().into_inner();
@@ -382,6 +462,11 @@ mod tests {
             assert_eq!(success.parse_failures.len(), usize::from(validate_docs));
             assert!(success.shard_id.is_none());
             assert!(success.replication_position_inclusive.is_none());
+            assert_eq!(
+                counter!(parent: requests, "status" => "success", "code" => "ok").get(),
+                1
+            );
+            assert_eq!(in_flight.get(), 0.0);
             let files = queue.finish().await.unwrap();
             assert_eq!(files.len(), 1);
             assert_eq!(files[0].index_uid, IndexUid::for_test("logs", 123));

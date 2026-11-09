@@ -18,6 +18,7 @@ use std::time::Duration;
 use bytesize::ByteSize;
 use quickwit_cluster::{Cluster, ClusterNode};
 use quickwit_common::rendezvous_hasher::node_affinity;
+use quickwit_metrics::GaugeGuard;
 use quickwit_proto::ingest::ingesthree::ingesthree_service_client::IngesthreeServiceClient;
 use quickwit_proto::ingest::router::{
     IngestFailureReason, IngestRequestV2, IngestResponseV2, IngestSubrequest,
@@ -25,6 +26,12 @@ use quickwit_proto::ingest::router::{
 use quickwit_proto::ingest::{CommitTypeV2, RateLimitingCause};
 use quickwit_proto::types::AvailabilityZone;
 use tonic::{Code, Request, Status};
+use tower::{Layer, Service};
+
+#[path = "router_metrics.rs"]
+mod metrics;
+
+use metrics::RouterMetrics;
 
 use super::service::{VERSION, VERSION_HEADER, failure, validate_request};
 use crate::IngestServiceError;
@@ -38,6 +45,7 @@ pub struct IngesthreeRouter {
     cluster: Cluster,
     availability_zone: Option<AvailabilityZone>,
     max_grpc_message_size: ByteSize,
+    metrics: RouterMetrics,
 }
 
 impl IngesthreeRouter {
@@ -50,6 +58,7 @@ impl IngesthreeRouter {
             cluster,
             availability_zone,
             max_grpc_message_size,
+            metrics: RouterMetrics::default(),
         }
     }
 
@@ -57,7 +66,12 @@ impl IngesthreeRouter {
         &self,
         request: IngestRequestV2,
     ) -> Result<IngestResponse, IngestServiceError> {
-        validate_request(&request)?;
+        let _request_bytes =
+            GaugeGuard::new(&self.metrics.in_flight_bytes, request.num_bytes() as f64);
+        if let Err(error) = validate_request(&request) {
+            self.metrics.record_error(&error, request.subrequests.len());
+            return Err(error);
+        }
         let ready_nodes = self.cluster.ready_nodes().await;
         let mut response = IngestResponse::default();
         for subrequest in request.subrequests {
@@ -66,11 +80,18 @@ impl IngesthreeRouter {
                 &subrequest.index_id,
                 self.availability_zone.as_ref(),
             );
-            let result =
-                route_subrequest(&subrequest, destinations, self.max_grpc_message_size).await;
+            let result = route_subrequest(
+                &subrequest,
+                destinations,
+                self.max_grpc_message_size,
+                self.availability_zone.as_ref(),
+                &self.metrics,
+            )
+            .await;
             response.successes.extend(result.successes);
             response.failures.extend(result.failures);
         }
+        self.metrics.record_response(&response);
         Ok(response)
     }
 }
@@ -108,6 +129,8 @@ async fn route_subrequest(
     subrequest: &IngestSubrequest,
     mut destinations: Vec<&ClusterNode>,
     max_message_size: ByteSize,
+    availability_zone: Option<&AvailabilityZone>,
+    metrics: &RouterMetrics,
 ) -> IngestResponse {
     let mut error =
         IngestServiceError::Unavailable("no ready ingest destination accepted the request".into());
@@ -122,7 +145,8 @@ async fn route_subrequest(
         None => false,
     });
     for node in destinations.into_iter().take(3) {
-        let mut client = IngesthreeServiceClient::new(node.channel())
+        metrics.record_attempt(availability_zone, node.availability_zone().as_ref());
+        let client = IngesthreeServiceClient::new(node.channel())
             .max_decoding_message_size(max_message_size.0 as usize)
             .max_encoding_message_size(max_message_size.0 as usize);
         let mut request = Request::new(IngestRequestV2 {
@@ -133,9 +157,25 @@ async fn route_subrequest(
             .metadata_mut()
             .insert(VERSION_HEADER, VERSION.parse().unwrap());
         request.set_timeout(Duration::from_secs(5));
-        let result = tokio::time::timeout(Duration::from_secs(5), client.ingest(request))
-            .await
-            .unwrap_or_else(|_| Err(Status::deadline_exceeded("ingesthree intake timed out")));
+        let result = metrics
+            .grpc_client
+            .layer(tower::service_fn(move |request| {
+                let mut client = client.clone();
+                async move {
+                    // Keep expiry inside the metrics layer and prioritize it if both
+                    // timers have elapsed: tonic reports its transport timeout as Cancelled.
+                    // Dropping the caller's future still counts as cancellation.
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                            Err(Status::deadline_exceeded("ingesthree intake timed out"))
+                        }
+                        response = client.ingest(request) => response,
+                    }
+                }
+            }))
+            .call(request)
+            .await;
         let attempt_error = match result {
             Ok(response) => {
                 let response = response.into_inner();

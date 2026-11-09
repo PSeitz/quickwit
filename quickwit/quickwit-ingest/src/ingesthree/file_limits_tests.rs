@@ -199,6 +199,7 @@ async fn test_writer_loop_finishes_expired_files() {
 
     // The loop must finish the expired file before this queued request needs a writer.
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let mut next = pin!(queue.append(index(2), batch(), None));
     assert!(poll!(&mut next).is_pending());
     let mut finish = pin!(queue.finish());
@@ -327,6 +328,7 @@ async fn test_open_file_limit_releases_reservations_and_keeps_processing() {
     core.file_limits.max_open_files = 1;
     core.file_limits.target_file_bytes = file_size(&index(1), 2);
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let clone = queue.clone();
     let mut first = pin!(queue.append(index(1), batch(), None));
     let mut rejected = pin!(clone.append(index(2), batch(), None));
@@ -365,6 +367,7 @@ async fn test_finishing_files_at_size_limit_settles_reservations_and_drains_queu
     let mut core = Ingester::open(dir.path(), 2 * disk_bytes).unwrap();
     core.file_limits.target_file_bytes = disk_bytes;
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let mut first = pin!(queue.append(index_uid.clone(), batch(), None));
     let mut second = pin!(queue.append(index_uid.clone(), batch(), None));
     assert!(poll!(&mut first).is_pending());
@@ -420,6 +423,7 @@ async fn test_finishing_expired_files_precedes_queued_work_and_io_failure_stops_
     active.writer.write_all(b"unflushed bytes").unwrap();
     let retained = core.disk_bytes;
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
+    let core = FileWriter::new(core, queue.admission.clone());
     let mut first = pin!(queue.append(index(2), batch(), None));
     let mut second = pin!(queue.append(index(2), batch(), None));
     assert!(poll!(&mut first).is_pending());

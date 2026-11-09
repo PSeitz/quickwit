@@ -17,6 +17,7 @@
 //! splits in the metastore.
 
 mod indexing;
+mod metrics;
 mod supervisor;
 pub(crate) use supervisor::S3IndexerSupervisor;
 pub use supervisor::StopS3Indexers;
@@ -38,6 +39,7 @@ use quickwit_common::uri::Uri;
 use quickwit_config::RetentionPolicy;
 use quickwit_ingest::ingesthree::DocumentFileReader;
 use quickwit_metastore::{IndexMetadataResponseExt, SplitMetadata, StageSplitsRequestExt};
+use quickwit_metrics::{Gauge, GaugeGuard};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::metastore::{
     AssignFilesForIndexing, IndexMetadataRequest, LastDeleteOpstampRequest, MetastoreError,
@@ -49,11 +51,13 @@ use tracing::{Instrument, warn};
 use ulid::Ulid;
 
 use self::indexing::SplitBuilders;
+use self::metrics::ACTIVE_ASSIGNMENTS;
 use crate::actors::{
     acquire_indexing_upload_permit, create_packaged_split, prepare_split_for_upload,
 };
 use crate::docs_clustering::Fingerprinter;
 use crate::merge_policy::{MergePolicy, merge_policy_from_settings};
+use crate::metrics::record_published_split;
 use crate::{IndexingSplitCache, IndexingSplitStore};
 
 /// Indexes assigned input files from S3 and publishes their output splits.
@@ -94,6 +98,15 @@ impl S3Indexer {
         &mut self,
         assignment: AssignFilesForIndexing,
     ) -> anyhow::Result<Option<FilePublication>> {
+        self.index_next_with_activity(assignment, &ACTIVE_ASSIGNMENTS)
+            .await
+    }
+
+    async fn index_next_with_activity(
+        &mut self,
+        assignment: AssignFilesForIndexing,
+        active_assignments: &Gauge,
+    ) -> anyhow::Result<Option<FilePublication>> {
         ensure!(
             self.max_concurrent_split_uploads > 0,
             "split upload limit must be positive"
@@ -106,6 +119,8 @@ impl S3Indexer {
         let Some(first) = files.first() else {
             return Ok(None);
         };
+        // The group stays active until its caller and any detached blocking work have exited.
+        let active_assignment = Arc::new(GaugeGuard::new(active_assignments, 1.0));
         let index_uid = first
             .index_uid
             .clone()
@@ -137,8 +152,12 @@ impl S3Indexer {
         let merge_policy = merge_policy_from_settings(&config.indexing_settings);
         let retention = config.retention_policy_opt.clone();
         let directory = self.scratch_directory.clone();
-        let directory =
-            tokio::task::spawn_blocking(move || directory.named_temp_child("files-")).await??;
+        let assignment_guard = active_assignment.clone();
+        let directory = tokio::task::spawn_blocking(move || {
+            let _assignment = assignment_guard;
+            directory.named_temp_child("files-")
+        })
+        .await??;
         let cancellation = StopIndexingOnDrop(KillSwitch::default());
         let io_controls = IoControls::default()
             .set_kill_switch(cancellation.0.clone())
@@ -151,7 +170,9 @@ impl S3Indexer {
         };
         let split_directory = directory.clone();
         let fingerprinter = self.fingerprinter.clone();
+        let assignment_guard = active_assignment.clone();
         let mut builders = run_cpu_intensive(move || {
+            let _assignment = assignment_guard;
             SplitBuilders::new(
                 config,
                 pipeline_id,
@@ -181,18 +202,22 @@ impl S3Indexer {
             );
             let expected_uid = index_uid.clone();
             let expected_size = file.num_bytes;
-            let mut reader = run_indexing(directory.clone(), move || {
-                DocumentFileReader::open(&path, &expected_uid, expected_size)
-            })
-            .await?;
+            let mut reader =
+                run_indexing(directory.clone(), active_assignment.clone(), move || {
+                    DocumentFileReader::open(&path, &expected_uid, expected_size)
+                })
+                .await?;
             loop {
                 let (next_reader, documents) =
-                    run_indexing(directory.clone(), move || read_batch(reader)).await?;
+                    run_indexing(directory.clone(), active_assignment.clone(), move || {
+                        read_batch(reader)
+                    })
+                    .await?;
                 reader = next_reader;
                 if documents.is_empty() {
                     break;
                 }
-                builders = run_indexing(directory.clone(), move || {
+                builders = run_indexing(directory.clone(), active_assignment.clone(), move || {
                     builders.add_documents(documents)?;
                     Ok(builders)
                 })
@@ -204,6 +229,7 @@ impl S3Indexer {
                         &merge_policy,
                         retention.as_ref(),
                         &mut splits,
+                        &active_assignment,
                     )
                     .await?;
                 }
@@ -217,6 +243,7 @@ impl S3Indexer {
             &merge_policy,
             retention.as_ref(),
             &mut splits,
+            &active_assignment,
         )
         .await?;
         let publication = PublishFileSplits {
@@ -229,7 +256,12 @@ impl S3Indexer {
             publication_id: Ulid::new().to_string(),
         };
         let published = publish_files(&mut self.metastore, publication).await?;
-        if !published {
+        if published {
+            // Count confirmed winners once, after publication retries have finished.
+            for split in &splits {
+                record_published_split(&index_uid.index_id, split);
+            }
+        } else {
             // These outputs belong to this attempt. Preserve them until cleanup reconciles
             // completion; a transport error alone never permits deleting any output.
             splits.clear();
@@ -248,6 +280,7 @@ impl S3Indexer {
         merge_policy: &Arc<dyn MergePolicy>,
         retention: Option<&RetentionPolicy>,
         uploaded: &mut Vec<SplitMetadata>,
+        active_assignment: &Arc<GaugeGuard>,
     ) -> anyhow::Result<()> {
         let splits = builders.take_splits();
         ensure!(
@@ -263,10 +296,13 @@ impl S3Indexer {
             let tags = builders.tag_fields()?;
             let merge_policy = merge_policy.clone();
             let retention = retention.cloned();
-            let (packaged, metadata, payload) =
-                run_indexing(self.scratch_directory.clone(), move || {
+            let (packaged, metadata, payload) = run_indexing(
+                self.scratch_directory.clone(),
+                active_assignment.clone(),
+                move || {
                     let _guard = io_controls.check_if_alive()?;
                     split
+                        .builder
                         .controlled_directory
                         .set_io_controls(io_controls.clone());
                     let packaged =
@@ -275,8 +311,9 @@ impl S3Indexer {
                     let (metadata, payload) =
                         prepare_split_for_upload(&packaged, &merge_policy, retention.as_ref())?;
                     Ok((packaged, metadata, payload))
-                })
-                .await?;
+                },
+            )
+            .await?;
             let request =
                 StageSplitsRequest::try_from_split_metadata(metadata.index_uid.clone(), &metadata)?;
             self.metastore.stage_splits(request).await?;
@@ -296,9 +333,10 @@ impl S3Indexer {
 /// Runs synchronous indexing and filesystem work on the existing blocking runtime.
 /// Writers, compression, and serialization can exceed the small-task CPU pool's time budget.
 /// Keep the scratch root alive through cancellation: TempDirectory retains only its immediate
-/// parent.
+/// parent. The shared assignment guard also keeps detached work counted until it exits.
 async fn run_indexing<T: Send + 'static>(
     directory: TempDirectory,
+    active_assignment: Arc<GaugeGuard>,
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
     RuntimeType::Blocking
@@ -306,6 +344,7 @@ async fn run_indexing<T: Send + 'static>(
         .spawn(
             async move {
                 let _directory = directory;
+                let _assignment = active_assignment;
                 work()
             }
             .in_current_span(),

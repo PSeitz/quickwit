@@ -56,6 +56,9 @@ pub static IN_FLIGHT_REST_SERVER: LazyGauge =
 pub static IN_FLIGHT_INGEST_ROUTER: LazyGauge =
     LazyGauge::new(|| in_flight_data_gauge("ingest_router"));
 
+pub static IN_FLIGHT_INGESTHREE_QUEUE: LazyGauge =
+    LazyGauge::new(|| in_flight_data_gauge("ingesthree_queue"));
+
 pub static IN_FLIGHT_INGESTER_PERSIST: LazyGauge =
     LazyGauge::new(|| in_flight_data_gauge("ingester_persist"));
 

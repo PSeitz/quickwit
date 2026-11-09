@@ -82,6 +82,36 @@ handling policy are required before rollout. Batch byte limits and heap threshol
 overshoot, including a document larger than the batch target. Physical scratch-space,
 indexing-memory, and worker-concurrency admission remain production prerequisites.
 
+## Metrics
+
+Initial publication uses the existing `quickwit_indexing_published_*` counters and
+split-size histogram with `{index, source, merge_ops}` labels. Counters increment
+once per output after a confirmed winning publication, outside the retry loop.
+Losing attempts and unconfirmed responses contribute nothing. A process crash after
+publication can still lose metric emission. Select `merge_ops="0"` to measure initial
+indexing throughput without counting compaction rewrites.
+
+Document conversion retains the existing processed-document and processed-byte
+metrics. Those count processing attempts, including work that later fails or loses
+publication. Writer-memory estimates use
+`quickwit_memory_in_flight_data_bytes{component="index_writer"}` and stay with each
+writer through serialization and cancellation.
+
+Worker metrics use the `quickwit_indexing_ingesthree_` prefix:
+
+| Suffix | Meaning |
+| --- | --- |
+| `configured_supervisors` | Supervisors owned by the indexing service, including restart backoff. |
+| `live_supervisors` | Supervisor tasks from their first poll until destruction, including idle polling and backoff. |
+| `active_assignments` | Nonempty assigned groups from metadata lookup through publication, including blocking work still exiting after cancellation. |
+| `worker_failures_total{reason}` | Runs ending with `error`, `panic`, or `unexpected_exit`. |
+| `worker_restarts_total` | Restarts begun after failure backoff completes. |
+
+Shutdown cancellation increments neither failure nor restart counters. Active
+assignments and writer memory can remain positive briefly after supervisor shutdown
+while synchronous work exits. Classic actor-pipeline and mailbox-backpressure metrics
+retain their existing meanings. Standalone compaction uses its existing metric families.
+
 ## Tests
 
 The worker tests use the file-backed metastore and RAM object storage. They open uploaded

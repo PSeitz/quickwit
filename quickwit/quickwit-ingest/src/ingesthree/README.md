@@ -56,6 +56,45 @@ can restart it and recover retained files. V2 retains its existing retirement se
 See [node configuration](../../../../docs/configuration/node-config.md#experimental-ingesthree)
 and [file indexing and compaction](../../../quickwit-indexing/src/ingesthree/README.md).
 
+## Metrics
+
+Intake reuses `quickwit_ingest_docs_total` and `quickwit_ingest_docs_bytes_total`
+with `validity="valid|invalid"`. These count validation attempts before append,
+including all-invalid batches. Bytes include the document payload and batch length
+entries. Validation-disabled documents count as valid. Retries can count documents
+again. These counters measure input processing rather than durable publication.
+
+Routing reuses `quickwit_ingest_ingest_result_total{result}` for final subrequest
+outcomes and `quickwit_ingest_ingest_attempts{az_routing}` for destination attempts.
+Capacity-filtered destinations consume no attempt. Invalid requests use
+`result="bad_request"`. Request buffers use
+`quickwit_memory_in_flight_data_bytes{component="ingest_router"}`.
+The common `quickwit_grpc_*` families cover internal calls with
+`service="ingesthree"`, `grpc_service="ingesthree"`, `kind="client|server"`, and
+`rpc="ingest"`. RPC success can contain an application-level subrequest failure.
+
+The following node-level gauges use the `quickwit_ingesthree_` prefix:
+
+| Suffix | Meaning |
+| --- | --- |
+| `queue_bytes` | Reserved queued and processing input bytes, including validation copies and descriptors. Also exposed as memory in-flight bytes with `component="ingesthree_queue"`. |
+| `queue_limit_bytes` | Configured queue byte budget. |
+| `disk_bytes` | Last-known logical framed-file bytes in the node's ingesthree directory, including recovered files and pending local deletion. |
+| `disk_reserved_bytes` | Reservations for queued and processing appends. |
+| `disk_limit_bytes` | Configured logical disk byte budget. |
+| `capacity_score` | Last sampled 0–10 gossip score. Zero before sampling and after intake closes. |
+
+`quickwit_ingesthree_admission_rejections_total{reason}` counts destination admission
+rejections as `queue_full`, `storage_full`, `open_file_limit`, or `unavailable`.
+The same request can encounter multiple destination rejections before its final result.
+
+Input reservations follow their buffers through cancellation and blocking work.
+The disk and configured-limit gauges are snapshots for the node's single ingesthree
+directory. Retained bytes survive writer shutdown, and reopening replaces the disk
+snapshot with recovered charges. Failed partial writes are reconciled on recovery.
+Disk gauges describe logical admission accounting; physical free space, filesystem
+overhead, indexing scratch, and other workloads require separate monitoring.
+
 ## Implemented
 
 - `Ingester::open(data_dir, max_disk_bytes)` uses `<data_dir>/ingesthree`, with an
@@ -179,8 +218,13 @@ Finishing a file closes it and makes its contents immutable for upload.
 The next append creates a fresh file with a new ID. The core implements this with
 `finish_file(index_uid)`. Finished files use the `.finished` filename extension.
 
-The internal defaults are **100 MB**, **10 seconds**, and **1,024 active files**.
-No new node configuration is required.
+The defaults are **100 MB**, **10 seconds**, and **1,024 active files**.
+Set `QW_INGESTHREE_TARGET_FILE_SIZE` on ingesting nodes to override the size target,
+for example `QW_INGESTHREE_TARGET_FILE_SIZE=250MB` or `256MiB`. A bare integer means
+bytes. The variable is read when intake opens. Invalid or zero sizes fail startup
+before local recovery changes any files. The target applies per index incarnation
+on each ingesting node. The 10-second deadline and node-wide memory/disk budgets
+remain unchanged.
 
 - Size includes the header and document framing: 100 MB means 100,000,000 file
   bytes. The core finishes the file after a batch reaches the target. A batch

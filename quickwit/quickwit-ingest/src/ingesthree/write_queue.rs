@@ -36,6 +36,14 @@ use crate::ingest_v2::{is_document_validation_enabled, validate_doc_batch_impl};
 mod capacity_tracker;
 use capacity_tracker::CapacityTracker;
 
+#[path = "queue_metrics.rs"]
+mod queue_metrics;
+use queue_metrics::{QueueMetrics, ValidationMetrics};
+
+#[path = "queue_file_writer.rs"]
+mod queue_file_writer;
+use queue_file_writer::FileWriter;
+
 /// Distinguishes admission failures so a router can retry another destination.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
@@ -82,14 +90,37 @@ struct Admission {
     disk_bytes: u64,
     reserved_disk_bytes: u64,
     closed: bool,
+    metrics: QueueMetrics,
 }
 
 impl Admission {
-    fn capacity_score(&self, tracker: &mut CapacityTracker) -> usize {
-        if self.closed || self.max_disk_bytes == 0 {
-            return 0;
+    fn capacity_score(&mut self, tracker: &mut CapacityTracker) -> usize {
+        let score = if self.closed || self.max_disk_bytes == 0 {
+            0
+        } else {
+            tracker.record_and_score(self.disk_bytes + self.reserved_disk_bytes, self.queue_bytes)
+        };
+        self.metrics.record_capacity(score);
+        score
+    }
+
+    fn record_usage(&self) {
+        self.metrics
+            .record_usage(self.queue_bytes, self.reserved_disk_bytes);
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        self.metrics.record_capacity(0);
+    }
+
+    fn record_written(&mut self, written_bytes: u64) {
+        self.disk_bytes += written_bytes;
+        // Releasing old validation work after reopen must leave the recovered
+        // disk snapshot untouched. Only file mutations update that snapshot.
+        if written_bytes > 0 {
+            self.metrics.disk_bytes.set(self.disk_bytes as f64);
         }
-        tracker.record_and_score(self.disk_bytes + self.reserved_disk_bytes, self.queue_bytes)
     }
 }
 
@@ -111,9 +142,10 @@ impl Reservation {
         assert!(written_bytes <= self.disk_bytes);
         let mut admission = self.admission.lock().expect("admission mutex poisoned");
         // Transfer reservations to retained disk usage atomically with admission.
-        admission.disk_bytes += written_bytes;
+        admission.record_written(written_bytes);
         admission.queue_bytes -= self.queue_bytes;
         admission.reserved_disk_bytes -= self.disk_bytes;
+        admission.record_usage();
         self.queue_bytes = 0;
         self.disk_bytes = 0;
     }
@@ -135,6 +167,33 @@ struct AppendRequest {
     reply: oneshot::Sender<Result<AppendResponse, IngestError>>,
     // Last so queued request buffers drop before releasing their reservation.
     reservation: Reservation,
+}
+
+// A validation result whose document buffers drop before its input reservation.
+struct ValidatedRequest {
+    index_uid: IndexUid,
+    reply: oneshot::Sender<Result<AppendResponse, IngestError>>,
+    documents: Result<(Vec<Bytes>, Vec<ParseFailure>), IngestError>,
+    reservation: Reservation,
+}
+
+impl AppendRequest {
+    fn validate(self, metrics: &ValidationMetrics) -> ValidatedRequest {
+        let Self {
+            index_uid,
+            batch,
+            mapper,
+            reply,
+            reservation,
+        } = self;
+        let documents = validate_documents(batch, mapper, metrics);
+        ValidatedRequest {
+            index_uid,
+            reply,
+            documents,
+            reservation,
+        }
+    }
 }
 
 // Requests that the writer append a batch, finish locally, or drain handoff.
@@ -159,15 +218,19 @@ impl WriteQueue {
                 "zero write-queue budget".into(),
             ));
         }
-        let mut ingester =
-            tokio::task::spawn_blocking(move || Ingester::open(&data_dir, max_disk_bytes))
-                .await
-                .map_err(anyhow::Error::from)??;
+        let (queue, receiver, mut ingester) = tokio::task::spawn_blocking(move || {
+            let ingester = Ingester::open(&data_dir, max_disk_bytes)?;
+            let (queue, receiver) = Self::channel(&ingester, max_queue_bytes);
+            let ingester = FileWriter::new(ingester, queue.admission.clone());
+            Ok::<_, anyhow::Error>((queue, receiver, ingester))
+        })
+        .await
+        .map_err(anyhow::Error::from)??;
         if let Some(uploader) = &uploader {
             while let Some(input) = ingester.finished_files().first() {
                 let file_id = uploader.start(input).await?;
-                // Once registered or discarded, retry only local deletion. No intake exists
-                // yet, so the ingester's disk accounting is the only charge to release.
+                // Once registered or discarded, retry only local deletion. Recovered
+                // files remain charged throughout startup handoff and deletion retries.
                 loop {
                     let (writer, result) = tokio::task::spawn_blocking(move || {
                         let result = ingester.delete_finished_file(file_id);
@@ -186,7 +249,6 @@ impl WriteQueue {
                 }
             }
         }
-        let (queue, receiver) = Self::channel(&ingester, max_queue_bytes);
         let admission = queue.admission.clone();
         tokio::spawn(async move {
             if let Err(error) = write_batches(ingester, receiver, admission, uploader).await {
@@ -210,6 +272,11 @@ impl WriteQueue {
             disk_bytes: ingester.disk_bytes,
             reserved_disk_bytes: 0,
             closed: false,
+            metrics: QueueMetrics::new(
+                max_queue_bytes,
+                ingester.max_disk_bytes,
+                ingester.disk_bytes,
+            ),
         }));
         (Self { sender, admission }, receiver)
     }
@@ -229,23 +296,24 @@ impl WriteQueue {
         {
             let mut admission = self.admission.lock().expect("admission mutex poisoned");
             if admission.closed || self.sender.is_closed() {
-                return Err(IngestError::Unavailable);
+                return Err(admission.metrics.reject(IngestError::Unavailable));
             }
             let total_queue_bytes = admission
                 .queue_bytes
                 .checked_add(queue_bytes)
                 .filter(|total| *total <= admission.max_queue_bytes)
-                .ok_or(IngestError::QueueFull)?;
+                .ok_or_else(|| admission.metrics.reject(IngestError::QueueFull))?;
             let total_disk_bytes = admission
                 .disk_bytes
                 .checked_add(admission.reserved_disk_bytes)
                 .and_then(|total| total.checked_add(disk_bytes))
                 .filter(|total| *total <= admission.max_disk_bytes);
             if total_disk_bytes.is_none() {
-                return Err(IngestError::StorageFull);
+                return Err(admission.metrics.reject(IngestError::StorageFull));
             }
             admission.queue_bytes = total_queue_bytes;
             admission.reserved_disk_bytes += disk_bytes;
+            admission.record_usage();
             let request = WriterRequest::Append(AppendRequest {
                 index_uid,
                 batch,
@@ -261,7 +329,11 @@ impl WriteQueue {
             // failed send only after unlocking, since its reservation also locks.
             let sent = self.sender.send(request);
             drop(admission);
-            sent.map_err(|_| IngestError::Unavailable)?;
+            if let Err(error) = sent {
+                drop(error);
+                let admission = self.admission.lock().expect("admission mutex poisoned");
+                return Err(admission.metrics.reject(IngestError::Unavailable));
+            }
         }
         response.await.map_err(|_| IngestError::Unavailable)?
     }
@@ -292,6 +364,11 @@ impl WriteQueue {
                 }
             }
         }
+        self.admission
+            .lock()
+            .expect("admission mutex poisoned")
+            .metrics
+            .record_capacity(0);
         cluster.set_self_ingesthree_capacity(0).await;
     }
 
@@ -305,7 +382,7 @@ impl WriteQueue {
             if admission.closed {
                 return Err(IngestError::Unavailable);
             }
-            admission.closed = true;
+            admission.close();
             self.sender
                 .send(WriterRequest::Finish(reply))
                 .map_err(|_| IngestError::Unavailable)?;
@@ -326,7 +403,7 @@ impl WriteQueue {
             if admission.closed {
                 return Err(IngestError::Unavailable);
             }
-            admission.closed = true;
+            admission.close();
             self.sender
                 .send(WriterRequest::Drain(reply))
                 .map_err(|_| IngestError::Unavailable)?;
@@ -371,6 +448,7 @@ fn num_bytes(index_uid: &IndexUid, batch: &DocBatchV2) -> Result<(u64, u64), Ing
 fn validate_documents(
     batch: DocBatchV2,
     mapper: Option<Arc<DocMapper>>,
+    metrics: &ValidationMetrics,
 ) -> Result<(Vec<Bytes>, Vec<ParseFailure>), IngestError> {
     let document_bytes = batch
         .doc_lengths
@@ -383,10 +461,12 @@ fn validate_documents(
             "inconsistent lengths or duplicate document IDs".into(),
         ));
     }
+    let original_bytes = batch.num_bytes();
     let (batch, parse_failures) = match mapper {
         Some(mapper) if is_document_validation_enabled() => validate_doc_batch_impl(batch, &mapper),
         _ => (batch, Vec::new()),
     };
+    metrics.record(&batch, parse_failures.len(), original_bytes);
     Ok((
         batch.docs().map(|(_, bytes)| bytes).collect(),
         parse_failures,
@@ -395,7 +475,7 @@ fn validate_documents(
 
 /// Writes batches and finishes files while upload and registration make progress.
 async fn write_batches(
-    ingester: Ingester,
+    ingester: FileWriter,
     receiver: mpsc::UnboundedReceiver<WriterRequest>,
     admission: Arc<Mutex<Admission>>,
     uploader: Option<Uploader>,
@@ -403,7 +483,7 @@ async fn write_batches(
     let mut drain_reply = None;
     let result =
         write_until_stopped(ingester, receiver, &admission, uploader, &mut drain_reply).await;
-    admission.lock().expect("admission mutex poisoned").closed = true;
+    admission.lock().expect("admission mutex poisoned").close();
     // The owner and any upload future are dropped before acknowledging drain.
     if let Some(reply) = drain_reply {
         let response = result
@@ -416,7 +496,7 @@ async fn write_batches(
 }
 
 async fn write_until_stopped(
-    mut ingester: Ingester,
+    mut ingester: FileWriter,
     mut receiver: mpsc::UnboundedReceiver<WriterRequest>,
     admission: &Arc<Mutex<Admission>>,
     uploader: Option<Uploader>,
@@ -466,7 +546,7 @@ async fn write_until_stopped(
                     Ok(file_id) => pending_delete = Some((file_id, Instant::now())),
                     Err(error) => {
                         receiver.close();
-                        admission.lock().expect("admission mutex poisoned").closed = true;
+                        admission.lock().expect("admission mutex poisoned").close();
                         // Preserve accepted writes and release the directory on the blocking pool.
                         tokio::task::spawn_blocking(move || ingester.finish()).await??;
                         return Err(error);
@@ -486,10 +566,7 @@ async fn write_until_stopped(
                 }).await?;
                 ingester = writer;
                 match result {
-                    Ok(num_bytes) => {
-                        admission.lock().expect("admission mutex poisoned").disk_bytes -= num_bytes;
-                        pending_delete = None;
-                    }
+                    Ok(_) => pending_delete = None,
                     Err(error) => {
                         tracing::warn!(%file_id, ?error, "failed to delete finished ingesthree file; retrying");
                         pending_delete = Some((file_id, Instant::now() + Duration::from_secs(1)));
@@ -541,47 +618,74 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     }
 }
 
+// Owns validated document buffers and their reservation in drop order.
+struct ValidatedDocuments {
+    documents: Vec<Bytes>,
+    reservation: Reservation,
+}
+
 /// Validates and writes one batch, settles its reservation, and replies to the caller.
-async fn append_batch(mut ingester: Ingester, append: AppendRequest) -> anyhow::Result<Ingester> {
-    let AppendRequest {
+async fn append_batch(ingester: FileWriter, append: AppendRequest) -> anyhow::Result<FileWriter> {
+    let metrics = append
+        .reservation
+        .admission
+        .lock()
+        .expect("admission mutex poisoned")
+        .metrics
+        .validation
+        .clone();
+    // Move the request into validation. Cancellation can leave CPU work running,
+    // and a discarded result must drop its buffers before its reservation.
+    let ValidatedRequest {
         index_uid,
-        batch,
-        mapper,
         reply,
+        documents: result,
         reservation,
-    } = append;
-    let (documents, parse_failures) =
-        match run_cpu_intensive(move || validate_documents(batch, mapper)).await? {
-            Ok(documents_and_failures) => documents_and_failures,
-            Err(error) => {
-                drop(reservation);
-                let _ = reply.send(Err(error));
-                return Ok(ingester);
-            }
-        };
-    let num_docs = documents.len() as u64;
+    } = run_cpu_intensive(move || append.validate(&metrics)).await?;
+    let (documents, parse_failures) = match result {
+        Ok(documents_and_failures) => documents_and_failures,
+        Err(error) => {
+            drop(reservation);
+            let _ = reply.send(Err(error));
+            return Ok(ingester);
+        }
+    };
     if documents.is_empty() {
         drop(documents);
         drop(reservation);
         let _ = reply.send(Ok(AppendResponse {
             file_id: None,
-            num_docs,
+            num_docs: 0,
             parse_failures,
         }));
         return Ok(ingester);
     }
-    let (writer, result, written_bytes) = tokio::task::spawn_blocking(move || {
-        let previous_disk_bytes = ingester.disk_bytes;
-        let result = ingester.append(&index_uid, &documents);
-        let written_bytes = ingester.disk_bytes - previous_disk_bytes;
-        // Release document buffers before releasing their reservation.
-        drop(documents);
-        (ingester, result, written_bytes)
+    let documents = ValidatedDocuments {
+        documents,
+        reservation,
+    };
+    tokio::task::spawn_blocking(move || {
+        append_validated(ingester, index_uid, documents, parse_failures, reply)
     })
-    .await?;
-    ingester = writer;
+    .await?
+}
+
+fn append_validated(
+    mut ingester: FileWriter,
+    index_uid: IndexUid,
+    documents: ValidatedDocuments,
+    parse_failures: Vec<ParseFailure>,
+    reply: oneshot::Sender<Result<AppendResponse, IngestError>>,
+) -> anyhow::Result<FileWriter> {
+    let previous_disk_bytes = ingester.disk_bytes;
+    let num_docs = documents.documents.len() as u64;
+    let result = ingester.append(&index_uid, &documents.documents);
+    let written_bytes = ingester.disk_bytes - previous_disk_bytes;
+    drop(documents.documents);
+    let reservation = documents.reservation;
     match result {
         Ok(file_id) => {
+            // Settle in the blocking task even if its awaiting future was cancelled.
             reservation.release_after_write(written_bytes);
             let _ = reply.send(Ok(AppendResponse {
                 file_id: Some(file_id),
@@ -590,19 +694,30 @@ async fn append_batch(mut ingester: Ingester, append: AppendRequest) -> anyhow::
             }));
         }
         Err(error) if error.is::<OpenFileLimit>() => {
-            drop(reservation);
-            let _ = reply.send(Err(IngestError::OpenFileLimit));
-        }
-        Err(error) => {
-            let message = format!("{error:#}");
-            reservation
+            let error = reservation
                 .admission
                 .lock()
                 .expect("admission mutex poisoned")
-                .closed = true;
-            // A failed BufWriter may still hold bytes. Its destructor also
-            // belongs on the blocking pool, before releasing the directory.
-            tokio::task::spawn_blocking(move || drop(ingester)).await?;
+                .metrics
+                .reject(IngestError::OpenFileLimit);
+            drop(reservation);
+            let _ = reply.send(Err(error));
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            {
+                let mut admission = reservation
+                    .admission
+                    .lock()
+                    .expect("admission mutex poisoned");
+                admission.close();
+                // A rename failure can follow a flushed append. Retain its known
+                // file growth. Recovery reconciles partial writes after IO errors.
+                admission.record_written(written_bytes);
+            }
+            // A failed BufWriter may still hold bytes. Drop it on this blocking
+            // thread before releasing its reservation and directory ownership.
+            drop(ingester);
             let _ = reply.send(Err(IngestError::Internal(error)));
             anyhow::bail!("local append failed: {message}");
         }
@@ -613,6 +728,14 @@ async fn append_batch(mut ingester: Ingester, append: AppendRequest) -> anyhow::
 #[cfg(test)]
 #[path = "write_queue_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "queue_metrics_tests.rs"]
+mod queue_metrics_tests;
+
+#[cfg(test)]
+#[path = "validation_metrics_tests.rs"]
+mod validation_metrics_tests;
 
 #[cfg(test)]
 #[path = "file_limits_tests.rs"]

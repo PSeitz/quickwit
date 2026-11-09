@@ -41,6 +41,7 @@ pub(super) fn index_response(
 #[tokio::test]
 async fn test_ingesthree_terminal_errors_and_malformed_responses_are_not_retried() {
     let healthy = destination("healthy", true, true, "zone-a", None, false).await;
+    let metrics = RouterMetrics::for_test("terminal_errors");
     for (error, malformed, expected) in [
         (Some(Code::Internal), false, 500),
         (Some(Code::DeadlineExceeded), false, 500),
@@ -52,6 +53,8 @@ async fn test_ingesthree_terminal_errors_and_malformed_responses_are_not_retried
             &subrequest(),
             vec![&bad.node, &healthy.node],
             ByteSize::mb(1),
+            None,
+            &metrics,
         )
         .await;
         assert_eq!(
@@ -60,18 +63,22 @@ async fn test_ingesthree_terminal_errors_and_malformed_responses_are_not_retried
                 .http_status_code(),
             expected
         );
+        metrics.record_response(&response);
     }
     assert_eq!(healthy.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(metrics.attempt_count("az_unaware"), 4);
+    assert_eq!(metrics.result_count("internal"), 2);
+    assert_eq!(metrics.result_count("timeout"), 1);
+    assert_eq!(metrics.result_count("bad_request"), 1);
 }
 
 #[tokio::test]
 async fn test_ingesthree_client_preserves_partial_results_and_backend_errors() {
     let node = destination("intake", true, true, "zone-a", None, false).await;
-    let client = IngestRouterClient::from(IngesthreeRouter::new(
-        node.cluster.clone(),
-        None,
-        ByteSize::mb(1),
-    ));
+    let metrics = RouterMetrics::for_test("partial_results");
+    let mut router = IngesthreeRouter::new(node.cluster.clone(), None, ByteSize::mb(1));
+    router.metrics = metrics.clone();
+    let client = IngestRouterClient::from(router);
     let indexes = [
         "logs",
         "bad-input",
@@ -117,16 +124,27 @@ async fn test_ingesthree_client_preserves_partial_results_and_backend_errors() {
         );
     }
     assert_eq!(node.calls.load(Ordering::SeqCst), indexes.len());
+    for result in [
+        "success",
+        "bad_request",
+        "unavailable",
+        "load_shedding",
+        "index_not_found",
+        "source_not_found",
+    ] {
+        assert_eq!(metrics.result_count(result), 1, "{result}");
+    }
+    assert_eq!(metrics.attempt_count("az_unaware"), indexes.len() as u64);
+    assert_eq!(metrics.in_flight_bytes.get(), 0.0);
 }
 
 #[tokio::test]
 async fn test_ingesthree_client_rejects_request_errors_before_any_write() {
     let node = destination("intake", true, true, "zone-a", None, false).await;
-    let client = IngestRouterClient::from(IngesthreeRouter::new(
-        node.cluster.clone(),
-        None,
-        ByteSize::mb(1),
-    ));
+    let metrics = RouterMetrics::for_test("request_errors");
+    let mut router = IngesthreeRouter::new(node.cluster.clone(), None, ByteSize::mb(1));
+    router.metrics = metrics.clone();
+    let client = IngestRouterClient::from(router);
     let valid = IngestRequestV2 {
         commit_type: CommitTypeV2::Auto as i32,
         subrequests: vec![subrequest()],
@@ -149,4 +167,8 @@ async fn test_ingesthree_client_rejects_request_errors_before_any_write() {
         assert_eq!(error.error_code().http_status_code(), 400);
     }
     assert_eq!(node.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(metrics.result_count("bad_request"), 5);
+    assert_eq!(metrics.result_count("success"), 0);
+    assert_eq!(metrics.attempt_count("az_unaware"), 0);
+    assert_eq!(metrics.in_flight_bytes.get(), 0.0);
 }

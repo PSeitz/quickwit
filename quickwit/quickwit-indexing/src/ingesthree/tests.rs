@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use quickwit_common::metrics::index_label;
 use quickwit_common::split_file;
 use quickwit_config::IndexConfig;
 use quickwit_ingest::ingesthree::Ingester;
@@ -23,6 +24,7 @@ use quickwit_metastore::{
     CreateIndexRequestExt, FileBackedMetastore, ListSplitsRequestExt,
     MetastoreServiceStreamSplitsExt, Split, SplitState,
 };
+use quickwit_metrics::{Counter, counter, label_values};
 use quickwit_proto::metastore::{
     CreateIndexRequest, DeleteQuery, DocumentsStagedForUpload, ListSplitsRequest,
     PublishFileSplitsResponse, RegisterFileForIndexing,
@@ -36,6 +38,10 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use super::*;
 use crate::get_tantivy_directory_from_split_bundle;
+use crate::metrics::{
+    PUBLISHED_SPLIT, PUBLISHED_SPLIT_BYTES_TOTAL, PUBLISHED_SPLIT_DOCS_TOTAL,
+    PUBLISHED_SPLIT_UNCOMPRESSED_BYTES_TOTAL, PUBLISHED_SPLITS_TOTAL,
+};
 
 const DOC: &str = r#"{"timestamp":"2024-01-01T00:00:00Z","body":"hello world","owner":"alice"}"#;
 const DOC_LATER: &str = r#"{"timestamp":"2024-01-01T00:00:02Z","body":"goodbye","owner":"bob"}"#;
@@ -61,7 +67,8 @@ async fn setup(mut config: IndexConfig) -> (S3Indexer, IndexUid) {
         .clone();
     let worker = S3Indexer {
         node_id: NodeId::from_str("test-node"),
-        source_id: "ingesthree".into(),
+        // Keep metric assertions independent even when per-index labels are disabled.
+        source_id: format!("ingesthree-{}", index_uid.index_id),
         metastore,
         storage_resolver: StorageResolver::for_test(),
         scratch_directory: TempDirectory::for_test(),
@@ -149,11 +156,59 @@ async fn list_splits(worker: &mut S3Indexer, index_uid: &IndexUid) -> Vec<Split>
         .unwrap()
 }
 
+fn publication_counters(worker: &S3Indexer, index_uid: &IndexUid) -> [Counter; 4] {
+    let labels = label_values!(
+        PUBLISHED_SPLIT => index_label(&index_uid.index_id).to_string(),
+        worker.source_id.clone(), "0"
+    );
+    [
+        counter!(parent: PUBLISHED_SPLITS_TOTAL, labels: [labels.clone()]),
+        counter!(parent: PUBLISHED_SPLIT_DOCS_TOTAL, labels: [labels.clone()]),
+        counter!(parent: PUBLISHED_SPLIT_BYTES_TOTAL, labels: [labels.clone()]),
+        counter!(parent: PUBLISHED_SPLIT_UNCOMPRESSED_BYTES_TOTAL, labels: [labels]),
+    ]
+}
+
+fn assert_publication_counters(counters: &[Counter; 4], splits: &[SplitMetadata]) {
+    assert_eq!(counters[0].get(), splits.len() as u64);
+    assert_eq!(
+        counters[1].get(),
+        splits
+            .iter()
+            .map(|split| split.num_docs as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        counters[2].get(),
+        splits
+            .iter()
+            .map(|split| split.footer_offsets.end)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        counters[3].get(),
+        splits
+            .iter()
+            .map(|split| split.uncompressed_docs_size_in_bytes)
+            .sum::<u64>()
+    );
+}
+
 #[tokio::test]
 async fn test_files_publish_searchable_splits_and_completion_together() {
     let config = IndexConfig::for_test("files", "ram:///splits");
     let mapping_uid = config.doc_mapping.doc_mapping_uid;
     let (mut worker, index_uid) = setup(config).await;
+    let counters = publication_counters(&worker, &index_uid);
+    assert_publication_counters(&counters, &[]);
+    let active_assignments = Gauge::local();
+    let observed_activity = active_assignments.clone();
+    worker.metastore = MetastoreServiceClient::tower()
+        .stack_assign_files_for_indexing_layer(tower::util::MapRequestLayer::new(move |request| {
+            assert_eq!(observed_activity.get(), 0.0, "polling is idle");
+            request
+        }))
+        .build(worker.metastore);
     let first = register_file(&mut worker, &index_uid, &[DOC, "not JSON"]).await;
     let second = register_file(&mut worker, &index_uid, &[DOC_LATER]).await;
     let delete_opstamp = worker
@@ -166,7 +221,13 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
         .await
         .unwrap()
         .opstamp;
-    let result = worker.index_next(assignment()).await.unwrap().unwrap();
+    let result = worker
+        .index_next_with_activity(assignment(), &active_assignments)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_assignments.get(), 0.0);
+    assert_publication_counters(&counters, &result.splits);
     assert!(result.published);
     assert_eq!(result.index_uid, index_uid);
     assert_eq!(result.splits.len(), 1);
@@ -187,7 +248,15 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
         list_splits(&mut worker, &index_uid).await[0].split_state,
         SplitState::Published
     );
-    assert!(worker.index_next(assignment()).await.unwrap().is_none());
+    assert!(
+        worker
+            .index_next_with_activity(assignment(), &active_assignments)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(active_assignments.get(), 0.0);
+    assert_publication_counters(&counters, &result.splits);
 
     let storage = worker
         .storage_resolver
@@ -217,11 +286,13 @@ async fn test_document_target_flushes_without_completing_partial_groups() {
     let mut config = IndexConfig::for_test("flush", "ram:///splits");
     config.indexing_settings.split_num_docs_target = 1;
     let (mut worker, index_uid) = setup(config).await;
+    let counters = publication_counters(&worker, &index_uid);
     let first = register_file(&mut worker, &index_uid, &[DOC]).await;
     let second = register_file(&mut worker, &index_uid, &[DOC_LATER]).await;
     let result = worker.index_next(assignment()).await.unwrap().unwrap();
     assert!(result.published);
     assert_eq!(result.splits.len(), 2);
+    assert_publication_counters(&counters, &result.splits);
     assert!(result.splits.iter().all(|split| split.num_docs == 1));
     assert_eq!(
         read_file(&mut worker, &first).await.publication_id,
@@ -232,6 +303,7 @@ async fn test_document_target_flushes_without_completing_partial_groups() {
 #[tokio::test]
 async fn test_all_invalid_documents_complete_without_outputs() {
     let (mut worker, index_uid) = setup(IndexConfig::for_test("invalid", "ram:///splits")).await;
+    let counters = publication_counters(&worker, &index_uid);
     let input = register_file(
         &mut worker,
         &index_uid,
@@ -241,6 +313,7 @@ async fn test_all_invalid_documents_complete_without_outputs() {
     let result = worker.index_next(assignment()).await.unwrap().unwrap();
     assert!(result.published);
     assert!(result.splits.is_empty());
+    assert_publication_counters(&counters, &[]);
     assert!(
         read_file(&mut worker, &input)
             .await
@@ -255,6 +328,8 @@ async fn test_corrupt_input_preserves_group_and_uploaded_outputs() {
     let mut config = IndexConfig::for_test("corrupt", "ram:///splits");
     config.indexing_settings.split_num_docs_target = 1;
     let (mut worker, index_uid) = setup(config).await;
+    let counters = publication_counters(&worker, &index_uid);
+    let active_assignments = Gauge::local();
     let mut files = vec![
         register_file(&mut worker, &index_uid, &[DOC]).await,
         register_file(&mut worker, &index_uid, &[DOC_LATER]).await,
@@ -273,12 +348,14 @@ async fn test_corrupt_input_preserves_group_and_uploaded_outputs() {
     storage.put(path, Box::new(damaged.clone())).await.unwrap();
     assert!(
         worker
-            .index_next(assignment())
+            .index_next_with_activity(assignment(), &active_assignments)
             .await
             .unwrap_err()
             .to_string()
             .contains("checksum")
     );
+    assert_eq!(active_assignments.get(), 0.0);
+    assert_publication_counters(&counters, &[]);
     for file in &files {
         let stored = read_file(&mut worker, file).await;
         assert!(stored.processing_started_timestamp.is_some());
@@ -293,6 +370,8 @@ async fn test_corrupt_input_preserves_group_and_uploaded_outputs() {
 #[tokio::test]
 async fn test_committed_publication_retry_keeps_ids_and_outputs() {
     let (mut worker, index_uid) = setup(IndexConfig::for_test("retry", "ram:///splits")).await;
+    let counters = publication_counters(&worker, &index_uid);
+    let before_confirmation = counters.clone();
     let input = register_file(&mut worker, &index_uid, &[DOC]).await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
@@ -305,6 +384,7 @@ async fn test_committed_publication_retry_keeps_ids_and_outputs() {
         .map_result(
             move |result: Result<PublishFileSplitsResponse, MetastoreError>| {
                 let response = result?;
+                assert_publication_counters(&before_confirmation, &[]);
                 if first.swap(false, Ordering::SeqCst) {
                     return Err(MetastoreError::Unavailable("committed reply lost".into()));
                 }
@@ -317,6 +397,7 @@ async fn test_committed_publication_retry_keeps_ids_and_outputs() {
         .build(worker.metastore);
     let result = worker.index_next(assignment()).await.unwrap().unwrap();
     assert!(result.published);
+    assert_publication_counters(&counters, &result.splits);
     let publication_id = {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -333,6 +414,9 @@ async fn test_committed_publication_retry_keeps_ids_and_outputs() {
 #[tokio::test]
 async fn test_cancel_after_committed_publication_preserves_winner() {
     let (mut worker, index_uid) = setup(IndexConfig::for_test("cancel", "ram:///splits")).await;
+    let counters = publication_counters(&worker, &index_uid);
+    let active_assignments = Gauge::local();
+    let work_activity = active_assignments.clone();
     let input = register_file(&mut worker, &index_uid, &[DOC]).await;
     let committed = Arc::new(Notify::new());
     let notify = committed.clone();
@@ -353,12 +437,20 @@ async fn test_cancel_after_committed_publication_preserves_winner() {
         metastore,
         ..worker_for_observation(&worker)
     };
-    let handle = tokio::spawn(async move { worker.index_next(assignment()).await });
+    let handle = tokio::spawn(async move {
+        worker
+            .index_next_with_activity(assignment(), &work_activity)
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(10), committed.notified())
         .await
         .unwrap();
+    assert_eq!(active_assignments.get(), 1.0);
     handle.abort();
     assert!(handle.await.unwrap_err().is_cancelled());
+    assert_eq!(active_assignments.get(), 0.0);
+    // The lost reply prevents confirmation, even though the metastore committed the split.
+    assert_publication_counters(&counters, &[]);
     assert!(
         read_file(&mut observer, &input)
             .await
@@ -399,6 +491,9 @@ fn worker_for_observation(worker: &S3Indexer) -> S3Indexer {
 #[tokio::test]
 async fn test_reassigned_worker_wins_and_loser_returns_no_published_outputs() {
     let (mut older, index_uid) = setup(IndexConfig::for_test("race", "ram:///splits")).await;
+    let counters = publication_counters(&older, &index_uid);
+    let active_assignments = Gauge::local();
+    let older_activity = active_assignments.clone();
     let input = register_file(&mut older, &index_uid, &[DOC]).await;
     let mut newer = worker_for_observation(&older);
     let publication_gate = Arc::new(Semaphore::new(0));
@@ -407,7 +502,11 @@ async fn test_reassigned_worker_wins_and_loser_returns_no_published_outputs() {
             publication_gate.clone(),
         ))
         .build(older.metastore);
-    let handle = tokio::spawn(async move { older.index_next(assignment()).await });
+    let handle = tokio::spawn(async move {
+        older
+            .index_next_with_activity(assignment(), &older_activity)
+            .await
+    });
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         // Wait for a staged split to establish that the older assignment has begun.
         while list_splits(&mut newer, &index_uid).await.is_empty() {
@@ -418,7 +517,11 @@ async fn test_reassigned_worker_wins_and_loser_returns_no_published_outputs() {
                 retry_after_secs: 1,
                 ..assignment()
             };
-            if let Some(publication) = newer.index_next(request).await.unwrap() {
+            if let Some(publication) = newer
+                .index_next_with_activity(request, &active_assignments)
+                .await
+                .unwrap()
+            {
                 break publication;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -427,10 +530,14 @@ async fn test_reassigned_worker_wins_and_loser_returns_no_published_outputs() {
     .await
     .unwrap();
     assert!(result.published);
+    assert_eq!(active_assignments.get(), 1.0);
+    assert_publication_counters(&counters, &result.splits);
     publication_gate.add_permits(1);
     let older = handle.await.unwrap().unwrap().unwrap();
     assert!(!older.published);
     assert!(older.splits.is_empty());
+    assert_eq!(active_assignments.get(), 0.0);
+    assert_publication_counters(&counters, &result.splits);
     let splits = list_splits(&mut newer, &index_uid).await;
     assert_eq!(
         splits

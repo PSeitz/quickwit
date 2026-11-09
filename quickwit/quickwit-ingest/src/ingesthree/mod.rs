@@ -20,6 +20,8 @@
 //! storage and the metastore before the writer deletes them and releases disk charges.
 
 mod documents_staged_for_upload;
+#[cfg(test)]
+mod file_size_tests;
 mod handoff;
 mod router;
 mod service;
@@ -36,6 +38,7 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use bytes::Bytes;
+use bytesize::ByteSize;
 use quickwit_proto::types::IndexUid;
 use tokio::time::Instant;
 use ulid::Ulid;
@@ -55,7 +58,9 @@ struct ActiveFile {
     writer: BufWriter<File>,
 }
 
-// Internal defaults, with smaller thresholds available to tests.
+const TARGET_FILE_SIZE_ENV_KEY: &str = "QW_INGESTHREE_TARGET_FILE_SIZE";
+
+// File-finishing thresholds and the active-writer cap.
 struct FileLimits {
     target_file_bytes: u64,
     max_file_age: Duration,
@@ -69,6 +74,30 @@ impl Default for FileLimits {
             max_file_age: Duration::from_secs(10),
             max_open_files: 1_024,
         }
+    }
+}
+
+impl FileLimits {
+    fn from_env() -> anyhow::Result<Self> {
+        let mut limits = Self::default();
+        match std::env::var(TARGET_FILE_SIZE_ENV_KEY) {
+            Ok(value) => {
+                limits.target_file_bytes = value
+                    .parse::<ByteSize>()
+                    .map_err(|error| anyhow::anyhow!("{TARGET_FILE_SIZE_ENV_KEY}: {error}"))?
+                    .as_u64();
+                ensure!(
+                    limits.target_file_bytes > 0,
+                    "{TARGET_FILE_SIZE_ENV_KEY} must be greater than zero"
+                );
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read {TARGET_FILE_SIZE_ENV_KEY}"));
+            }
+        }
+        Ok(limits)
     }
 }
 
@@ -104,6 +133,7 @@ impl Ingester {
     /// be budgeted separately by the caller. Existing data is retained even if
     /// it already exceeds this limit.
     pub fn open(data_dir: &Path, max_disk_bytes: u64) -> anyhow::Result<Self> {
+        let file_limits = FileLimits::from_env()?;
         let directory = data_dir.join("ingesthree");
         fs::create_dir_all(&directory)?;
         let directory_lock = OpenOptions::new()
@@ -169,7 +199,7 @@ impl Ingester {
             directory_lock: Arc::new(directory_lock),
             active: HashMap::new(),
             finished,
-            file_limits: FileLimits::default(),
+            file_limits,
             max_disk_bytes,
             disk_bytes,
             requires_recovery: false,

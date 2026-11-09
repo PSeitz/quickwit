@@ -17,12 +17,14 @@ use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use futures::FutureExt;
+use quickwit_metrics::GaugeGuard;
 use quickwit_proto::metastore::AssignFilesForIndexing;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::error;
 
 use super::S3Indexer;
+use super::metrics::{SUPERVISOR_METRICS, SupervisorMetrics};
 
 const IDLE_MIN: Duration = Duration::from_millis(100);
 const IDLE_MAX: Duration = Duration::from_secs(5);
@@ -39,35 +41,51 @@ pub struct StopS3Indexers;
 /// indexing and restart delays. Dropping the service also stops the worker.
 pub(crate) struct S3IndexerSupervisor {
     task: JoinHandle<()>,
+    _configured: GaugeGuard,
 }
 
 impl S3IndexerSupervisor {
     pub fn spawn(worker: S3Indexer) -> Self {
-        Self::supervise(move || run(worker.clone()))
+        Self::supervise(move || run(worker.clone()), SUPERVISOR_METRICS.clone())
     }
 
-    fn supervise<F, Fut>(mut run: F) -> Self
+    fn supervise<F, Fut>(mut run: F, metrics: SupervisorMetrics) -> Self
     where
         F: FnMut() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<()>> + Send,
     {
+        let configured = GaugeGuard::new(&metrics.configured, 1.0);
         let task = tokio::spawn(async move {
+            let _live = GaugeGuard::new(&metrics.live, 1.0);
             let mut delay = RESTART_MIN;
             loop {
                 let started = Instant::now();
                 match AssertUnwindSafe(run()).catch_unwind().await {
-                    Ok(Err(error)) => error!(%error, "S3 indexer failed, restarting"),
-                    Ok(Ok(())) => error!("S3 indexer exited unexpectedly, restarting"),
-                    Err(_) => error!("S3 indexer panicked, restarting"),
+                    Ok(Err(error)) => {
+                        metrics.errors.inc();
+                        error!(%error, "S3 indexer failed, restarting");
+                    }
+                    Ok(Ok(())) => {
+                        metrics.unexpected_exits.inc();
+                        error!("S3 indexer exited unexpectedly, restarting");
+                    }
+                    Err(_) => {
+                        metrics.panics.inc();
+                        error!("S3 indexer panicked, restarting");
+                    }
                 }
                 if started.elapsed() >= RESTART_MAX {
                     delay = RESTART_MIN;
                 }
                 tokio::time::sleep(delay).await;
+                metrics.restarts.inc();
                 delay = (delay * 2).min(RESTART_MAX);
             }
         });
-        Self { task }
+        Self {
+            task,
+            _configured: configured,
+        }
     }
 
     pub async fn stop(mut self) {
@@ -119,29 +137,65 @@ mod tests {
     async fn errors_panics_and_unexpected_exits_restart_with_backoff() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let count = attempts.clone();
-        let supervisor = S3IndexerSupervisor::supervise(move || {
-            let attempt = count.fetch_add(1, Ordering::SeqCst);
-            async move {
-                match attempt {
-                    0 => anyhow::bail!("injected error"),
-                    1 => panic!("injected panic"),
-                    _ => Ok(()),
+        let metrics = SupervisorMetrics::for_test();
+        let supervisor = S3IndexerSupervisor::supervise(
+            move || {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match attempt {
+                        0 => anyhow::bail!("injected error"),
+                        1 => panic!("injected panic"),
+                        _ => Ok(()),
+                    }
                 }
-            }
-        });
+            },
+            metrics.clone(),
+        );
+        assert_eq!(metrics.configured.get(), 1.0);
         tokio::task::yield_now().await;
+        assert_eq!(metrics.live.get(), 1.0);
+        assert_eq!(metrics.errors.get(), 1);
+        assert_eq!(metrics.restarts.get(), 0);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         for (delay, expected) in [(1, 2), (2, 3), (4, 4)] {
             tokio::time::advance(Duration::from_secs(delay) - Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
             assert_eq!(attempts.load(Ordering::SeqCst), expected - 1);
+            assert_eq!(metrics.configured.get(), 1.0);
+            assert_eq!(metrics.live.get(), 1.0);
+            assert_eq!(metrics.restarts.get(), (expected - 2) as u64);
             tokio::time::advance(Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
             assert_eq!(attempts.load(Ordering::SeqCst), expected);
         }
         supervisor.stop().await;
+        assert_eq!(metrics.configured.get(), 0.0);
+        assert_eq!(metrics.live.get(), 0.0);
+        assert_eq!(metrics.errors.get(), 1);
+        assert_eq!(metrics.panics.get(), 1);
+        assert_eq!(metrics.unexpected_exits.get(), 2);
+        assert_eq!(metrics.restarts.get(), 3);
         tokio::time::advance(Duration::from_secs(100)).await;
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(metrics.restarts.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn stop_before_first_poll_releases_configured_supervisor() {
+        let metrics = SupervisorMetrics::for_test();
+        let supervisor = S3IndexerSupervisor::supervise(
+            std::future::pending::<anyhow::Result<()>>,
+            metrics.clone(),
+        );
+        assert_eq!(metrics.configured.get(), 1.0);
+        assert_eq!(metrics.live.get(), 0.0);
+        supervisor.stop().await;
+        assert_eq!(metrics.configured.get(), 0.0);
+        assert_eq!(metrics.live.get(), 0.0);
+        assert_eq!(metrics.restarts.get(), 0);
+        assert_eq!(metrics.errors.get(), 0);
+        assert_eq!(metrics.panics.get(), 0);
+        assert_eq!(metrics.unexpected_exits.get(), 0);
     }
 
     #[tokio::test]
@@ -154,15 +208,21 @@ mod tests {
         }
         let cancelled = Arc::new(AtomicUsize::new(0));
         for explicit_stop in [true, false] {
+            let metrics = SupervisorMetrics::for_test();
             let count = cancelled.clone();
-            let supervisor = S3IndexerSupervisor::supervise(move || {
-                let work = Work(count.clone());
-                async move {
-                    let _work = work;
-                    std::future::pending().await
-                }
-            });
+            let supervisor = S3IndexerSupervisor::supervise(
+                move || {
+                    let work = Work(count.clone());
+                    async move {
+                        let _work = work;
+                        std::future::pending().await
+                    }
+                },
+                metrics.clone(),
+            );
             tokio::task::yield_now().await;
+            assert_eq!(metrics.configured.get(), 1.0);
+            assert_eq!(metrics.live.get(), 1.0);
             if explicit_stop {
                 supervisor.stop().await;
                 assert_eq!(cancelled.load(Ordering::SeqCst), 1);
@@ -171,6 +231,12 @@ mod tests {
                 tokio::task::yield_now().await;
                 assert_eq!(cancelled.load(Ordering::SeqCst), 2);
             }
+            assert_eq!(metrics.configured.get(), 0.0);
+            assert_eq!(metrics.live.get(), 0.0);
+            assert_eq!(metrics.errors.get(), 0);
+            assert_eq!(metrics.panics.get(), 0);
+            assert_eq!(metrics.unexpected_exits.get(), 0);
+            assert_eq!(metrics.restarts.get(), 0);
         }
     }
 
@@ -196,8 +262,12 @@ mod tests {
             indexing_io_throughput_limiter: None,
             fingerprinter: None,
         };
-        let supervisor = S3IndexerSupervisor::spawn(worker);
+        let metrics = SupervisorMetrics::for_test();
+        let supervisor =
+            S3IndexerSupervisor::supervise(move || run(worker.clone()), metrics.clone());
         tokio::task::yield_now().await;
+        assert_eq!(metrics.configured.get(), 1.0);
+        assert_eq!(metrics.live.get(), 1.0);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         tokio::time::advance(IDLE_MIN).await;
         tokio::task::yield_now().await;
@@ -211,5 +281,8 @@ mod tests {
         supervisor.stop().await;
         tokio::time::advance(Duration::from_secs(100)).await;
         assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert_eq!(metrics.configured.get(), 0.0);
+        assert_eq!(metrics.live.get(), 0.0);
+        assert_eq!(metrics.restarts.get(), 0);
     }
 }
