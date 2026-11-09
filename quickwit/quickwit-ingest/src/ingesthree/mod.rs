@@ -23,6 +23,7 @@ mod documents_staged_for_upload;
 #[cfg(test)]
 mod file_size_tests;
 mod handoff;
+mod metadata_cache;
 mod router;
 mod service;
 #[cfg(test)]
@@ -48,6 +49,7 @@ use self::documents_staged_for_upload::{
     MAGIC, encode_metadata, record_size, recover, write_record,
 };
 pub use self::handoff::Uploader;
+pub use self::metadata_cache::METADATA_CHANGE_KEY;
 pub use self::router::IngesthreeRouter;
 pub use self::service::IngesthreeService;
 pub use self::write_queue::{AppendResponse, IngestError, WriteQueue};

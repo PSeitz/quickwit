@@ -12,20 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use quickwit_actors::Mailbox;
 use quickwit_cluster::Cluster;
+use quickwit_common::pubsub::{Event, EventBroker, EventSubscriber, EventSubscriptionHandle};
 use quickwit_config::NodeConfig;
 use quickwit_config::service::QuickwitService;
 use quickwit_indexing::actors::IndexingService;
 use quickwit_indexing::ingesthree::StopS3Indexers;
 use quickwit_ingest::ingesthree::{Uploader, WriteQueue};
-use quickwit_proto::metastore::MetastoreServiceClient;
+use quickwit_proto::metastore::{
+    AddSourceRequest, CreateIndexRequest, DeleteIndexRequest, DeleteSourceRequest,
+    MetastoreServiceClient, ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest,
+};
 use quickwit_storage::StorageResolver;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+/// Publishes a new gossip token after a successful index or source mutation.
+#[derive(Clone)]
+struct MetadataChangePublisher {
+    cluster: Cluster,
+    sequence: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl<E: Event> EventSubscriber<E> for MetadataChangePublisher {
+    async fn handle_event(&mut self, _event: E) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.cluster
+            .set_self_key_value(quickwit_ingest::ingesthree::METADATA_CHANGE_KEY, sequence)
+            .await;
+    }
+}
+
+/// Subscribe on every node: a primary metastore need not enable ingesthree itself.
+/// Keep these handles alive for the server lifetime. Missed events are repaired by
+/// intake reconciliation. Mutations do not wait for remote invalidation.
+pub(crate) fn publish_metadata_changes(
+    cluster: &Cluster,
+    broker: &EventBroker,
+) -> Vec<EventSubscriptionHandle> {
+    let publisher = MetadataChangePublisher {
+        cluster: cluster.clone(),
+        sequence: Arc::new(AtomicU64::new(0)),
+    };
+    vec![
+        broker.subscribe::<CreateIndexRequest>(publisher.clone()),
+        broker.subscribe::<UpdateIndexRequest>(publisher.clone()),
+        broker.subscribe::<DeleteIndexRequest>(publisher.clone()),
+        broker.subscribe::<AddSourceRequest>(publisher.clone()),
+        broker.subscribe::<UpdateSourceRequest>(publisher.clone()),
+        broker.subscribe::<ToggleSourceRequest>(publisher.clone()),
+        broker.subscribe::<DeleteSourceRequest>(publisher),
+    ]
+}
 
 /// File indexing publishes durable splits for the standalone planner to discover.
 /// Router-only nodes do not produce splits and can use either compaction setting.

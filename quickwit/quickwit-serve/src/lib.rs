@@ -616,6 +616,8 @@ pub async fn serve_quickwit(
         .context("failed to start cluster service")?;
 
     let event_broker = EventBroker::default();
+    let _ingesthree_metadata_subscriptions =
+        ingesthree::publish_metadata_changes(&cluster, &event_broker);
     let indexer_pool = IndexerPool::default();
     let ingester_pool = IngesterPool::default();
     let universe = Universe::new();
@@ -992,12 +994,17 @@ pub async fn serve_quickwit(
         ingest_router_service,
         ingest_service,
         ingester_opt: ingester_opt.clone(),
-        ingesthree_service_opt: ingesthree_queue_opt.as_ref().map(|queue| {
-            quickwit_ingest::ingesthree::IngesthreeService::new(
-                primary_metastore_through_control_plane.clone(),
-                queue.clone(),
-            )
-        }),
+        ingesthree_service_opt: match ingesthree_queue_opt.as_ref() {
+            Some(queue) => Some(
+                quickwit_ingest::ingesthree::IngesthreeService::new(
+                    primary_metastore_through_control_plane.clone(),
+                    queue.clone(),
+                )
+                .with_metadata_updates(&cluster)
+                .await,
+            ),
+            None => None,
+        },
         compaction_service_client_opt,
         compactor_service_opt: compactor_service_opt.clone(),
         janitor_service_opt,

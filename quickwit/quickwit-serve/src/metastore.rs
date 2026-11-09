@@ -237,6 +237,8 @@ pub(super) async fn start_metastore_service_if_needed(
         let metastore = MetastoreServiceClient::tower()
             .stack_layer(shared_layer)
             .stack_create_index_layer(broker_layer.clone())
+            .stack_update_index_layer(broker_layer.clone())
+            .stack_update_source_layer(broker_layer.clone())
             .stack_delete_index_layer(broker_layer.clone())
             .stack_add_source_layer(broker_layer.clone())
             .stack_delete_source_layer(broker_layer.clone())

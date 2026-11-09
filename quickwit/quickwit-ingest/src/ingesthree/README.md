@@ -47,8 +47,10 @@ and 503 for unavailability. Bulk responses retain successful items alongside fai
 The intake RPC reuses existing request/success messages and index/source lookup failures.
 Other intake failures use gRPC status codes. The v2 error enums and router remain unchanged.
 
-Intake resolves current index/source configuration and validates documents. The source
-must be the built-in JSON ingest source without a transform. Auto commits are supported.
+Intake caches index/source configuration and the document mapper per index. Concurrent
+misses share initialization. Mutation notifications invalidate the cache, and background
+reconciliation repairs missed notifications. See [metadata lifecycle](../../../../docs/internals/ingesthree-metadata-cache.md).
+The source must be the built-in JSON ingest source without a transform. Auto commits are supported.
 Force, WaitFor, and legacy ingest are rejected explicitly. ACK means local append/kernel
 flush, rather than fsync, upload, or search visibility.
 

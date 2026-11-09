@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use quickwit_common::thread_pool::run_cpu_intensive;
+use quickwit_cluster::Cluster;
 use quickwit_common::tower::GrpcMetricsLayer;
-use quickwit_config::{INGEST_V2_SOURCE_ID, SourceInputFormat, SourceParams, build_doc_mapper};
-use quickwit_metastore::IndexMetadataResponseExt;
-use quickwit_proto::ServiceError;
+use quickwit_config::INGEST_V2_SOURCE_ID;
 use quickwit_proto::ingest::CommitTypeV2;
 use quickwit_proto::ingest::ingesthree::ingesthree_service_server::{
     IngesthreeService as GrpcIngesthreeService, IngesthreeServiceServer,
@@ -27,19 +26,18 @@ use quickwit_proto::ingest::router::{
     IngestFailure, IngestFailureReason, IngestRequestV2, IngestResponseV2, IngestSubrequest,
     IngestSuccess,
 };
-use quickwit_proto::metastore::{
-    EntityKind, IndexMetadataRequest, MetastoreError, MetastoreService, MetastoreServiceClient,
-};
+use quickwit_proto::metastore::MetastoreServiceClient;
 use tonic::{Request, Response, Status};
 use tower::{Layer, Service};
 
+use super::metadata_cache::{MetadataCache, MetadataWatch, ResolveError};
 use super::{IngestError, WriteQueue};
 use crate::IngestServiceError;
 
 pub(super) const VERSION_HEADER: &str = "ingest-version";
 pub(super) const VERSION: &str = "ingesthree";
 
-/// Resolves each index incarnation and checks its source before file intake.
+/// Caches each index incarnation, its source checks, and its document mapper.
 /// Document validation follows the index's ingest settings.
 /// The supplied queue owns recovery, admission limits, upload, and shutdown.
 #[derive(Clone)]
@@ -47,6 +45,8 @@ pub struct IngesthreeService {
     metastore: MetastoreServiceClient,
     queue: WriteQueue,
     grpc_metrics: GrpcMetricsLayer,
+    metadata_cache: MetadataCache,
+    _metadata_watch: Option<Arc<MetadataWatch>>,
 }
 
 impl IngesthreeService {
@@ -55,7 +55,19 @@ impl IngesthreeService {
             metastore,
             queue,
             grpc_metrics: GrpcMetricsLayer::new("ingesthree", "server"),
+            metadata_cache: MetadataCache::default(),
+            _metadata_watch: None,
         }
+    }
+
+    /// Install lifecycle notifications and reconciliation before exposing production intake.
+    pub async fn with_metadata_updates(mut self, cluster: &Cluster) -> Self {
+        self._metadata_watch = Some(Arc::new(
+            self.metadata_cache
+                .watch(cluster, self.metastore.clone())
+                .await,
+        ));
+        self
     }
 
     /// Mount separately from the public router and v2 ingester services. The metadata
@@ -74,63 +86,21 @@ impl IngesthreeService {
         if subrequest.source_id != INGEST_V2_SOURCE_ID {
             return reject(IngestFailureReason::SourceNotFound);
         }
-        let metadata_response = match self
-            .metastore
-            .index_metadata(IndexMetadataRequest::for_index_id(
-                subrequest.index_id.clone(),
-            ))
+        let metadata = match self
+            .metadata_cache
+            .resolve(&subrequest.index_id, self.metastore.clone())
             .await
         {
-            Ok(response) => response,
-            Err(MetastoreError::NotFound(EntityKind::Index { .. })) => {
-                return reject(IngestFailureReason::IndexNotFound);
-            }
-            Err(error) => {
-                return Err(Status::new(
-                    error.error_code().grpc_status_code(),
-                    error.to_string(),
-                ));
-            }
-        };
-        let metadata = metadata_response
-            .deserialize_index_metadata()
-            .map_err(|error| Status::internal(error.to_string()))?;
-        if metadata.index_uid.index_id != subrequest.index_id
-            || metadata.index_config.index_id != subrequest.index_id
-        {
-            return Err(Status::internal("metastore returned a different index"));
-        }
-        let Some(source) = metadata.sources.get(INGEST_V2_SOURCE_ID).filter(|source| {
-            source.enabled && matches!(source.source_params, SourceParams::Ingest)
-        }) else {
-            return reject(IngestFailureReason::SourceNotFound);
-        };
-        // S3Indexer consumes JSON directly and carries a single source label.
-        // Applying a source transform again during indexing would change accepted data.
-        if source.input_format != SourceInputFormat::Json || source.transform_config.is_some() {
-            return Err(Status::invalid_argument(
-                "ingesthree requires a JSON ingest source without a transform",
-            ));
-        }
-        let index_config = metadata.index_config;
-        let mapper = if index_config.ingest_settings.validate_docs {
-            Some(
-                run_cpu_intensive(move || {
-                    build_doc_mapper(&index_config.doc_mapping, &index_config.search_settings)
-                })
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?
-                .map_err(|error| Status::internal(error.to_string()))?,
-            )
-        } else {
-            None
+            Ok(metadata) => metadata,
+            Err(ResolveError::Failure(reason)) => return reject(reason),
+            Err(ResolveError::Status(status)) => return Err(status),
         };
         let batch = subrequest
             .doc_batch
             .expect("request shape checked before append");
         let appended = self
             .queue
-            .append(metadata.index_uid.clone(), batch, mapper)
+            .append(metadata.index_uid.clone(), batch, metadata.mapper.clone())
             .await
             .map_err(|error| match error {
                 IngestError::QueueFull | IngestError::StorageFull | IngestError::OpenFileLimit => {
@@ -143,7 +113,7 @@ impl IngesthreeService {
         Ok(IngestResponseV2 {
             successes: vec![IngestSuccess {
                 subrequest_id: subrequest.subrequest_id,
-                index_uid: Some(metadata.index_uid),
+                index_uid: Some(metadata.index_uid.clone()),
                 source_id: subrequest.source_id,
                 num_ingested_docs: appended.num_docs as u32,
                 parse_failures: appended.parse_failures,
@@ -241,13 +211,16 @@ pub(super) fn validate_request(request: &IngestRequestV2) -> Result<(), IngestSe
 
 #[cfg(test)]
 mod tests {
-    use quickwit_config::{IndexConfig, SourceConfig};
-    use quickwit_metastore::IndexMetadata;
+    use quickwit_config::{IndexConfig, SourceConfig, SourceInputFormat, SourceParams};
+    use quickwit_metastore::{IndexMetadata, IndexMetadataResponseExt};
     use quickwit_metrics::{Counter, Gauge, counter, gauge, labels};
-    use quickwit_proto::ServiceErrorCode;
     use quickwit_proto::ingest::DocBatchV2;
-    use quickwit_proto::metastore::{IndexMetadataResponse, MockMetastoreService};
+    use quickwit_proto::metastore::{
+        EntityKind, IndexMetadataRequest, IndexMetadataResponse, MetastoreError,
+        MockMetastoreService,
+    };
     use quickwit_proto::types::IndexUid;
+    use quickwit_proto::{ServiceError, ServiceErrorCode};
 
     use super::*;
     use crate::ingesthree::DocumentFileReader;
@@ -557,7 +530,7 @@ mod tests {
             let queue = WriteQueue::open(directory.path().into(), queue_bytes, disk_bytes, None)
                 .await
                 .unwrap();
-            let service = IngesthreeService::new(metastore(metadata(), 2), queue.clone());
+            let service = IngesthreeService::new(metastore(metadata(), 1), queue.clone());
             assert_eq!(
                 service.ingest(request(payload())).await.unwrap_err().code(),
                 tonic::Code::ResourceExhausted

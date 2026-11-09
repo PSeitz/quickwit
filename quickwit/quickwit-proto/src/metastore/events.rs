@@ -18,7 +18,7 @@ use quickwit_common::pubsub::Event;
 
 use super::{
     AddSourceRequest, CreateIndexRequest, DeleteIndexRequest, DeleteSourceRequest, SourceType,
-    ToggleSourceRequest,
+    ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest,
 };
 use crate::types::{IndexUid, SourceId};
 
@@ -65,3 +65,5 @@ impl Event for CreateIndexRequest {}
 impl Event for DeleteIndexRequest {}
 impl Event for DeleteSourceRequest {}
 impl Event for ToggleSourceRequest {}
+impl Event for UpdateIndexRequest {}
+impl Event for UpdateSourceRequest {}
