@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use quickwit_common::metrics::index_label;
 use quickwit_common::split_file;
 use quickwit_config::IndexConfig;
@@ -279,6 +280,56 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
         .await
         .unwrap();
     assert!(inputs.exists(Path::new(&first.file_id)).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_whole_file_task_flushes_and_indexes_all_documents() {
+    let mut config = IndexConfig::for_test("whole-file", "ram:///splits");
+    config.indexing_settings.split_num_docs_target = 100;
+    let (mut worker, index_uid) = setup(config).await;
+    let input = register_file(&mut worker, &index_uid, &vec![DOC; 300]).await;
+    let result = worker.index_next(assignment()).await.unwrap().unwrap();
+    assert!(result.published);
+    assert_eq!(result.splits.len(), 3);
+    assert_eq!(
+        result
+            .splits
+            .iter()
+            .map(|split| split.num_docs)
+            .sum::<usize>(),
+        300
+    );
+    assert!(
+        read_file(&mut worker, &input)
+            .await
+            .completed_timestamp
+            .is_some()
+    );
+    let storage = worker
+        .storage_resolver
+        .resolve(&Uri::for_test("ram:///splits"))
+        .await
+        .unwrap();
+    let mut searchable_docs = 0;
+    for split in &result.splits {
+        let filename = split_file(&split.split_id);
+        let path = worker.scratch_directory.path().join(&filename);
+        storage
+            .copy_to_file(Path::new(&filename), &path)
+            .await
+            .unwrap();
+        let directory = get_tantivy_directory_from_split_bundle(&path).unwrap();
+        let index = tantivy::Index::open(directory).unwrap();
+        let reader = index.reader().unwrap();
+        searchable_docs += reader.searcher().search(&AllQuery, &Count).unwrap();
+    }
+    assert_eq!(searchable_docs, 300);
+    assert!(
+        list_splits(&mut worker, &index_uid)
+            .await
+            .iter()
+            .all(|split| split.split_state == SplitState::Published)
+    );
 }
 
 #[tokio::test]

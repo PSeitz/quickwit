@@ -13,21 +13,38 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use bytes::Bytes;
 use quickwit_common::io::IoControls;
 use quickwit_common::metrics::IN_FLIGHT_INDEX_WRITER;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_config::{IndexConfig, IndexingSettings, SourceInputFormat, build_doc_mapper};
+use quickwit_config::{
+    IndexConfig, IndexingSettings, RetentionPolicy, SourceInputFormat, build_doc_mapper,
+};
 use quickwit_doc_mapper::DocMapper;
+use quickwit_ingest::ingesthree::DocumentFileReader;
+use quickwit_metastore::SplitMetadata;
 use quickwit_metrics::{Gauge, GaugeGuard};
 use quickwit_proto::indexing::IndexingPipelineId;
+use quickwit_proto::metastore::DocumentsStagedForUpload;
+use quickwit_storage::SplitPayload;
 
-use crate::actors::{DocumentConverter, OTHER_PARTITION_ID};
+use crate::actors::{
+    DocumentConverter, OTHER_PARTITION_ID, create_packaged_split, prepare_split_for_upload,
+};
 use crate::docs_clustering::Fingerprinter;
-use crate::models::{IndexedSplit, IndexedSplitBuilder, ProcessedDoc};
+use crate::merge_policy::MergePolicy;
+use crate::models::{IndexedSplit, IndexedSplitBuilder, PackagedSplit, ProcessedDoc};
+
+/// Keeps packaged files and their upload metadata alive until async upload completes.
+pub(super) struct PreparedSplit {
+    pub packaged: PackagedSplit,
+    pub metadata: SplitMetadata,
+    pub payload: SplitPayload,
+}
 
 /// A split writer whose memory is counted until serialization finishes.
 /// Field order releases the builder before its memory guard on error or cancellation.
@@ -154,6 +171,75 @@ impl SplitBuilders {
         Ok(())
     }
 
+    /// Processes a whole file synchronously, preserving partially filled builders across files.
+    /// Flushes serialize to scratch here. Uploads happen after this file has been consumed.
+    pub fn index_file(
+        &mut self,
+        path: &Path,
+        file: &DocumentsStagedForUpload,
+        merge_policy: &Arc<dyn MergePolicy>,
+        retention: Option<&RetentionPolicy>,
+        last_file: bool,
+        num_uploaded_splits: usize,
+    ) -> anyhow::Result<Vec<PreparedSplit>> {
+        let _guard = self.io_controls.check_if_alive()?;
+        let index_uid = file
+            .index_uid
+            .as_ref()
+            .context("assigned file has no index UID")?;
+        let mut reader = DocumentFileReader::open(path, index_uid, file.num_bytes)?;
+        let mut prepared = Vec::new();
+        loop {
+            let _guard = self.io_controls.check_if_alive()?;
+            let documents = read_batch(&mut reader)?;
+            let end_of_file = documents.is_empty();
+            self.add_documents(documents)?;
+            if self.should_flush() || (end_of_file && last_file) {
+                prepared.extend(self.prepare_splits(
+                    merge_policy,
+                    retention,
+                    num_uploaded_splits + prepared.len(),
+                )?);
+            }
+            if end_of_file {
+                break;
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn prepare_splits(
+        &mut self,
+        merge_policy: &Arc<dyn MergePolicy>,
+        retention: Option<&RetentionPolicy>,
+        num_existing_splits: usize,
+    ) -> anyhow::Result<Vec<PreparedSplit>> {
+        let splits = self.take_splits();
+        ensure!(
+            num_existing_splits + splits.len() <= 1000,
+            "assigned group exceeds the publication split limit"
+        );
+        let mut prepared = Vec::with_capacity(splits.len());
+        for split in splits {
+            let io_controls = self.io_controls.clone().set_component("index_serializer");
+            let _guard = io_controls.check_if_alive()?;
+            let tags = self.tag_fields()?;
+            split
+                .builder
+                .controlled_directory
+                .set_io_controls(io_controls.clone());
+            let packaged = create_packaged_split(split.finalize()?, &tags, io_controls.progress())?;
+            let _guard = io_controls.check_if_alive()?;
+            let (metadata, payload) = prepare_split_for_upload(&packaged, merge_policy, retention)?;
+            prepared.push(PreparedSplit {
+                packaged,
+                metadata,
+                payload,
+            });
+        }
+        Ok(prepared)
+    }
+
     pub fn should_flush(&self) -> bool {
         let mut num_docs = 0;
         let mut num_bytes = 0;
@@ -176,6 +262,20 @@ impl SplitBuilders {
     pub fn tag_fields(&self) -> anyhow::Result<Vec<quickwit_doc_mapper::NamedField>> {
         self.mapper.tag_named_fields()
     }
+}
+
+/// Read incrementally inside the file task. The final document can exceed the byte target.
+fn read_batch(reader: &mut DocumentFileReader) -> anyhow::Result<Vec<Bytes>> {
+    let mut documents = Vec::new();
+    let mut num_bytes = 0;
+    while documents.len() < 128 && num_bytes < 1024 * 1024 {
+        let Some(document) = reader.read_document()? else {
+            break;
+        };
+        num_bytes += document.len();
+        documents.push(document);
+    }
+    Ok(documents)
 }
 
 #[cfg(test)]

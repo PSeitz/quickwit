@@ -28,16 +28,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
-use bytes::Bytes;
 use quickwit_common::KillSwitch;
 use quickwit_common::io::{IoControls, Limiter};
 use quickwit_common::retry::Retryable;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
-use quickwit_config::RetentionPolicy;
-use quickwit_ingest::ingesthree::DocumentFileReader;
 use quickwit_metastore::{IndexMetadataResponseExt, SplitMetadata, StageSplitsRequestExt};
 use quickwit_metrics::{Gauge, GaugeGuard};
 use quickwit_proto::indexing::IndexingPipelineId;
@@ -50,13 +46,11 @@ use quickwit_storage::{StorageError, StorageErrorKind, StorageResolver};
 use tracing::{Instrument, warn};
 use ulid::Ulid;
 
-use self::indexing::SplitBuilders;
+use self::indexing::{PreparedSplit, SplitBuilders};
 use self::metrics::ACTIVE_ASSIGNMENTS;
-use crate::actors::{
-    acquire_indexing_upload_permit, create_packaged_split, prepare_split_for_upload,
-};
+use crate::actors::acquire_indexing_upload_permit;
 use crate::docs_clustering::Fingerprinter;
-use crate::merge_policy::{MergePolicy, merge_policy_from_settings};
+use crate::merge_policy::merge_policy_from_settings;
 use crate::metrics::record_published_split;
 use crate::{IndexingSplitCache, IndexingSplitStore};
 
@@ -151,13 +145,6 @@ impl S3Indexer {
         let split_store = IndexingSplitStore::new(split_storage, self.split_cache.clone());
         let merge_policy = merge_policy_from_settings(&config.indexing_settings);
         let retention = config.retention_policy_opt.clone();
-        let directory = self.scratch_directory.clone();
-        let assignment_guard = active_assignment.clone();
-        let directory = tokio::task::spawn_blocking(move || {
-            let _assignment = assignment_guard;
-            directory.named_temp_child("files-")
-        })
-        .await??;
         let cancellation = StopIndexingOnDrop(KillSwitch::default());
         let io_controls = IoControls::default()
             .set_kill_switch(cancellation.0.clone())
@@ -168,23 +155,27 @@ impl S3Indexer {
             index_uid: index_uid.clone(),
             pipeline_uid: PipelineUid::random(),
         };
-        let split_directory = directory.clone();
+        let scratch_directory = self.scratch_directory.clone();
         let fingerprinter = self.fingerprinter.clone();
-        let assignment_guard = active_assignment.clone();
-        let mut builders = run_cpu_intensive(move || {
-            let _assignment = assignment_guard;
-            SplitBuilders::new(
-                config,
-                pipeline_id,
-                delete_opstamp,
-                split_directory,
-                io_controls,
-                fingerprinter,
-            )
-        })
-        .await??;
+        let (directory, mut builders) = run_indexing(
+            scratch_directory.clone(),
+            active_assignment.clone(),
+            move || {
+                let directory = scratch_directory.named_temp_child("files-")?;
+                let builders = SplitBuilders::new(
+                    config,
+                    pipeline_id,
+                    delete_opstamp,
+                    directory.clone(),
+                    io_controls,
+                    fingerprinter,
+                )?;
+                Ok((directory, builders))
+            },
+        )
+        .await?;
         let mut splits = Vec::new();
-        for file in &files {
+        for (file_index, file) in files.iter().enumerate() {
             let uri: Uri = file.file_uri.parse()?;
             let storage = self
                 .storage_resolver
@@ -200,52 +191,29 @@ impl S3Indexer {
                 size == file.num_bytes,
                 "downloaded input size differs from registration"
             );
-            let expected_uid = index_uid.clone();
-            let expected_size = file.num_bytes;
-            let mut reader =
+            let file = file.clone();
+            let merge_policy = merge_policy.clone();
+            let retention = retention.clone();
+            let last_file = file_index + 1 == files.len();
+            let num_uploaded_splits = splits.len();
+            let (next_builders, prepared) =
                 run_indexing(directory.clone(), active_assignment.clone(), move || {
-                    DocumentFileReader::open(&path, &expected_uid, expected_size)
-                })
-                .await?;
-            loop {
-                let (next_reader, documents) =
-                    run_indexing(directory.clone(), active_assignment.clone(), move || {
-                        read_batch(reader)
-                    })
-                    .await?;
-                reader = next_reader;
-                if documents.is_empty() {
-                    break;
-                }
-                builders = run_indexing(directory.clone(), active_assignment.clone(), move || {
-                    builders.add_documents(documents)?;
-                    Ok(builders)
-                })
-                .await?;
-                if builders.should_flush() {
-                    self.upload_splits(
-                        &mut builders,
-                        &split_store,
+                    let prepared = builders.index_file(
+                        &path,
+                        &file,
                         &merge_policy,
                         retention.as_ref(),
-                        &mut splits,
-                        &active_assignment,
-                    )
-                    .await?;
-                }
-            }
-            drop(reader);
+                        last_file,
+                        num_uploaded_splits,
+                    )?;
+                    Ok((builders, prepared))
+                })
+                .await?;
+            builders = next_builders;
+            self.upload_splits(prepared, &split_store, &mut splits)
+                .await?;
             tokio::fs::remove_file(directory.path().join("input")).await?;
         }
-        self.upload_splits(
-            &mut builders,
-            &split_store,
-            &merge_policy,
-            retention.as_ref(),
-            &mut splits,
-            &active_assignment,
-        )
-        .await?;
         let publication = PublishFileSplits {
             index_uid: Some(index_uid.clone()),
             file_ids: files.into_iter().map(|file| file.file_id).collect(),
@@ -275,45 +243,17 @@ impl S3Indexer {
 
     async fn upload_splits(
         &mut self,
-        builders: &mut SplitBuilders,
+        prepared: Vec<PreparedSplit>,
         split_store: &IndexingSplitStore,
-        merge_policy: &Arc<dyn MergePolicy>,
-        retention: Option<&RetentionPolicy>,
         uploaded: &mut Vec<SplitMetadata>,
-        active_assignment: &Arc<GaugeGuard>,
     ) -> anyhow::Result<()> {
-        let splits = builders.take_splits();
-        ensure!(
-            uploaded.len() + splits.len() <= 1000,
-            "assigned group exceeds the publication split limit"
-        );
-        for split in splits {
+        for PreparedSplit {
+            packaged,
+            metadata,
+            payload,
+        } in prepared
+        {
             let _permit = acquire_indexing_upload_permit(self.max_concurrent_split_uploads).await?;
-            let io_controls = builders
-                .io_controls
-                .clone()
-                .set_component("index_serializer");
-            let tags = builders.tag_fields()?;
-            let merge_policy = merge_policy.clone();
-            let retention = retention.cloned();
-            let (packaged, metadata, payload) = run_indexing(
-                self.scratch_directory.clone(),
-                active_assignment.clone(),
-                move || {
-                    let _guard = io_controls.check_if_alive()?;
-                    split
-                        .builder
-                        .controlled_directory
-                        .set_io_controls(io_controls.clone());
-                    let packaged =
-                        create_packaged_split(split.finalize()?, &tags, io_controls.progress())?;
-                    let _guard = io_controls.check_if_alive()?;
-                    let (metadata, payload) =
-                        prepare_split_for_upload(&packaged, &merge_policy, retention.as_ref())?;
-                    Ok((packaged, metadata, payload))
-                },
-            )
-            .await?;
             let request =
                 StageSplitsRequest::try_from_split_metadata(metadata.index_uid.clone(), &metadata)?;
             self.metastore.stage_splits(request).await?;
@@ -370,20 +310,6 @@ async fn run_indexing<T: Send + 'static>(
             .in_current_span(),
         )
         .await?
-}
-
-/// Read a small batch. The final document can exceed the byte target.
-fn read_batch(mut reader: DocumentFileReader) -> anyhow::Result<(DocumentFileReader, Vec<Bytes>)> {
-    let mut documents = Vec::new();
-    let mut num_bytes = 0;
-    while documents.len() < 128 && num_bytes < 1024 * 1024 {
-        let Some(document) = reader.read_document()? else {
-            break;
-        };
-        num_bytes += document.len();
-        documents.push(document);
-    }
-    Ok((reader, documents))
 }
 
 async fn publish_files(

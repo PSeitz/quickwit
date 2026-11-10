@@ -43,18 +43,24 @@ classification. Exhaustion follows the existing worker restart path. Retry and r
 logs include the full error chain. The assignment's 60-second retry eligibility is unchanged,
 so another worker can claim the inputs while an upload is still retrying.
 
-There are no stage actors or stage channels. The async caller awaits each operation.
-Mapper construction uses `run_cpu_intensive`. Reading, document conversion/insertion,
-serialization, and packaging use the existing blocking runtime: writers and compression
-can block beyond the small-task CPU pool's time budget. Storage/metastore calls remain async.
+There are no stage actors or stage channels. One blocking-runtime task creates the scratch
+directory and builders, including the mapper. Each downloaded file is then passed to one
+blocking-runtime task for opening, incremental reading, document conversion/insertion,
+serialization, and packaging. Internal batches preserve the document/heap flush checks
+without dispatching another task per batch. Storage/metastore calls remain async.
 Running synchronous work retains the scratch root after caller cancellation and checks a
-kill switch between documents and serialization steps. Synchronous work may finish its
-current operation before releasing the directory.
+kill switch before read batches, between documents, and during serialization. Synchronous
+work may finish its current operation before releasing the directory.
 
 Existing document routing and its overflow partition are preserved. Builders flush after
 batches when their aggregate document or heap target is reached, and at group end. All
-splits remain unpublished until every input has been processed. The mapper and delete
-opstamp stay fixed across the group. Files contain JSON without source-format/transform
+splits remain unpublished until every input has been processed. Flushed splits are serialized
+to scratch within the file task and uploaded after that file has been fully consumed.
+Partially filled builders carry across files and flush at group end. Packaged files, metadata,
+and hotcache payloads accumulate until the file task returns, increasing per-file scratch and
+packaging-memory needs. Serialization concurrency follows worker count. The shared upload
+semaphore limits staging/uploads, rather than serialization. The mapper and delete opstamp
+stay fixed across the group. Files contain JSON without source-format/transform
 metadata, so source decoding and transforms belong before intake. Current mapping rules
 apply at indexing time. Invalid documents are counted, logged, and skipped as in v2.
 Corrupt files and operational failures fail the group. An all-invalid group completes
