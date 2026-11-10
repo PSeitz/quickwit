@@ -300,6 +300,7 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
         ByteSize::mb(1),
         Some(&zone),
         &metrics,
+        None,
     )
     .await;
     assert_eq!(result.successes.len(), 1);
@@ -324,6 +325,7 @@ async fn test_ingesthree_capacity_filter_preserves_affinity_and_recovers() {
         ByteSize::mb(1),
         Some(&zone),
         &metrics,
+        None,
     )
     .await;
     assert_eq!(
@@ -374,6 +376,7 @@ async fn test_ingesthree_retries_capacity_and_unavailable_then_succeeds() {
         ByteSize::mb(1),
         Some(&zone),
         &metrics,
+        None,
     )
     .await;
     assert_eq!(response.successes.len(), 1);
@@ -430,6 +433,7 @@ async fn test_ingesthree_exhausted_capacity_is_429_compatible_and_retries_are_li
         ByteSize::mb(1),
         None,
         &metrics,
+        None,
     )
     .await;
     assert!(response.successes.is_empty());
@@ -463,6 +467,7 @@ async fn test_ingesthree_exhausted_capacity_is_429_compatible_and_retries_are_li
         ByteSize::mb(1),
         None,
         &metrics,
+        None,
     )
     .await;
     assert_eq!(response.successes.len(), 1);
@@ -473,57 +478,61 @@ async fn test_ingesthree_exhausted_capacity_is_429_compatible_and_retries_are_li
 }
 
 #[tokio::test]
-async fn test_ingesthree_local_preference_only_overrides_close_affinity() {
-    let transport = ChitchatTransport::default();
-    let local = TestClusterBuilder::new(NodeId::from_str("local"), 51000, &transport)
-        .with_services(HashSet::from([QuickwitService::Indexer]))
-        .build()
-        .await
-        .unwrap();
-    let remote = TestClusterBuilder::new(NodeId::from_str("remote"), 52000, &transport)
-        .with_services(HashSet::from([QuickwitService::Indexer]))
-        .with_peer_seeds(vec![local.gossip_listen_addr.to_string()])
-        .build()
-        .await
-        .unwrap();
-    for cluster in [&local, &remote] {
-        cluster.set_self_ingesthree_enabled(true).await;
-        cluster.set_self_ingesthree_capacity(10).await;
-        cluster.set_self_node_readiness(true).await;
+async fn test_ingesthree_prefers_own_node_with_positive_capacity() {
+    let local = destination("local", true, true, "zone-a", None, false).await;
+    let peer = destination("peer", true, true, "zone-a", None, false).await;
+    let metrics = RouterMetrics::for_test("local_first");
+    for capacity in [Some(1), Some(10), Some(0), None] {
+        let local_node = update_capacity(&local, capacity).await;
+        let local_before = local.calls.load(Ordering::SeqCst);
+        let peer_before = peer.calls.load(Ordering::SeqCst);
+        let response = route_subrequest(
+            &subrequest(),
+            vec![&peer.node, &local_node],
+            ByteSize::mb(1),
+            None,
+            &metrics,
+            Some(&local.node.node_id),
+        )
+        .await;
+        assert_eq!(response.successes.len(), 1);
+        assert!(response.failures.is_empty());
+        let expect_local = usize::from(capacity.is_some_and(|score| score > 0));
+        assert_eq!(
+            local.calls.load(Ordering::SeqCst),
+            local_before + expect_local
+        );
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            peer_before + 1 - expect_local
+        );
     }
-    let nodes = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let nodes = local.ready_nodes().await;
-            if nodes.len() == 2
-                && nodes
-                    .iter()
-                    .all(|node| node.is_ingesthree() && node.ingesthree_capacity() == Some(10))
-            {
-                break nodes;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let local_node = nodes.iter().find(|node| node.is_self_node()).unwrap();
-    let remote_node = nodes.iter().find(|node| !node.is_self_node()).unwrap();
-    let mut local_overrides = 0;
-    let mut remote_wins = 0;
-    for index in 0..1000 {
-        let index_id = format!("index-{index}");
-        let local_affinity = node_affinity(&local_node.node_id, &index_id.as_str());
-        let remote_affinity = node_affinity(&remote_node.node_id, &index_id.as_str());
-        let winner = destinations(&nodes, &index_id, None)[0];
-        if winner.is_self_node() && remote_affinity > local_affinity {
-            assert!(remote_affinity - local_affinity <= u64::MAX / 20);
-            local_overrides += 1;
-        } else if !winner.is_self_node() {
-            remote_wins += 1;
-        }
-    }
-    assert!(local_overrides > 0);
-    assert!(remote_wins > 0);
-    local.initiate_shutdown().await.unwrap();
-    remote.initiate_shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ingesthree_retries_peer_after_own_node_rejects() {
+    let local = destination(
+        "local",
+        true,
+        true,
+        "zone-a",
+        Some(Code::ResourceExhausted),
+        false,
+    )
+    .await;
+    let peer = destination("peer", true, true, "zone-a", None, false).await;
+    let metrics = RouterMetrics::for_test("local_rejected");
+    let response = route_subrequest(
+        &subrequest(),
+        vec![&peer.node, &local.node],
+        ByteSize::mb(1),
+        None,
+        &metrics,
+        Some(&local.node.node_id),
+    )
+    .await;
+    assert_eq!(response.successes.len(), 1);
+    assert!(response.failures.is_empty());
+    assert_eq!(local.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.calls.load(Ordering::SeqCst), 1);
 }

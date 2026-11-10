@@ -51,6 +51,7 @@ async fn test_single_index_spreads_across_sampled_destinations() {
             ByteSize::mb(1),
             Some(&zone),
             &metrics,
+            None,
         )
         .await;
         assert_eq!(response.successes.len(), 1);
@@ -101,7 +102,7 @@ async fn test_selection_preserves_az_capacity_affinity_and_distinct_retries() {
     );
     assert!(take_destination(&mut candidates, Some(&zone), &mut rng).is_none());
 
-    // At equal capacity, retain the ordering produced by index affinity/local bonus.
+    // At equal capacity, retain the ordering produced by index affinity.
     let nodes = [preferred.node.clone(), other.node.clone()];
     let ordered = destinations(&nodes, "logs", Some(&zone));
     for _ in 0..100 {

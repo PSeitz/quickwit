@@ -55,6 +55,7 @@ async fn test_ingesthree_terminal_errors_and_malformed_responses_are_not_retried
             ByteSize::mb(1),
             None,
             &metrics,
+            None,
         )
         .await;
         assert_eq!(

@@ -24,7 +24,7 @@ use quickwit_proto::ingest::router::{
     IngestFailureReason, IngestRequestV2, IngestResponseV2, IngestSubrequest,
 };
 use quickwit_proto::ingest::{CommitTypeV2, RateLimitingCause};
-use quickwit_proto::types::AvailabilityZone;
+use quickwit_proto::types::{AvailabilityZone, NodeId};
 use tonic::{Code, Request, Status};
 use tower::{Layer, Service};
 
@@ -86,6 +86,7 @@ impl IngesthreeRouter {
                 self.max_grpc_message_size,
                 self.availability_zone.as_ref(),
                 &self.metrics,
+                Some(&self.cluster.self_node_id()),
             )
             .await;
             response.successes.extend(result.successes);
@@ -109,23 +110,12 @@ fn destinations<'a>(
         let same_zone =
             availability_zone.is_some() && node.availability_zone().as_ref() == availability_zone;
         let affinity = node_affinity(&node.node_id, &index_id) as u128;
-        // A five-percent score bonus breaks close affinity races in favor of local
-        // intake. It never overrides AZ preference or pins every index to this node.
-        let local_bonus = if node.is_self_node() {
-            u64::MAX as u128 / 20
-        } else {
-            0
-        };
-        (
-            Reverse(same_zone),
-            Reverse(affinity + local_bonus),
-            node.node_id.clone(),
-        )
+        (Reverse(same_zone), Reverse(affinity), node.node_id.clone())
     });
     destinations
 }
 
-/// Candidates are eligible and ordered by AZ, then index affinity/local bonus.
+/// Peer candidates are eligible and ordered by AZ, then index affinity.
 /// Sample before applying capacity and affinity so a single index can use many nodes.
 /// Remove the winner while preserving order, so retries always try distinct nodes.
 fn take_destination<'a>(
@@ -160,6 +150,7 @@ async fn route_subrequest(
     max_message_size: ByteSize,
     availability_zone: Option<&AvailabilityZone>,
     metrics: &RouterMetrics,
+    local_node_id: Option<&NodeId>,
 ) -> IngestResponse {
     let mut error =
         IngestServiceError::Unavailable("no ready ingest destination accepted the request".into());
@@ -173,8 +164,18 @@ async fn route_subrequest(
         Some(_) => true,
         None => false,
     });
+    // Prefer our own eligible intake before sampling peers. Removing it also prevents
+    // retries from choosing it again after rejection. Discovery capacity is advisory.
+    let mut local = local_node_id.and_then(|node_id| {
+        let index = destinations
+            .iter()
+            .position(|node| &node.node_id == node_id)?;
+        Some(destinations.remove(index))
+    });
     for _ in 0..3 {
-        let Some(node) = take_destination(&mut destinations, availability_zone, &mut rand::rng())
+        let Some(node) = local
+            .take()
+            .or_else(|| take_destination(&mut destinations, availability_zone, &mut rand::rng()))
         else {
             break;
         };
