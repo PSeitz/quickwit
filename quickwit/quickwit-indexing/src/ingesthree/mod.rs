@@ -174,16 +174,15 @@ impl S3Indexer {
             },
         )
         .await?;
-        let mut splits = Vec::new();
         for (file_index, file) in files.iter().enumerate() {
             let uri: Uri = file.file_uri.parse()?;
             let storage = self
                 .storage_resolver
                 .resolve(&uri.parent().context("input URI has no parent")?)
                 .await?;
-            // Use a fixed local filename. The directory belongs to this attempt and is reused
-            // only after the previous input has been read and removed.
-            let path = directory.path().join("input");
+            // Download the entire assignment before dispatching its indexing task.
+            // Local names are independent of remote paths and unique within this attempt.
+            let path = directory.path().join(file_index.to_string());
             let size = storage
                 .copy_to_file(uri.file_name().context("input URI has no filename")?, &path)
                 .await?;
@@ -191,29 +190,29 @@ impl S3Indexer {
                 size == file.num_bytes,
                 "downloaded input size differs from registration"
             );
-            let file = file.clone();
-            let merge_policy = merge_policy.clone();
-            let retention = retention.clone();
-            let last_file = file_index + 1 == files.len();
-            let num_uploaded_splits = splits.len();
-            let (next_builders, prepared) =
-                run_indexing(directory.clone(), active_assignment.clone(), move || {
-                    let prepared = builders.index_file(
-                        &path,
-                        &file,
-                        &merge_policy,
-                        retention.as_ref(),
-                        last_file,
-                        num_uploaded_splits,
-                    )?;
-                    Ok((builders, prepared))
-                })
-                .await?;
-            builders = next_builders;
-            self.upload_splits(prepared, &split_store, &mut splits)
-                .await?;
-            tokio::fs::remove_file(directory.path().join("input")).await?;
         }
+        let files_to_index = files.clone();
+        let input_directory = directory.clone();
+        let prepared = run_indexing(directory.clone(), active_assignment.clone(), move || {
+            let mut prepared = Vec::new();
+            for (file_index, file) in files_to_index.iter().enumerate() {
+                let path = input_directory.path().join(file_index.to_string());
+                prepared.extend(builders.index_file(
+                    &path,
+                    file,
+                    &merge_policy,
+                    retention.as_ref(),
+                    file_index + 1 == files_to_index.len(),
+                    prepared.len(),
+                )?);
+                std::fs::remove_file(path)?;
+            }
+            Ok(prepared)
+        })
+        .await?;
+        let mut splits = Vec::new();
+        self.upload_splits(prepared, &split_store, &mut splits)
+            .await?;
         let publication = PublishFileSplits {
             index_uid: Some(index_uid.clone()),
             file_ids: files.into_iter().map(|file| file.file_id).collect(),

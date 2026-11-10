@@ -172,7 +172,7 @@ impl SplitBuilders {
     }
 
     /// Processes a whole file synchronously, preserving partially filled builders across files.
-    /// Flushes serialize to scratch here. Uploads happen after this file has been consumed.
+    /// Flushes serialize to scratch here. Uploads happen after the entire assignment is consumed.
     pub fn index_file(
         &mut self,
         path: &Path,
@@ -180,7 +180,7 @@ impl SplitBuilders {
         merge_policy: &Arc<dyn MergePolicy>,
         retention: Option<&RetentionPolicy>,
         last_file: bool,
-        num_uploaded_splits: usize,
+        num_existing_splits: usize,
     ) -> anyhow::Result<Vec<PreparedSplit>> {
         let _guard = self.io_controls.check_if_alive()?;
         let index_uid = file
@@ -198,7 +198,7 @@ impl SplitBuilders {
                 prepared.extend(self.prepare_splits(
                     merge_policy,
                     retention,
-                    num_uploaded_splits + prepared.len(),
+                    num_existing_splits + prepared.len(),
                 )?);
             }
             if end_of_file {
@@ -264,7 +264,7 @@ impl SplitBuilders {
     }
 }
 
-/// Read incrementally inside the file task. The final document can exceed the byte target.
+/// Read incrementally inside the assignment task. The final document can exceed the byte target.
 fn read_batch(reader: &mut DocumentFileReader) -> anyhow::Result<Vec<Bytes>> {
     let mut documents = Vec::new();
     let mut num_bytes = 0;

@@ -283,28 +283,33 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
 }
 
 #[tokio::test]
-async fn test_whole_file_task_flushes_and_indexes_all_documents() {
-    let mut config = IndexConfig::for_test("whole-file", "ram:///splits");
+async fn test_batch_task_flushes_and_indexes_all_files() {
+    let mut config = IndexConfig::for_test("batch", "ram:///splits");
     config.indexing_settings.split_num_docs_target = 100;
     let (mut worker, index_uid) = setup(config).await;
-    let input = register_file(&mut worker, &index_uid, &vec![DOC; 300]).await;
+    let mut inputs = Vec::new();
+    for _ in 0..3 {
+        inputs.push(register_file(&mut worker, &index_uid, &[DOC; 300]).await);
+    }
     let result = worker.index_next(assignment()).await.unwrap().unwrap();
     assert!(result.published);
-    assert_eq!(result.splits.len(), 3);
+    assert_eq!(result.splits.len(), 7);
     assert_eq!(
         result
             .splits
             .iter()
             .map(|split| split.num_docs)
             .sum::<usize>(),
-        300
+        900
     );
-    assert!(
-        read_file(&mut worker, &input)
-            .await
-            .completed_timestamp
-            .is_some()
-    );
+    for input in &inputs {
+        assert!(
+            read_file(&mut worker, input)
+                .await
+                .completed_timestamp
+                .is_some()
+        );
+    }
     let storage = worker
         .storage_resolver
         .resolve(&Uri::for_test("ram:///splits"))
@@ -323,7 +328,7 @@ async fn test_whole_file_task_flushes_and_indexes_all_documents() {
         let reader = index.reader().unwrap();
         searchable_docs += reader.searcher().search(&AllQuery, &Count).unwrap();
     }
-    assert_eq!(searchable_docs, 300);
+    assert_eq!(searchable_docs, 900);
     assert!(
         list_splits(&mut worker, &index_uid)
             .await
@@ -375,7 +380,7 @@ async fn test_all_invalid_documents_complete_without_outputs() {
 }
 
 #[tokio::test]
-async fn test_corrupt_input_preserves_group_and_uploaded_outputs() {
+async fn test_corrupt_input_preserves_group_without_uploading_outputs() {
     let mut config = IndexConfig::for_test("corrupt", "ram:///splits");
     config.indexing_settings.split_num_docs_target = 1;
     let (mut worker, index_uid) = setup(config).await;
@@ -413,8 +418,8 @@ async fn test_corrupt_input_preserves_group_and_uploaded_outputs() {
         assert!(stored.completed_timestamp.is_none());
     }
     let splits = list_splits(&mut worker, &index_uid).await;
-    assert_eq!(splits.len(), 1);
-    assert_eq!(splits[0].split_state, SplitState::Staged);
+    // Packaging earlier inputs stays local until the whole assignment succeeds.
+    assert!(splits.is_empty());
     assert_eq!(storage.get_all(path).await.unwrap().as_slice(), damaged);
 }
 

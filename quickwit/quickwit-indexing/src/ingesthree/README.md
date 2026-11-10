@@ -21,8 +21,10 @@ incarnation per assignment, with a default target of 100,000,000 input bytes. Se
 fail worker startup. Restart the service to apply changes. An oversized first file is
 still assigned for progress. File rotation remains independently controlled by
 `QW_INGESTHREE_TARGET_UPLOAD_SIZE`. With both defaults, full-size files generally remain
-single-file assignments. Files in a group are processed one at a time, sharing these node resources
-and `INGEST_V2_SOURCE_ID`. Successful groups are followed immediately by another
+single-file assignments. The metastore collects available files up to the configured target,
+subject to the 1,000-file cap, without waiting for more files to arrive. Each assignment is
+processed by one indexing task, sharing these node resources and `INGEST_V2_SOURCE_ID`.
+Successful groups are followed immediately by another
 assignment request. Empty assignments back off from
 100 ms to 5 seconds. Each worker restarts independently after errors, panics, or unexpected
 exits, with a 1–30 second exponential backoff. Ingesthree indexers require `enable_standalone_compactors: true`. A Janitor
@@ -44,10 +46,11 @@ logs include the full error chain. The assignment's 60-second retry eligibility 
 so another worker can claim the inputs while an upload is still retrying.
 
 There are no stage actors or stage channels. One blocking-runtime task creates the scratch
-directory and builders, including the mapper. Each downloaded file is then passed to one
-blocking-runtime task for opening, incremental reading, document conversion/insertion,
-serialization, and packaging. Internal batches preserve the document/heap flush checks
-without dispatching another task per batch. Storage/metastore calls remain async.
+directory and builders, including the mapper. All files in the assignment are downloaded
+before one blocking-runtime task processes the entire assignment: opening files, incremental
+reading, document conversion/insertion, serialization, and packaging. Internal document
+batches preserve the document/heap flush checks without dispatching another task per file
+or document batch. Storage/metastore calls remain async.
 Running synchronous work retains the scratch root after caller cancellation and checks a
 kill switch before read batches, between documents, and during serialization. Synchronous
 work may finish its current operation before releasing the directory.
@@ -55,10 +58,12 @@ work may finish its current operation before releasing the directory.
 Existing document routing and its overflow partition are preserved. Builders flush after
 batches when their aggregate document or heap target is reached, and at group end. All
 splits remain unpublished until every input has been processed. Flushed splits are serialized
-to scratch within the file task and uploaded after that file has been fully consumed.
-Partially filled builders carry across files and flush at group end. Packaged files, metadata,
-and hotcache payloads accumulate until the file task returns, increasing per-file scratch and
-packaging-memory needs. Serialization concurrency follows worker count. The shared upload
+to scratch within the assignment task and uploaded after every assigned file is consumed.
+Partially filled builders carry across files and flush at group end. All input files initially
+occupy scratch space and are removed individually after processing. Packaged files, metadata,
+and hotcache payloads accumulate until the assignment task returns, increasing per-assignment
+scratch and packaging-memory needs. A corrupt input fails the task before any output is staged
+or uploaded. Serialization concurrency follows worker count. The shared upload
 semaphore limits staging/uploads, rather than serialization. The mapper and delete opstamp
 stay fixed across the group. Files contain JSON without source-format/transform
 metadata, so source decoding and transforms belong before intake. Current mapping rules
@@ -138,7 +143,7 @@ retain their existing meanings. Standalone compaction uses its existing metric f
 The worker tests use the file-backed metastore and RAM object storage. They open uploaded
 split bundles with Tantivy and check document counts, metadata, and atomic completion.
 They cover shared and multiple outputs, all-invalid inputs, corrupt input after an earlier
-upload, committed-but-lost publication replies, cancellation, competing workers, partition
+local flush, committed-but-lost publication replies, cancellation, competing workers, partition
 overflow, clustering across batches, and heap flushing. A held synchronous operation checks
 scratch ownership after cancellation. Reader tests reject wrong size/incarnation, damaged
 checksums, oversized frame lengths, and truncation without modifying input.
