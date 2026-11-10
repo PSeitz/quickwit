@@ -46,7 +46,7 @@ use quickwit_proto::metastore::{
     MetastoreService, MetastoreServiceClient, PublishFileSplits, StageSplitsRequest,
 };
 use quickwit_proto::types::{IndexUid, NodeId, PipelineUid, SourceId};
-use quickwit_storage::StorageResolver;
+use quickwit_storage::{StorageError, StorageErrorKind, StorageResolver};
 use tracing::{Instrument, warn};
 use ulid::Ulid;
 
@@ -317,13 +317,33 @@ impl S3Indexer {
             let request =
                 StageSplitsRequest::try_from_split_metadata(metadata.index_uid.clone(), &metadata)?;
             self.metastore.stage_splits(request).await?;
-            split_store
-                .store_split(
-                    &metadata,
-                    packaged.split_scratch_directory.path(),
-                    Box::new(payload),
-                )
-                .await?;
+            // Keep the same split ID and scratch files across whole-upload retries.
+            // Local cache/cleanup errors can follow a successful upload and must escape.
+            for attempt in 1..=3 {
+                let error = match split_store
+                    .store_split(
+                        &metadata,
+                        packaged.split_scratch_directory.path(),
+                        Box::new(payload.clone()),
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) => error,
+                };
+                let retry_upload = error.downcast_ref::<StorageError>().is_some_and(|error| {
+                    !matches!(
+                        error.kind(),
+                        StorageErrorKind::Unauthorized | StorageErrorKind::NotFound
+                    )
+                });
+                if !retry_upload || attempt == 3 {
+                    return Err(error);
+                }
+                warn!(error = %format!("{error:#}"), split_id = %metadata.split_id(), attempt,
+                    "split upload failed, retrying same split");
+                tokio::time::sleep(Duration::from_secs(attempt)).await;
+            }
             uploaded.push(metadata);
         }
         Ok(())

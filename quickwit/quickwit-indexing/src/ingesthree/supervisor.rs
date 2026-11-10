@@ -66,7 +66,7 @@ impl S3IndexerSupervisor {
                 match AssertUnwindSafe(run()).catch_unwind().await {
                     Ok(Err(error)) => {
                         metrics.errors.inc();
-                        error!(%error, "S3 indexer failed, restarting");
+                        error!(error = %format!("{error:#}"), "S3 indexer failed, restarting");
                     }
                     Ok(Ok(())) => {
                         metrics.unexpected_exits.inc();

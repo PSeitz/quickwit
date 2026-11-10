@@ -35,6 +35,13 @@ The existing v2 actors and this worker share `DocumentConverter`, split creation
 `IndexedSplitBuilder::finalize`, packaging, upload preparation, and `IndexingSplitStore`.
 The split format, metadata, recovery footer, merge maturity, and local merge cache remain
 unchanged. Index uploads share the existing node-wide upload semaphore.
+After storage-level retries, failed split uploads get up to two whole-upload retries,
+after 1 and 2 seconds, retaining the packaged files and split ID. Authorization and
+not-found storage errors, and local cache/cleanup errors, fail immediately. Other storage
+errors receive these retries even when the backend does not retain a precise transient
+classification. Exhaustion follows the existing worker restart path. Retry and restart
+logs include the full error chain. The assignment's 60-second retry eligibility is unchanged,
+so another worker can claim the inputs while an upload is still retrying.
 
 There are no stage actors or stage channels. The async caller awaits each operation.
 Mapper construction uses `run_cpu_intensive`. Reading, document conversion/insertion,
