@@ -224,8 +224,8 @@ The next append creates a fresh file with a new ID. The core implements this wit
 `finish_file(index_uid)`. Finished files use the `.finished` filename extension.
 
 The defaults are **100 MB**, **10 seconds**, and **1,024 active files**.
-Set `QW_INGESTHREE_TARGET_FILE_SIZE` on ingesting nodes to override the size target,
-for example `QW_INGESTHREE_TARGET_FILE_SIZE=250MB` or `256MiB`. A bare integer means
+Set `QW_INGESTHREE_TARGET_UPLOAD_SIZE` on ingesting nodes to override the size target,
+for example `QW_INGESTHREE_TARGET_UPLOAD_SIZE=250MB` or `256MiB`. A bare integer means
 bytes. The variable is read when intake opens. Invalid or zero sizes fail startup
 before local recovery changes any files. The target applies per index incarnation
 on each ingesting node. The 10-second deadline and node-wide memory/disk budgets

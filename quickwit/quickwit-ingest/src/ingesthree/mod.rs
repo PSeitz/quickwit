@@ -60,7 +60,7 @@ struct ActiveFile {
     writer: BufWriter<File>,
 }
 
-const TARGET_FILE_SIZE_ENV_KEY: &str = "QW_INGESTHREE_TARGET_FILE_SIZE";
+const TARGET_FILE_SIZE_ENV_KEY: &str = "QW_INGESTHREE_TARGET_UPLOAD_SIZE";
 
 // File-finishing thresholds and the active-writer cap.
 struct FileLimits {

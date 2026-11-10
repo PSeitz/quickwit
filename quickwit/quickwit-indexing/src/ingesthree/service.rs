@@ -22,9 +22,9 @@ use quickwit_config::INGEST_V2_SOURCE_ID;
 use super::IndexingService;
 use crate::ingesthree::{S3Indexer, S3IndexerSupervisor, StopS3Indexers};
 
-/// Reads the target total input bytes for one indexing assignment.
-fn assignment_target_bytes() -> anyhow::Result<u64> {
-    const ENV_KEY: &str = "QW_INGESTHREE_TARGET_ASSIGNMENT_SIZE";
+/// Reads the target total input bytes for one indexer batch.
+fn indexer_batch_bytes() -> anyhow::Result<u64> {
+    const ENV_KEY: &str = "QW_INGESTHREE_INDEXER_BATCH_SIZE";
     let num_bytes = match std::env::var(ENV_KEY) {
         Ok(value) => value
             .parse::<ByteSize>()
@@ -55,7 +55,7 @@ impl IndexingService {
         if !self.ingesthree_enabled {
             return Ok(());
         }
-        let max_num_bytes = assignment_target_bytes()?;
+        let max_num_bytes = indexer_batch_bytes()?;
         let num_workers = quickwit_common::num_cpus();
         ensure!(num_workers > 0, "S3 indexing requires at least one CPU");
         let scratch_directory = temp_dir::Builder::default()

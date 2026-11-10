@@ -314,14 +314,14 @@ and `decommission_timeout` apply. Recovery finishes before the node becomes read
 Shutdown stops worker restarts and drains accepted input to storage and the metastore.
 A timeout retains local input for recovery.
 
-Set `QW_INGESTHREE_TARGET_FILE_SIZE` on ingesting nodes to change the file-size target
+Set `QW_INGESTHREE_TARGET_UPLOAD_SIZE` on ingesting nodes to change the file-size target
 (default `100MB`, or 100,000,000 bytes). It accepts sizes such as `250MB`, `256MiB`,
 or an integer byte count. Invalid or zero values fail startup. The target applies
 per index incarnation on each ingesting node, includes file framing, and is checked
 between batches, so a batch can exceed it. The 10-second rotation deadline and
 node-wide queue/disk budgets are unchanged. Restart intake to apply a new value.
 
-Set `QW_INGESTHREE_TARGET_ASSIGNMENT_SIZE` on indexers to control how many input bytes
+Set `QW_INGESTHREE_INDEXER_BATCH_SIZE` on indexers to control how many input bytes
 an indexing worker claims per metastore assignment (default `100MB`, or 100,000,000 bytes).
 It accepts sizes such as `1GB`, `512MiB`, or an integer byte count. Values must be positive
 and at most `INT64_MAX` bytes. Invalid or unreadable values fail worker startup before
