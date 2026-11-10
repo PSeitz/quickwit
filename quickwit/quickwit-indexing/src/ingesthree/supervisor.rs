@@ -103,10 +103,10 @@ impl Drop for S3IndexerSupervisor {
 async fn run(mut worker: S3Indexer) -> anyhow::Result<()> {
     let mut idle_delay = IDLE_MIN;
     loop {
-        // Each worker indexes one file at a time. An oversized
-        // first file is still assigned by the metastore, as required for forward progress.
+        // Group files up to the byte budget and the metastore's 1,000-file limit.
+        // An oversized first file is still assigned to ensure forward progress.
         let assignment = AssignFilesForIndexing {
-            max_num_files: 1,
+            max_num_files: 1_000,
             max_num_bytes: 100_000_000,
             retry_after_secs: 60,
         };

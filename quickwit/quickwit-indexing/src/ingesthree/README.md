@@ -14,8 +14,12 @@ shared split cache, upload limit, optional shared IO limiter, and optional finge
 With `ingest_api.enable_ingesthree` enabled, each indexer node starts
 `quickwit_common::num_cpus()` workers, controlled by `QW_NUM_CPUS`. Without that override,
 the existing CPU detection uses `KUBERNETES_LIMITS_CPU`, then the OS, then a default of 2.
-The worker count must be positive. Each worker processes one assigned file at a time,
-sharing these node resources and `INGEST_V2_SOURCE_ID`. Empty assignments back off from
+The worker count must be positive. Each worker requests up to 1,000 files from one index
+incarnation per assignment, within a 100,000,000-byte budget. An oversized first file is
+still assigned for progress. Full-size files therefore generally remain single-file
+assignments. Files in a group are processed one at a time, sharing these node resources
+and `INGEST_V2_SOURCE_ID`. Successful groups are followed immediately by another
+assignment request. Empty assignments back off from
 100 ms to 5 seconds. Each worker restarts independently after errors, panics, or unexpected
 exits, with a 1–30 second exponential backoff. Ingesthree indexers require `enable_standalone_compactors: true`. A Janitor
 node hosts the standalone planner and separate Compactor nodes perform merges. The
