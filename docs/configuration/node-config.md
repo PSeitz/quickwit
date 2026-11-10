@@ -321,6 +321,17 @@ per index incarnation on each ingesting node, includes file framing, and is chec
 between batches, so a batch can exceed it. The 10-second rotation deadline and
 node-wide queue/disk budgets are unchanged. Restart intake to apply a new value.
 
+Set `QW_INGESTHREE_TARGET_ASSIGNMENT_SIZE` on indexers to control how many input bytes
+an indexing worker claims per metastore assignment (default `100MB`, or 100,000,000 bytes).
+It accepts sizes such as `1GB`, `512MiB`, or an integer byte count. Values must be positive
+and at most `INT64_MAX` bytes. Invalid or unreadable values fail worker startup before
+workers are spawned. Restart the service to apply changes. Each assignment groups at
+most 1,000 files from one index incarnation. The first file can exceed the target so
+large files still make progress. This setting is independent of file rotation and queue
+memory limits. Files are downloaded and processed sequentially within the group.
+The existing 60-second reassignment timeout is unchanged, so larger groups can cause
+concurrent retries if processing exceeds that interval.
+
 This path supports JSON ingest sources without a source transform and Auto commits.
 Force, WaitFor, and legacy ingest requests are rejected. Acknowledgment means local
 append/kernel flush, rather than fsync, upload, or search visibility. Splits become

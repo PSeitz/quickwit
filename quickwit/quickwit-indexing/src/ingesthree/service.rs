@@ -12,14 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use async_trait::async_trait;
+use bytesize::ByteSize;
 use quickwit_actors::{ActorContext, ActorExitStatus, Handler};
 use quickwit_common::temp_dir;
 use quickwit_config::INGEST_V2_SOURCE_ID;
 
 use super::IndexingService;
 use crate::ingesthree::{S3Indexer, S3IndexerSupervisor, StopS3Indexers};
+
+/// Reads the target total input bytes for one indexing assignment.
+fn assignment_target_bytes() -> anyhow::Result<u64> {
+    const ENV_KEY: &str = "QW_INGESTHREE_TARGET_ASSIGNMENT_SIZE";
+    let num_bytes = match std::env::var(ENV_KEY) {
+        Ok(value) => value
+            .parse::<ByteSize>()
+            .map_err(|error| anyhow::anyhow!("{ENV_KEY}: {error}"))?
+            .as_u64(),
+        Err(std::env::VarError::NotPresent) => 100_000_000,
+        Err(error) => return Err(error).with_context(|| format!("failed to read {ENV_KEY}")),
+    };
+    ensure!(
+        num_bytes > 0 && num_bytes <= i64::MAX as u64,
+        "{ENV_KEY} must be between 1 and {} bytes",
+        i64::MAX,
+    );
+    Ok(num_bytes)
+}
 
 impl IndexingService {
     pub(crate) fn enable_ingesthree(&mut self) -> anyhow::Result<()> {
@@ -35,6 +55,7 @@ impl IndexingService {
         if !self.ingesthree_enabled {
             return Ok(());
         }
+        let max_num_bytes = assignment_target_bytes()?;
         let num_workers = quickwit_common::num_cpus();
         ensure!(num_workers > 0, "S3 indexing requires at least one CPU");
         let scratch_directory = temp_dir::Builder::default()
@@ -52,7 +73,7 @@ impl IndexingService {
             fingerprinter: self.fingerprinter_opt.clone(),
         };
         self.s3_indexers = (0..num_workers)
-            .map(|_| S3IndexerSupervisor::spawn(worker.clone()))
+            .map(|_| S3IndexerSupervisor::spawn(worker.clone(), max_num_bytes))
             .collect();
         Ok(())
     }

@@ -15,9 +15,13 @@ With `ingest_api.enable_ingesthree` enabled, each indexer node starts
 `quickwit_common::num_cpus()` workers, controlled by `QW_NUM_CPUS`. Without that override,
 the existing CPU detection uses `KUBERNETES_LIMITS_CPU`, then the OS, then a default of 2.
 The worker count must be positive. Each worker requests up to 1,000 files from one index
-incarnation per assignment, within a 100,000,000-byte budget. An oversized first file is
-still assigned for progress. Full-size files therefore generally remain single-file
-assignments. Files in a group are processed one at a time, sharing these node resources
+incarnation per assignment, with a default target of 100,000,000 input bytes. Set
+`QW_INGESTHREE_TARGET_ASSIGNMENT_SIZE` on indexers to override it, for example `1GB`,
+`512MiB`, or an integer byte count. Zero, invalid, unreadable, or values above `INT64_MAX`
+fail worker startup. Restart the service to apply changes. An oversized first file is
+still assigned for progress. File rotation remains independently controlled by
+`QW_INGESTHREE_TARGET_FILE_SIZE`. With both defaults, full-size files generally remain
+single-file assignments. Files in a group are processed one at a time, sharing these node resources
 and `INGEST_V2_SOURCE_ID`. Successful groups are followed immediately by another
 assignment request. Empty assignments back off from
 100 ms to 5 seconds. Each worker restarts independently after errors, panics, or unexpected

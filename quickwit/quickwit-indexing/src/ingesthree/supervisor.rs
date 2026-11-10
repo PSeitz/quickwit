@@ -45,8 +45,11 @@ pub(crate) struct S3IndexerSupervisor {
 }
 
 impl S3IndexerSupervisor {
-    pub fn spawn(worker: S3Indexer) -> Self {
-        Self::supervise(move || run(worker.clone()), SUPERVISOR_METRICS.clone())
+    pub fn spawn(worker: S3Indexer, max_num_bytes: u64) -> Self {
+        Self::supervise(
+            move || run(worker.clone(), max_num_bytes),
+            SUPERVISOR_METRICS.clone(),
+        )
     }
 
     fn supervise<F, Fut>(mut run: F, metrics: SupervisorMetrics) -> Self
@@ -100,14 +103,14 @@ impl Drop for S3IndexerSupervisor {
     }
 }
 
-async fn run(mut worker: S3Indexer) -> anyhow::Result<()> {
+async fn run(mut worker: S3Indexer, max_num_bytes: u64) -> anyhow::Result<()> {
     let mut idle_delay = IDLE_MIN;
     loop {
         // Group files up to the byte budget and the metastore's 1,000-file limit.
         // An oversized first file is still assigned to ensure forward progress.
         let assignment = AssignFilesForIndexing {
             max_num_files: 1_000,
-            max_num_bytes: 100_000_000,
+            max_num_bytes,
             retry_after_secs: 60,
         };
         match worker.index_next(assignment).await? {
@@ -263,8 +266,10 @@ mod tests {
             fingerprinter: None,
         };
         let metrics = SupervisorMetrics::for_test();
-        let supervisor =
-            S3IndexerSupervisor::supervise(move || run(worker.clone()), metrics.clone());
+        let supervisor = S3IndexerSupervisor::supervise(
+            move || run(worker.clone(), 100_000_000),
+            metrics.clone(),
+        );
         tokio::task::yield_now().await;
         assert_eq!(metrics.configured.get(), 1.0);
         assert_eq!(metrics.live.get(), 1.0);
