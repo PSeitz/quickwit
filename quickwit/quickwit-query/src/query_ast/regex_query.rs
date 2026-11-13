@@ -164,13 +164,19 @@ impl BuildTantivyAst for RegexQuery {
     ) -> Result<TantivyQueryAst, InvalidQuery> {
         let resolved = self.to_resolved(context.schema, Some(context.tokenizer_manager))?;
 
-        let regex = tantivy_fst::Regex::new(&resolved.regex).context("failed to parse regex")?;
+        resolved.build_tantivy_ast()
+    }
+}
+
+impl ResolvedRegex {
+    pub(crate) fn build_tantivy_ast(self) -> Result<TantivyQueryAst, InvalidQuery> {
+        let regex = tantivy_fst::Regex::new(&self.regex).context("failed to parse regex")?;
         let regex_automaton_with_path = JsonPathPrefix {
-            prefix: resolved.json_path.unwrap_or_default(),
+            prefix: self.json_path.unwrap_or_default(),
             automaton: regex.into(),
         };
         let regex_query_with_path = AutomatonQuery {
-            field: resolved.field,
+            field: self.field,
             automaton: Arc::new(regex_automaton_with_path),
         };
         Ok(regex_query_with_path.into())

@@ -325,6 +325,24 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
         Ok(())
     }
 
+    fn visit_term_set(&mut self, term_set_query: &'a TermSetQuery) -> Result<(), Self::Err> {
+        // Query construction has already validated the query when requested. Skip invalid
+        // terms here just as the query builder does when validation is disabled.
+        let context = BuildTantivyAstContext {
+            schema: self.schema,
+            tokenizer_manager: self.tokenizer_manager,
+            search_fields: &[],
+            with_validation: false,
+        };
+        for resolved in term_set_query.to_regexes(&context)? {
+            self.add_automaton(
+                resolved.field,
+                Automaton::Regex(resolved.json_path, resolved.regex),
+            );
+        }
+        Ok(())
+    }
+
     fn visit_regex(&mut self, regex_query: &'a RegexQuery) -> Result<(), Self::Err> {
         let resolved = match regex_query.to_resolved(self.schema, Some(self.tokenizer_manager)) {
             Ok(res) => res,
@@ -1137,16 +1155,163 @@ mod test {
         let (_, warmup_info) = build_query(query_with_set, &context, None).unwrap();
         assert!(warmup_info.term_dict_fields.is_empty());
         let desc = schema.get_field("desc").unwrap();
+        assert!(warmup_info.terms_grouped_by_field.is_empty());
         assert_eq!(
-            warmup_info.terms_grouped_by_field,
+            warmup_info.automatons_grouped_by_field,
             HashMap::from([(
                 desc,
-                HashMap::from([(Term::from_field_text(desc, "hello"), false)])
+                HashSet::from([Automaton::Regex(None, "hello".to_string())])
             )])
         );
 
         let (_, warmup_info) = build_query(query_without_set, &context, None).unwrap();
         assert!(warmup_info.term_dict_fields.is_empty());
+    }
+
+    fn term_set_query_for_warmup(fields: &[(&str, &[&str])]) -> QueryAst {
+        quickwit_query::query_ast::TermSetQuery {
+            terms_per_field: fields
+                .iter()
+                .map(|(field, values)| {
+                    (
+                        (*field).to_string(),
+                        values.iter().map(|value| (*value).to_string()).collect(),
+                    )
+                })
+                .collect(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn test_term_set_warmup_escapes_text_and_groups_by_field() {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", STRING);
+        let body = schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+        let context = BuildTantivyAstContext::for_test(&schema);
+        let query = term_set_query_for_warmup(&[("title", &["A.*", "B|C"]), ("body", &["Other"])]);
+
+        let (_, warmup) = build_query(query, &context, None).unwrap();
+        assert!(warmup.terms_grouped_by_field.is_empty());
+        assert!(warmup.term_dict_fields.is_empty());
+        assert!(warmup.term_ranges_grouped_by_field.is_empty());
+        assert_eq!(
+            warmup.automatons_grouped_by_field,
+            HashMap::from([
+                (
+                    title,
+                    HashSet::from([Automaton::Regex(None, r"A\.\*|B\|C".to_string())])
+                ),
+                (
+                    body,
+                    HashSet::from([Automaton::Regex(None, "Other".to_string())])
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_term_set_warmup_keeps_typed_terms_and_isolates_json_paths() {
+        let mut schema_builder = Schema::builder();
+        let count = schema_builder.add_u64_field("count", INDEXED);
+        let payload = schema_builder.add_json_field("payload", STRING);
+        let schema = schema_builder.build();
+        let context = BuildTantivyAstContext::for_test(&schema);
+        let query = term_set_query_for_warmup(&[
+            ("count", &["42"]),
+            ("payload.nested.value", &["-7", "true"]),
+            ("payload.nested.other", &["Other.*"]),
+        ]);
+
+        let (_, warmup) = build_query(query, &context, None).unwrap();
+        let value_path = Term::from_field_json_path(payload, "nested.value", false);
+        let mut number = value_path.clone();
+        number.append_type_and_fast_value(-7i64);
+        let mut boolean = value_path.clone();
+        boolean.append_type_and_fast_value(true);
+        assert_eq!(
+            warmup.terms_grouped_by_field,
+            HashMap::from([
+                (
+                    count,
+                    HashMap::from([(Term::from_field_u64(count, 42), false)])
+                ),
+                (payload, HashMap::from([(number, false), (boolean, false)])),
+            ])
+        );
+
+        let mut value_prefix = value_path;
+        value_prefix.append_type_and_str("");
+        let mut other_prefix = Term::from_field_json_path(payload, "nested.other", false);
+        other_prefix.append_type_and_str("");
+        assert_eq!(
+            warmup.automatons_grouped_by_field,
+            HashMap::from([(
+                payload,
+                HashSet::from([
+                    Automaton::Regex(
+                        Some(value_prefix.value().as_serialized()[1..].to_vec()),
+                        r"\-7|true".to_string(),
+                    ),
+                    Automaton::Regex(
+                        Some(other_prefix.value().as_serialized()[1..].to_vec()),
+                        r"Other\.\*".to_string(),
+                    ),
+                ])
+            )])
+        );
+        assert!(warmup.term_dict_fields.is_empty());
+        assert!(warmup.term_ranges_grouped_by_field.is_empty());
+    }
+
+    #[test]
+    fn test_term_set_warmup_with_fast_only_field_uses_no_regex() {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", STRING);
+        schema_builder.add_u64_field("count", FAST);
+        let schema = schema_builder.build();
+        let context = BuildTantivyAstContext::for_test(&schema);
+
+        for fields in [
+            vec![("count", &["42"][..])],
+            vec![("count", &["42"][..]), ("title", &["A.*"][..])],
+        ] {
+            let query = term_set_query_for_warmup(&fields);
+            let (_, warmup) = build_query(query, &context, None).unwrap();
+            assert!(warmup.automatons_grouped_by_field.is_empty());
+            assert_eq!(warmup.fast_fields, expected_fast_fields(&["count"]));
+            let expected_terms = if fields.len() == 1 {
+                HashMap::new()
+            } else {
+                HashMap::from([(
+                    title,
+                    HashMap::from([(Term::from_field_text(title, "A.*"), false)]),
+                )])
+            };
+            assert_eq!(warmup.terms_grouped_by_field, expected_terms);
+        }
+    }
+
+    #[test]
+    fn test_term_set_warmup_skips_missing_fields_without_validation() {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", STRING);
+        let schema = schema_builder.build();
+        let mut context = BuildTantivyAstContext::for_test(&schema);
+        let query = term_set_query_for_warmup(&[("title", &["hello"]), ("missing", &["ignored"])]);
+        assert!(build_query(query.clone(), &context, None).is_err());
+
+        context.with_validation = false;
+        let (_, warmup) = build_query(query, &context, None).unwrap();
+        assert!(warmup.terms_grouped_by_field.is_empty());
+        assert_eq!(
+            warmup.automatons_grouped_by_field,
+            HashMap::from([(
+                title,
+                HashSet::from([Automaton::Regex(None, "hello".to_string())])
+            )])
+        );
     }
 
     #[test]
