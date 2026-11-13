@@ -91,41 +91,57 @@ async fn test_single_node_termset() -> anyhow::Result<()> {
             field_mappings:
               - name: title
                 type: text
-              - name: body
-                type: text
-              - name: url
-                type: text
-              - name: binary
-                type: bytes
+                tokenizer: raw
+              - name: payload
+                type: json
+                tokenizer: raw
+              - name: counter
+                type: u64
         "#;
-    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &["body"]).await?;
-    let docs = vec![
-        json!({"title": "snoopy", "body": "Snoopy is an anthropomorphic beagle[5] in the comic strip...", "url": "http://snoopy", "binary": "dGhpcyBpcyBhIHRlc3Qu"}),
-        json!({"title": "beagle", "body": "The beagle is a breed of small scent hound, similar in appearance to the much larger foxhound.", "url": "http://beagle", "binary": "bWFkZSB5b3UgbG9vay4="}),
-    ];
-    test_sandbox.add_documents(docs.clone()).await?;
-    let search_request = SearchRequest {
-        index_id_patterns: vec![index_id.to_string()],
-        query_ast: qast_json_helper("title: IN [beagle]", &[]),
-        start_timestamp: None,
-        end_timestamp: None,
-        max_hits: 2,
-        start_offset: 0,
-        ..Default::default()
-    };
-    let single_node_result = single_node_search(
-        search_request,
-        test_sandbox.metastore(),
-        test_sandbox.storage_resolver(),
-    )
-    .await?;
-    assert_eq!(single_node_result.num_hits, 1);
-    assert_eq!(single_node_result.hits.len(), 1);
-    let hit_json: JsonValue = serde_json::from_str(&single_node_result.hits[0].json)?;
-    let expected_json: JsonValue = json!({"title": "beagle", "body": "The beagle is a breed of small scent hound, similar in appearance to the much larger foxhound.", "url": "http://beagle", "binary": "bWFkZSB5b3UgbG9vay4="});
-    assert_json_include!(actual: hit_json, expected: expected_json);
-    assert!(single_node_result.elapsed_time_micros > 10);
-    assert!(single_node_result.elapsed_time_micros < 1_000_000);
+    let test_sandbox = TestSandbox::create(index_id, doc_mapping_yaml, "{}", &[]).await?;
+    test_sandbox
+        .add_documents(vec![
+            json!({"title": "a.b", "payload": {"left": "a.b"}, "counter": 1}),
+            json!({"title": "axb", "payload": {"left": "axb", "right": "a.b"}, "counter": 2}),
+            json!({"title": "x|y", "payload": {"left": "x|y"}, "counter": 3}),
+            json!({"title": "wrong-path", "payload": {"right": "x|y"}, "counter": 4}),
+            json!({"title": "typed", "payload": {"left": 42}, "counter": 42}),
+            json!({"title": "string", "payload": {"left": "42"}, "counter": 5}),
+        ])
+        .await?;
+    for (query, expected_titles) in [
+        (r#"title: IN ["a.b" "x|y"]"#, &["a.b", "x|y"][..]),
+        (r#"payload.left: IN ["a.b" "x|y"]"#, &["a.b", "x|y"][..]),
+        ("payload.left: IN [42]", &["string", "typed"][..]),
+        ("counter: IN [42]", &["typed"][..]),
+        ("payload.left: IN [missing]", &[][..]),
+    ] {
+        let search_request = SearchRequest {
+            index_id_patterns: vec![index_id.to_string()],
+            query_ast: qast_json_helper(query, &[]),
+            max_hits: 10,
+            ..Default::default()
+        };
+        let result = single_node_search(
+            search_request,
+            test_sandbox.metastore(),
+            test_sandbox.storage_resolver(),
+        )
+        .await?;
+        assert!(
+            result.failed_splits.is_empty(),
+            "{query}: {:?}",
+            result.failed_splits
+        );
+        assert_eq!(result.num_hits, expected_titles.len() as u64, "{query}");
+        let mut titles = Vec::new();
+        for hit in result.hits {
+            let document: JsonValue = serde_json::from_str(&hit.json)?;
+            titles.push(document["title"].as_str().unwrap().to_string());
+        }
+        titles.sort();
+        assert_eq!(titles, expected_titles, "{query}");
+    }
     test_sandbox.assert_quit().await;
     Ok(())
 }

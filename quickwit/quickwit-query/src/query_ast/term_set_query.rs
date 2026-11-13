@@ -85,32 +85,23 @@ impl TermSetQuery {
         let mut text_terms = BTreeMap::new();
         let mut other_terms = Vec::new();
         for term in self.make_term_iterator(context)? {
-            let bytes = term.serialized_value_bytes();
-            let (json_path, text_bytes) = if term.typ() == Type::Str {
-                (None, bytes)
-            } else if term.value().json_path_type() == Some(Type::Str) {
-                // JSON dictionary keys start with the path, a NUL terminator and a type byte.
-                let prefix_len = bytes
-                    .iter()
-                    .position(|&byte| byte == 0)
-                    .expect("JSON string terms have a path terminator")
-                    + 2;
-                (Some(bytes[..prefix_len].to_vec()), &bytes[prefix_len..])
-            } else {
+            if term.typ() != Type::Str && term.value().json_path_type() != Some(Type::Str) {
                 other_terms.push(term);
                 continue;
-            };
-            let text = std::str::from_utf8(text_bytes).expect("text terms contain valid UTF-8");
+            }
+            // Match the full dictionary key, including the path and type for JSON terms.
+            let text = std::str::from_utf8(term.serialized_value_bytes())
+                .expect("string dictionary keys contain valid UTF-8");
             text_terms
-                .entry((term.field(), json_path))
+                .entry(term.field())
                 .or_insert_with(BTreeSet::new)
                 .insert(regex::escape(text));
         }
         let regexes = text_terms
             .into_iter()
-            .map(|((field, json_path), terms)| ResolvedRegex {
+            .map(|(field, terms)| ResolvedRegex {
                 field,
-                json_path,
+                json_path: None,
                 // FST regexes match entire terms. Keep TermQuery's case-sensitive matching.
                 regex: terms.into_iter().collect::<Vec<_>>().join("|"),
             })
