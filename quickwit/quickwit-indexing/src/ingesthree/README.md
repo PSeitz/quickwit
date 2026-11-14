@@ -22,9 +22,10 @@ fail worker startup. Restart the service to apply changes. The batch includes th
 that reaches or crosses the target, including an oversized first file. File rotation
 remains independently controlled by `QW_INGESTHREE_TARGET_UPLOAD_SIZE`.
 
-Reassignment uses `ceil(configured batch bytes / 3,000,000)` seconds, assuming 3 MB/s:
-34 seconds for `100MB`, 167 seconds for `500MB`. The result is limited to the protocol's
-1–4294967295 second range. The configured target determines this interval even when the
+Reassignment uses `max(120, ceil(configured batch bytes / 3,000,000))` seconds, assuming
+3 MB/s with a two-minute minimum: 120 seconds for `100MB`, 167 seconds for `500MB`.
+The result is capped at the protocol's 4294967295-second limit. The configured target
+determines this interval even when the
 assigned bytes overshoot it. There is no additional allowance or renewal while working.
 
 The metastore claims a same-index batch only when its bytes reach the target or its

@@ -346,8 +346,9 @@ QW_INGESTHREE_INDEXER_MAX_WAIT_SECS=15
 
 Metastores must support the added `max_wait_secs` protocol field to enforce waiting;
 older metastores ignore it. The reassignment interval is the configured indexing batch size
-divided by 3,000,000 bytes/second, rounded up and limited to 1–4294967295 seconds. This gives
-34 seconds for `100MB` and 167 seconds for `500MB`. It uses the configured target even when
+divided by 3,000,000 bytes/second, rounded up, with a two-minute minimum and the protocol's
+4294967295-second maximum. This gives 120 seconds for `100MB` and 167 seconds for `500MB`.
+It uses the configured target even when
 assigned bytes overshoot it, with no additional allowance or renewal. Another worker can
 claim unfinished inputs when their processing-start age exceeds this interval.
 

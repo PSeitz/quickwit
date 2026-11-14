@@ -105,8 +105,10 @@ impl Drop for S3IndexerSupervisor {
 
 /// Seconds before retry, assuming 3 MB/s for the configured assignment target.
 fn retry_after_secs(max_num_bytes: u64) -> u32 {
-    // Round up and keep the result within the protocol's positive u32 range.
-    max_num_bytes.div_ceil(3_000_000).clamp(1, u32::MAX as u64) as u32
+    // Round up, allow at least two minutes, and cap at the protocol's u32 limit.
+    max_num_bytes
+        .div_ceil(3_000_000)
+        .clamp(120, u32::MAX as u64) as u32
 }
 
 async fn run(mut worker: S3Indexer, max_num_bytes: u64, max_wait_secs: u32) -> anyhow::Result<()> {
@@ -147,10 +149,11 @@ mod tests {
     #[test]
     fn test_retry_after_secs_from_assignment_target() {
         for (max_num_bytes, expected_secs) in [
-            (1, 1),
-            (3_000_000, 1),
-            (3_000_001, 2),
-            (100_000_000, 34),
+            (1, 120),
+            (100_000_000, 120),
+            (359_999_999, 120),
+            (360_000_000, 120),
+            (360_000_001, 121),
             (500_000_000, 167),
             (3_000_000_000, 1_000),
             (u32::MAX as u64 * 3_000_000, u32::MAX),
@@ -277,7 +280,7 @@ mod tests {
             .expect_assign_files_for_indexing()
             .returning(move |request| {
                 assert_eq!(request.max_num_bytes, 100_000_000);
-                assert_eq!(request.retry_after_secs, 34);
+                assert_eq!(request.retry_after_secs, 120);
                 assert_eq!(request.max_wait_secs, 15);
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(Default::default())
