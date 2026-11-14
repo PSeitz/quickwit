@@ -143,31 +143,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oversized_file_blocks_downloads_until_indexing_takes_it() {
-        let budget = Arc::new(DownloadBudget::default());
-        let oversized = budget.reserve(DOWNLOAD_TARGET_BYTES + 1).await;
-        let next = budget.reserve(1);
-        tokio::pin!(next);
-        assert!(futures::poll!(&mut next).is_pending());
-        drop(oversized);
-        let _next = next.await;
-        assert_eq!(budget.bytes.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
     async fn test_indexing_owns_active_input_outside_download_budget() {
         let budget = Arc::new(DownloadBudget::default());
         let file = DownloadedFile {
             contents: OwnedBytes::new(vec![1, 2, 3]),
-            reservation: budget.reserve(3).await,
+            reservation: budget.reserve(DOWNLOAD_TARGET_BYTES + 1).await,
         };
+        let next = budget.reserve(1);
+        tokio::pin!(next);
+        assert!(futures::poll!(&mut next).is_pending());
         let contents = file.into_contents();
         assert_eq!(budget.bytes.load(Ordering::Relaxed), 0);
-        assert_eq!(contents.as_slice(), &[1, 2, 3]);
         let queued = DownloadedFile {
             contents: OwnedBytes::new(vec![4]),
-            reservation: budget.reserve(1).await,
+            reservation: next.await,
         };
+        assert_eq!(budget.bytes.load(Ordering::Relaxed), 1);
+        assert_eq!(contents.as_slice(), &[1, 2, 3]);
         drop(queued);
         assert_eq!(budget.bytes.load(Ordering::Relaxed), 0);
     }

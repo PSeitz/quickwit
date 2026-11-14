@@ -223,7 +223,7 @@ impl S3Indexer {
         uploaded: &mut Vec<SplitMetadata>,
     ) -> anyhow::Result<()> {
         for PreparedSplit {
-            packaged,
+            scratch_directory,
             metadata,
             payload,
         } in prepared
@@ -238,7 +238,7 @@ impl S3Indexer {
                 let error = match split_store
                     .store_split(
                         &metadata,
-                        packaged.split_scratch_directory.path(),
+                        scratch_directory.path(),
                         Box::new(payload.clone()),
                     )
                     .await

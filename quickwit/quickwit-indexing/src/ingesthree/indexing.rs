@@ -38,11 +38,11 @@ use crate::actors::{
 };
 use crate::docs_clustering::Fingerprinter;
 use crate::merge_policy::MergePolicy;
-use crate::models::{IndexedSplit, IndexedSplitBuilder, PackagedSplit, ProcessedDoc};
+use crate::models::{IndexedSplit, IndexedSplitBuilder, ProcessedDoc};
 
-/// Keeps packaged files and their upload metadata alive until async upload completes.
+/// Owns the scratch directory so payload files survive until upload and retries finish.
 pub(super) struct PreparedSplit {
-    pub packaged: PackagedSplit,
+    pub scratch_directory: TempDirectory,
     pub metadata: SplitMetadata,
     pub payload: SplitPayload,
 }
@@ -237,7 +237,7 @@ impl SplitBuilders {
             let _guard = io_controls.check_if_alive()?;
             let (metadata, payload) = prepare_split_for_upload(&packaged, merge_policy, retention)?;
             prepared.push(PreparedSplit {
-                packaged,
+                scratch_directory: packaged.split_scratch_directory,
                 metadata,
                 payload,
             });
@@ -287,6 +287,7 @@ mod tests {
 
     use quickwit_config::DocsClusteringConfig;
     use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
+    use quickwit_storage::PutPayload;
 
     use super::*;
     use crate::ingesthree::run_indexing;
@@ -400,6 +401,27 @@ mod tests {
             )])
             .unwrap();
         builders
+    }
+
+    #[tokio::test]
+    async fn test_prepared_split_keeps_payload_files_alive() {
+        let mut builders = builders_for_test(TempDirectory::for_test(), Gauge::local());
+        let merge_policy = crate::merge_policy::merge_policy_from_settings(&builders.settings);
+        let mut prepared = Vec::new();
+        builders
+            .prepare_splits(&merge_policy, None, &mut prepared)
+            .unwrap();
+        drop(builders);
+        let prepared = prepared.pop().unwrap();
+        let path = prepared.scratch_directory.path().to_path_buf();
+        assert!(path.try_exists().unwrap());
+        let contents = prepared.payload.read_all().await.unwrap();
+        // Upload retries clone the payload and reopen its files.
+        let retry_payload = prepared.payload.clone();
+        let retry_contents = retry_payload.read_all().await.unwrap();
+        assert_eq!(contents.as_slice(), retry_contents.as_slice());
+        drop(prepared);
+        assert!(!path.try_exists().unwrap());
     }
 
     #[tokio::test]

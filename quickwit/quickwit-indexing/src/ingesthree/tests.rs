@@ -206,9 +206,11 @@ fn assert_publication_counters(counters: &[Counter; 4], splits: &[SplitMetadata]
 #[tokio::test]
 async fn test_files_publish_searchable_splits_and_completion_together() {
     let mut config = IndexConfig::for_test("files", "ram:///splits");
+    config.indexing_settings.split_num_docs_target = 100;
     config.indexing_settings.resources.heap_size = bytesize::ByteSize::mb(100);
     let mapping_uid = config.doc_mapping.doc_mapping_uid;
     let (mut worker, index_uid) = setup(config).await;
+    let memory_flushes = memory_flush_counter(&worker, &index_uid);
     let counters = publication_counters(&worker, &index_uid);
     assert_publication_counters(&counters, &[]);
     let active_assignments = Gauge::local();
@@ -219,8 +221,11 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
             request
         }))
         .build(worker.metastore);
-    let first = register_file(&mut worker, &index_uid, &[DOC, "not JSON"]).await;
-    let second = register_file(&mut worker, &index_uid, &[DOC_LATER]).await;
+    // Cross document batches and input files without flushing at the document target.
+    let mut docs = vec![DOC; 300];
+    docs.push("not JSON");
+    let first = register_file(&mut worker, &index_uid, &docs).await;
+    let second = register_file(&mut worker, &index_uid, &[DOC_LATER; 300]).await;
     let delete_opstamp = worker
         .metastore
         .create_delete_task(DeleteQuery {
@@ -241,8 +246,9 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
     assert!(result.published);
     assert_eq!(result.index_uid, index_uid);
     assert_eq!(result.splits.len(), 1);
+    assert_eq!(memory_flushes.get(), 0);
     let split = &result.splits[0];
-    assert_eq!(split.num_docs, 2);
+    assert_eq!(split.num_docs, 600);
     assert_eq!(split.doc_mapping_uid, mapping_uid);
     assert_eq!(split.delete_opstamp, delete_opstamp);
     assert_eq!(split.time_range, Some(1704067200..=1704067202));
@@ -252,6 +258,7 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
     let first = read_file(&mut worker, &first).await;
     let second = read_file(&mut worker, &second).await;
     assert!(first.completed_timestamp.is_some());
+    assert!(second.completed_timestamp.is_some());
     assert_eq!(first.publication_id, second.publication_id);
     assert!(first.publication_id.is_some());
     assert_eq!(
@@ -282,71 +289,13 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
     let directory = get_tantivy_directory_from_split_bundle(&path).unwrap();
     let index = tantivy::Index::open(directory).unwrap();
     let reader = index.reader().unwrap();
-    assert_eq!(reader.searcher().search(&AllQuery, &Count).unwrap(), 2);
+    assert_eq!(reader.searcher().search(&AllQuery, &Count).unwrap(), 600);
     let inputs = worker
         .storage_resolver
         .resolve(&Uri::for_test("ram:///inputs"))
         .await
         .unwrap();
     assert!(inputs.exists(Path::new(&first.file_id)).await.unwrap());
-}
-
-#[tokio::test]
-async fn test_batch_task_ignores_document_target() {
-    let mut config = IndexConfig::for_test("batch", "ram:///splits");
-    config.indexing_settings.split_num_docs_target = 100;
-    config.indexing_settings.resources.heap_size = bytesize::ByteSize::mb(100);
-    let (mut worker, index_uid) = setup(config).await;
-    let memory_flushes = memory_flush_counter(&worker, &index_uid);
-    let mut inputs = Vec::new();
-    for _ in 0..3 {
-        inputs.push(register_file(&mut worker, &index_uid, &[DOC; 300]).await);
-    }
-    let result = worker.index_next(assignment()).await.unwrap().unwrap();
-    assert!(result.published);
-    assert_eq!(result.splits.len(), 1);
-    assert_eq!(memory_flushes.get(), 0);
-    assert_eq!(
-        result
-            .splits
-            .iter()
-            .map(|split| split.num_docs)
-            .sum::<usize>(),
-        900
-    );
-    for input in &inputs {
-        assert!(
-            read_file(&mut worker, input)
-                .await
-                .completed_timestamp
-                .is_some()
-        );
-    }
-    let storage = worker
-        .storage_resolver
-        .resolve(&Uri::for_test("ram:///splits"))
-        .await
-        .unwrap();
-    let mut searchable_docs = 0;
-    for split in &result.splits {
-        let filename = split_file(&split.split_id);
-        let path = worker.scratch_directory.path().join(&filename);
-        storage
-            .copy_to_file(Path::new(&filename), &path)
-            .await
-            .unwrap();
-        let directory = get_tantivy_directory_from_split_bundle(&path).unwrap();
-        let index = tantivy::Index::open(directory).unwrap();
-        let reader = index.reader().unwrap();
-        searchable_docs += reader.searcher().search(&AllQuery, &Count).unwrap();
-    }
-    assert_eq!(searchable_docs, 900);
-    assert!(
-        list_splits(&mut worker, &index_uid)
-            .await
-            .iter()
-            .all(|split| split.split_state == SplitState::Published)
-    );
 }
 
 #[tokio::test]

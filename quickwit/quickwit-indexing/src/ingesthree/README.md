@@ -89,9 +89,10 @@ Thus input memory includes the ~100 MB download queue, up to one file of oversho
 active input file. These buffers are additional to writer memory and are outside its heap
 flush threshold and writer-memory gauge. Indexing failure cancels outstanding downloads.
 Download errors follow already queued inputs and fail the assignment before staging or
-publication. Packaged files still use scratch disk. Their metadata
-and hotcache payloads accumulate until the assignment task returns, increasing per-assignment
-scratch and packaging-memory needs. A corrupt input fails the task before any output is staged
+publication. Packaged files still use scratch disk. Prepared outputs retain their scratch-directory
+owner, split metadata, and upload payload. Packaging copies of hotcache bytes, serialized fields,
+and tags are released after preparing the payload. Metadata and hotcache bytes in the payload
+still accumulate until upload, increasing per-assignment scratch and packaging-memory needs. A corrupt input fails the task before any output is staged
 or uploaded. Serialization concurrency follows worker count. The shared upload
 semaphore limits staging/uploads, rather than serialization. The mapper and delete opstamp
 stay fixed across the group. Files contain JSON without source-format/transform
