@@ -31,6 +31,7 @@ use quickwit_metrics::{Counter, Gauge, GaugeGuard, counter};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_storage::{OwnedBytes, SplitPayload};
 
+use super::downloads::DownloadedFile;
 use super::metrics::MEMORY_FLUSHES;
 use crate::actors::{
     DocumentConverter, OTHER_PARTITION_ID, create_packaged_split, prepare_split_for_upload,
@@ -177,18 +178,19 @@ impl SplitBuilders {
         Ok(())
     }
 
-    /// Processes the assignment synchronously, preserving partially filled builders across files.
+    /// Processes the assignment on the blocking runtime, yielding only while waiting for input.
     /// Owns downloaded input buffers and releases each one after processing it.
     /// Flushes serialize to scratch here. Uploads happen after the entire assignment is consumed.
-    pub fn index_files(
+    pub async fn index_files(
         &mut self,
-        files: Vec<OwnedBytes>,
+        mut files: tokio::sync::mpsc::UnboundedReceiver<anyhow::Result<DownloadedFile>>,
         merge_policy: &Arc<dyn MergePolicy>,
         retention: Option<&RetentionPolicy>,
     ) -> anyhow::Result<Vec<PreparedSplit>> {
         let mut prepared = Vec::new();
-        for contents in files {
+        while let Some(file) = files.recv().await {
             let _guard = self.io_controls.check_if_alive()?;
+            let contents = file?.into_contents();
             let num_bytes = contents.len() as u64;
             let mut reader = DocumentFileReader::new(
                 Cursor::new(contents),
@@ -400,6 +402,32 @@ mod tests {
         builders
     }
 
+    #[tokio::test]
+    async fn test_indexing_yields_for_input_and_preserves_download_error() {
+        let writer_memory = Gauge::local();
+        let mut builders = builders_for_test(TempDirectory::for_test(), writer_memory.clone());
+        let merge_policy = crate::merge_policy::merge_policy_from_settings(&builders.settings);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let indexing = builders.index_files(receiver, &merge_policy, None);
+            tokio::pin!(indexing);
+            assert!(futures::poll!(&mut indexing).is_pending());
+            // Existing writer data must not become successful output when a later GET fails.
+            assert!(writer_memory.get() > 0.0);
+            assert!(
+                sender
+                    .send(Err(anyhow::anyhow!("injected download error")))
+                    .is_ok()
+            );
+            assert!(
+                matches!(indexing.await, Err(error) if error.to_string() == "injected download error")
+            );
+        }
+        drop(builders);
+        assert_eq!(writer_memory.get(), 0.0);
+        assert!(sender.is_closed());
+    }
+
     #[test]
     fn test_writer_memory_released_on_serialization_error() {
         let writer_memory = Gauge::local();
@@ -421,7 +449,7 @@ mod tests {
             let builders = builders_for_test(directory.clone(), writer_memory.clone());
             assert!(writer_memory.get() > 0.0);
             let assignment = Arc::new(GaugeGuard::new(&active_assignments, 1.0));
-            let result: anyhow::Result<()> = run_indexing(directory, assignment, move || {
+            let result: anyhow::Result<()> = run_indexing(directory, assignment, async move {
                 let _builders = builders;
                 if panic {
                     panic!("injected blocking panic");
@@ -451,7 +479,7 @@ mod tests {
         assert!(expected_bytes > 0.0);
         let active_assignments = Gauge::local();
         let assignment = Arc::new(GaugeGuard::new(&active_assignments, 1.0));
-        let task = tokio::spawn(run_indexing(directory, assignment, move || {
+        let task = tokio::spawn(run_indexing(directory, assignment, async move {
             started.send(()).unwrap();
             wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(work_path.try_exists().unwrap());

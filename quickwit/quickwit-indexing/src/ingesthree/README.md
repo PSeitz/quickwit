@@ -55,13 +55,14 @@ classification. Exhaustion follows the existing worker restart path. Retry and r
 logs include the full error chain. The assignment's 60-second retry eligibility is unchanged,
 so another worker can claim the inputs while an upload is still retrying.
 
-There are no stage actors or stage channels. One blocking-runtime task creates the scratch
-directory and builders, including the mapper. All files in the assignment are downloaded
-into owned memory buffers before one blocking-runtime task processes the entire assignment:
-incremental decoding, document conversion/insertion, serialization, and packaging. Input
-buffers are passed directly to the task, with no local input files. Internal document
-batches preserve the heap flush checks without dispatching another task per file
-or document batch. Storage/metastore calls remain async.
+There are no stage actors. One blocking-runtime task creates the scratch directory and
+builders, including the mapper. A sequential async downloader feeds whole input files through
+a channel to one indexing task on the blocking runtime. Downloading overlaps incremental
+decoding, document conversion/insertion, serialization, and packaging. The indexing task
+yields while waiting for the next file, leaving runtime threads available for other work.
+Input buffers are passed directly to the task, with no local input files or cross-chunk
+decoding. Internal document batches preserve the heap flush checks without dispatching
+another task per file or document batch. Storage/metastore calls remain async.
 Running synchronous work retains the scratch root after caller cancellation and checks a
 kill switch before read batches, between documents, and during serialization. Synchronous
 work may finish its current operation before releasing the directory.
@@ -72,11 +73,17 @@ and at group end. `split_num_docs_target` affects merge maturity, rather than tr
 an indexing flush. All splits remain unpublished until every input has been processed.
 Flushed splits are serialized to scratch within the assignment task and uploaded after
 every assigned file is consumed.
-Partially filled builders carry across inputs and flush at group end. Each input buffer is
-released after processing that input. At download completion, each worker holds the entire
-uncompressed assignment in memory. The assignment byte target is soft and permits an
-oversized input. These buffers are additional to writer memory and are outside its heap
-flush threshold and writer-memory gauge. Packaged files still use scratch disk. Their metadata
+Partially filled builders carry across inputs and flush at group end. Each worker admits a
+new download while its downloading and queued files total less than 100,000,000 registered
+bytes. The admitted file may cross that target, including a single oversized file. Admission
+happens before the GET, and the full response is consumed without waiting for indexing.
+Once indexing takes a file, its reservation is released so downloading can continue. That
+active input is separate from the download budget and its buffer is released after processing.
+Thus input memory includes the ~100 MB download queue, up to one file of overshoot, and the
+active input file. These buffers are additional to writer memory and are outside its heap
+flush threshold and writer-memory gauge. Indexing failure cancels outstanding downloads.
+Download errors follow already queued inputs and fail the assignment before staging or
+publication. Packaged files still use scratch disk. Their metadata
 and hotcache payloads accumulate until the assignment task returns, increasing per-assignment
 scratch and packaging-memory needs. A corrupt input fails the task before any output is staged
 or uploaded. Serialization concurrency follows worker count. The shared upload

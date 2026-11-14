@@ -16,6 +16,7 @@
 //! The indexing service owns polling and supervision. Standalone compactors discover published
 //! splits in the metastore.
 
+mod downloads;
 mod indexing;
 mod metrics;
 mod supervisor;
@@ -33,6 +34,7 @@ use quickwit_common::io::{IoControls, Limiter};
 use quickwit_common::retry::Retryable;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
+#[cfg(test)]
 use quickwit_common::uri::Uri;
 use quickwit_metastore::{IndexMetadataResponseExt, SplitMetadata, StageSplitsRequestExt};
 use quickwit_metrics::{Gauge, GaugeGuard};
@@ -160,7 +162,7 @@ impl S3Indexer {
         let (directory, mut builders) = run_indexing(
             scratch_directory.clone(),
             active_assignment.clone(),
-            move || {
+            async move {
                 let directory = scratch_directory.named_temp_child("files-")?;
                 let builders = SplitBuilders::new(
                     config,
@@ -174,27 +176,16 @@ impl S3Indexer {
             },
         )
         .await?;
-        // Download the entire assignment into memory before dispatching its indexing task.
-        let mut downloaded_files = Vec::with_capacity(files.len());
-        for file in &files {
-            let uri: Uri = file.file_uri.parse()?;
-            let storage = self
-                .storage_resolver
-                .resolve(&uri.parent().context("input URI has no parent")?)
-                .await?;
-            let contents = storage
-                .get_all(uri.file_name().context("input URI has no filename")?)
-                .await?;
-            ensure!(
-                contents.len() as u64 == file.num_bytes,
-                "downloaded input size differs from registration"
-            );
-            downloaded_files.push(contents);
-        }
-        let prepared = run_indexing(directory.clone(), active_assignment.clone(), move || {
-            builders.index_files(downloaded_files, &merge_policy, retention.as_ref())
-        })
-        .await?;
+        // Bytes are admitted before each GET. The indexing task yields while waiting for input.
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let downloading = downloads::download_files(&files, &self.storage_resolver, sender);
+        let indexing = run_indexing(directory.clone(), active_assignment.clone(), async move {
+            builders
+                .index_files(receiver, &merge_policy, retention.as_ref())
+                .await
+        });
+        let ((), prepared) = tokio::join!(downloading, indexing);
+        let prepared = prepared?;
         let mut splits = Vec::new();
         self.upload_splits(prepared, &split_store, &mut splits)
             .await?;
@@ -281,7 +272,7 @@ impl S3Indexer {
 async fn run_indexing<T: Send + 'static>(
     directory: TempDirectory,
     active_assignment: Arc<GaugeGuard>,
-    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    work: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
 ) -> anyhow::Result<T> {
     RuntimeType::Blocking
         .get_runtime_handle()
@@ -289,7 +280,7 @@ async fn run_indexing<T: Send + 'static>(
             async move {
                 let _directory = directory;
                 let _assignment = active_assignment;
-                work()
+                work.await
             }
             .in_current_span(),
         )
