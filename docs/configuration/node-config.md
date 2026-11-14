@@ -328,7 +328,8 @@ and at most `INT64_MAX` bytes. Invalid or unreadable values fail worker startup 
 workers are spawned. Restart the service to apply changes. Each assignment groups at
 most 1,000 files from one index incarnation and includes the file that reaches or
 crosses the byte target. This setting is independent of file rotation and queue memory
-limits. All assigned files download before one task indexes the group.
+limits. Whole-file downloads overlap indexing with a 100 MB per-worker download admission
+target, allowing one file of overshoot. The active indexing input is separate.
 
 Set `QW_INGESTHREE_INDEXER_MAX_WAIT_SECS` to control how long an underfilled batch waits
 since its oldest eligible file's metastore registration (default `15` seconds). It accepts
@@ -344,8 +345,11 @@ QW_INGESTHREE_INDEXER_MAX_WAIT_SECS=15
 ```
 
 Metastores must support the added `max_wait_secs` protocol field to enforce waiting;
-older metastores ignore it. The existing 60-second reassignment timeout is unchanged,
-so larger groups can cause concurrent retries if processing exceeds that interval.
+older metastores ignore it. The reassignment interval is the configured indexing batch size
+divided by 3,000,000 bytes/second, rounded up and limited to 1–4294967295 seconds. This gives
+34 seconds for `100MB` and 167 seconds for `500MB`. It uses the configured target even when
+assigned bytes overshoot it, with no additional allowance or renewal. Another worker can
+claim unfinished inputs when their processing-start age exceeds this interval.
 
 This path supports JSON ingest sources without a source transform and Auto commits.
 Force, WaitFor, and legacy ingest requests are rejected. Acknowledgment means local

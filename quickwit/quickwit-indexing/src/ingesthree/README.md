@@ -22,6 +22,11 @@ fail worker startup. Restart the service to apply changes. The batch includes th
 that reaches or crosses the target, including an oversized first file. File rotation
 remains independently controlled by `QW_INGESTHREE_TARGET_UPLOAD_SIZE`.
 
+Reassignment uses `ceil(configured batch bytes / 3,000,000)` seconds, assuming 3 MB/s:
+34 seconds for `100MB`, 167 seconds for `500MB`. The result is limited to the protocol's
+1–4294967295 second range. The configured target determines this interval even when the
+assigned bytes overshoot it. There is no additional allowance or renewal while working.
+
 The metastore claims a same-index batch only when its bytes reach the target or its
 oldest eligible file has waited `QW_INGESTHREE_INDEXER_MAX_WAIT_SECS` since registration
 (default `15`). This setting accepts an integer from `0` through `4294967295` seconds;
@@ -52,8 +57,8 @@ after 1 and 2 seconds, retaining the packaged files and split ID. Authorization 
 not-found storage errors, and local cache/cleanup errors, fail immediately. Other storage
 errors receive these retries even when the backend does not retain a precise transient
 classification. Exhaustion follows the existing worker restart path. Retry and restart
-logs include the full error chain. The assignment's 60-second retry eligibility is unchanged,
-so another worker can claim the inputs while an upload is still retrying.
+logs include the full error chain. Another worker can claim the inputs when the
+size-based reassignment interval expires, including while an upload is still retrying.
 
 There are no stage actors. One blocking-runtime task creates the scratch directory and
 builders, including the mapper. A sequential async downloader feeds whole input files through
