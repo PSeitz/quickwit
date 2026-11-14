@@ -217,35 +217,6 @@ async fn test_writer_loop_finishes_expired_files() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_idle_file_is_finished_at_creation_deadline_without_releasing_disk_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let queue = WriteQueue::open(dir.path().to_path_buf(), BUDGET, BUDGET, None)
-        .await
-        .unwrap();
-    let first_id = queue
-        .append(index(1), batch(), None)
-        .await
-        .unwrap()
-        .file_id
-        .unwrap();
-    let open_path = input_path(dir.path(), first_id, "open");
-    let finished_path = open_path.with_extension("finished");
-    let original = fs::read(&open_path).unwrap();
-    let retained = byte_usage(&queue);
-    advance(Duration::from_secs(9)).await;
-    assert!(open_path.try_exists().unwrap());
-    assert!(!finished_path.try_exists().unwrap());
-    advance(Duration::from_secs(1)).await;
-    wait_for_finished_file(&finished_path).await;
-    assert!(!open_path.try_exists().unwrap());
-    assert_eq!(fs::read(&finished_path).unwrap(), original);
-    assert_eq!(byte_usage(&queue), retained);
-    let files = queue.finish().await.unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].file_id, first_id);
-}
-
-#[tokio::test(start_paused = true)]
 async fn test_continuous_appends_do_not_extend_the_creation_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let queue = WriteQueue::open(dir.path().to_path_buf(), BUDGET, BUDGET, None)
@@ -292,6 +263,9 @@ async fn test_index_deadlines_are_independent_and_timer_restarts_after_idle() {
         .unwrap()
         .file_id
         .unwrap();
+    let open_path = input_path(dir.path(), first_id, "open");
+    let finished_path = open_path.with_extension("finished");
+    let original = fs::read(&open_path).unwrap();
     advance(Duration::from_secs(3)).await;
     let second_id = queue
         .append(index(2), batch(), None)
@@ -299,8 +273,15 @@ async fn test_index_deadlines_are_independent_and_timer_restarts_after_idle() {
         .unwrap()
         .file_id
         .unwrap();
-    advance(Duration::from_secs(7)).await;
-    wait_for_finished_file(&input_path(dir.path(), first_id, "finished")).await;
+    let retained = byte_usage(&queue);
+    advance(Duration::from_secs(6)).await;
+    assert!(open_path.try_exists().unwrap());
+    assert!(!finished_path.try_exists().unwrap());
+    advance(Duration::from_secs(1)).await;
+    wait_for_finished_file(&finished_path).await;
+    assert!(!open_path.try_exists().unwrap());
+    assert_eq!(fs::read(&finished_path).unwrap(), original);
+    assert_eq!(byte_usage(&queue), retained);
     assert!(
         input_path(dir.path(), second_id, "open")
             .try_exists()
@@ -318,7 +299,9 @@ async fn test_index_deadlines_are_independent_and_timer_restarts_after_idle() {
     assert_ne!(third_id, first_id);
     advance(Duration::from_secs(10)).await;
     wait_for_finished_file(&input_path(dir.path(), third_id, "finished")).await;
-    assert_eq!(queue.finish().await.unwrap().len(), 3);
+    let files = queue.finish().await.unwrap();
+    assert_eq!(files.len(), 3);
+    assert!(files.iter().any(|file| file.file_id == first_id));
 }
 
 #[tokio::test(start_paused = true)]
@@ -327,8 +310,7 @@ async fn test_open_file_limit_releases_reservations_and_keeps_processing() {
     let mut core = Ingester::open(dir.path(), BUDGET).unwrap();
     core.file_limits.max_open_files = 1;
     core.file_limits.target_file_bytes = file_size(&index(1), 2);
-    let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
-    let core = FileWriter::new(core, queue.admission.clone());
+    let (queue, receiver, core) = queue_metrics_tests::channel(core, BUDGET);
     let clone = queue.clone();
     let mut first = pin!(queue.append(index(1), batch(), None));
     let mut rejected = pin!(clone.append(index(2), batch(), None));
@@ -341,6 +323,15 @@ async fn test_open_file_limit_releases_reservations_and_keeps_processing() {
     assert!(matches!(rejected.await, Err(IngestError::OpenFileLimit)));
     assert_eq!(existing.await.unwrap().file_id, first_id);
     assert_eq!(byte_usage(&queue), (0, 0, file_size(&index(1), 2)));
+    assert_eq!(queue_metrics_tests::usage(&queue), byte_usage(&queue));
+    {
+        let admission = queue.admission.lock().unwrap();
+        assert_eq!(admission.metrics.open_file_limit.get(), 1);
+        assert_eq!(
+            queue_metrics_tests::validation_counts(&admission.metrics.validation),
+            (3, 0, 3 * batch().num_bytes() as u64, 0)
+        );
+    }
     assert_eq!(
         fs::read_dir(dir.path().join("ingesthree")).unwrap().count(),
         2

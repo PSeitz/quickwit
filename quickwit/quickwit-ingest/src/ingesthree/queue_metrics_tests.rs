@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::fs;
 use std::pin::pin;
 
 use futures::poll;
@@ -31,7 +30,7 @@ fn batch() -> DocBatchV2 {
     DocBatchV2::for_test([r#"{"message":"hello"}"#])
 }
 
-fn channel(
+pub(super) fn channel(
     core: Ingester,
     max_queue_bytes: u64,
 ) -> (
@@ -65,7 +64,7 @@ fn channel(
 }
 
 // Per-owner contributions and local snapshots isolate parallel tests.
-fn usage(queue: &WriteQueue) -> (u64, u64, u64) {
+pub(super) fn usage(queue: &WriteQueue) -> (u64, u64, u64) {
     let admission = queue.admission.lock().unwrap();
     let metrics = &admission.metrics;
     assert_eq!(metrics.memory_bytes.delta(), metrics.queue_bytes.delta());
@@ -76,7 +75,7 @@ fn usage(queue: &WriteQueue) -> (u64, u64, u64) {
     )
 }
 
-fn validation_counts(metrics: &ValidationMetrics) -> (u64, u64, u64, u64) {
+pub(super) fn validation_counts(metrics: &ValidationMetrics) -> (u64, u64, u64, u64) {
     (
         metrics.valid_docs.get(),
         metrics.invalid_docs.get(),
@@ -151,35 +150,6 @@ async fn test_admission_metrics_count_queue_storage_and_unavailable_rejections_o
 }
 
 #[tokio::test]
-async fn test_open_file_rejection_counts_validation_before_append() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut core = Ingester::open(dir.path(), BUDGET).unwrap();
-    core.file_limits.max_open_files = 0;
-    let (queue, receiver, writer) = channel(core, BUDGET);
-    let worker = tokio::spawn(write_batches(
-        writer,
-        receiver,
-        queue.admission.clone(),
-        None,
-    ));
-    assert!(matches!(
-        queue.append(index(), batch(), None).await,
-        Err(IngestError::OpenFileLimit)
-    ));
-    assert_eq!(usage(&queue), (0, 0, 0));
-    {
-        let admission = queue.admission.lock().unwrap();
-        assert_eq!(admission.metrics.open_file_limit.get(), 1);
-        assert_eq!(
-            validation_counts(&admission.metrics.validation),
-            (1, 0, batch().num_bytes() as u64, 0)
-        );
-    }
-    queue.finish().await.unwrap();
-    worker.await.unwrap().unwrap();
-}
-
-#[tokio::test]
 async fn test_dropped_receiver_releases_queued_metric_contributions() {
     let dir = tempfile::tempdir().unwrap();
     let core = Ingester::open(dir.path(), BUDGET).unwrap();
@@ -248,38 +218,6 @@ fn test_recovered_disk_metrics_release_after_deletion_and_do_not_double_count_re
     queue.admission.lock().unwrap().record_usage();
     assert_eq!(usage(&queue).2, 0);
     assert!(!files[0].path.try_exists().unwrap());
-}
-
-#[tokio::test]
-async fn test_writer_failure_releases_reservations_and_preserves_disk_and_validation_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut core = Ingester::open(dir.path(), BUDGET).unwrap();
-    core.append(&index(), &[Bytes::from_static(b"retained")])
-        .unwrap();
-    let retained_bytes = core.disk_bytes;
-    let active = core.active.get_mut(&index()).unwrap();
-    active.writer = BufWriter::new(File::open(&active.input.path).unwrap());
-    let (queue, receiver, writer) = channel(core, BUDGET);
-    let mut first = pin!(queue.append(index(), batch(), None));
-    let mut second = pin!(queue.append(index(), batch(), None));
-    assert!(poll!(&mut first).is_pending());
-    assert!(poll!(&mut second).is_pending());
-    let worker = tokio::spawn(write_batches(
-        writer,
-        receiver,
-        queue.admission.clone(),
-        None,
-    ));
-    assert!(matches!(first.await, Err(IngestError::Internal(_))));
-    assert!(matches!(second.await, Err(IngestError::Unavailable)));
-    assert!(worker.await.unwrap().is_err());
-    assert_eq!(usage(&queue), (0, 0, retained_bytes));
-    let admission = queue.admission.lock().unwrap();
-    assert_eq!(admission.metrics.validation.valid_docs.get(), 1);
-    assert_eq!(admission.metrics.unavailable.get(), 0);
-    assert_eq!(admission.metrics.queue_limit_bytes.get(), BUDGET as f64);
-    assert_eq!(admission.metrics.disk_limit_bytes.get(), BUDGET as f64);
-    assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
 }
 
 #[tokio::test]
@@ -388,27 +326,6 @@ async fn test_panicking_work_releases_input_gauges_and_closes_admission() {
             .delta(),
         0.0
     );
-}
-
-#[test]
-fn test_capacity_metric_tracks_samples_and_closed_intake() {
-    let dir = tempfile::tempdir().unwrap();
-    let core = Ingester::open(dir.path(), 100).unwrap();
-    let (queue, _receiver, writer) = channel(core, 100);
-    let mut tracker = CapacityTracker::new(100, 100);
-    {
-        let mut admission = queue.admission.lock().unwrap();
-        assert_eq!(admission.capacity_score(&mut tracker), 10);
-        assert_eq!(admission.metrics.capacity_score.delta(), 10.0);
-        admission.reserved_disk_bytes = 95;
-        assert_eq!(admission.capacity_score(&mut tracker), 0);
-        assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
-        admission.reserved_disk_bytes = 0;
-        admission.metrics.record_capacity(10);
-        admission.close();
-        assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
-    }
-    drop(writer);
 }
 
 #[test]

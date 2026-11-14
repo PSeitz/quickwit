@@ -35,19 +35,24 @@ fn test_capacity_accounts_for_queue_disk_reservations_and_closed_intake() {
     };
     let mut tracker = CapacityTracker::new(100, 100);
     assert_eq!(admission.capacity_score(&mut tracker), 10);
+    assert_eq!(admission.metrics.capacity_score.delta(), 10.0);
     admission.queue_bytes = 95;
     assert_eq!(admission.capacity_score(&mut tracker), 0);
+    assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
     admission.queue_bytes = 0;
     assert!(admission.capacity_score(&mut tracker) > 0);
     admission.disk_bytes = 90;
     admission.reserved_disk_bytes = 5;
     assert_eq!(admission.capacity_score(&mut tracker), 0);
+    assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
     admission.reserved_disk_bytes = 0;
     // The inherited trend penalty can keep the score at zero above 5% headroom.
     assert_eq!(admission.capacity_score(&mut tracker), 0);
     admission.disk_bytes = 0;
     assert!(admission.capacity_score(&mut tracker) > 0);
-    admission.closed = true;
+    assert!(admission.metrics.capacity_score.delta() > 0.0);
+    admission.close();
+    assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
     assert_eq!(admission.capacity_score(&mut tracker), 0);
     admission.closed = false;
     admission.max_disk_bytes = 0;
@@ -381,10 +386,10 @@ async fn test_io_failure_stops_writer_and_releases_pending_requests() {
     let mut core = Ingester::open(dir.path(), BUDGET).unwrap();
     core.append(&index(), &[Bytes::from_static(b"existing")])
         .unwrap();
+    let retained_bytes = core.disk_bytes;
     let active = core.active.get_mut(&index()).unwrap();
     active.writer = BufWriter::new(File::open(&active.input.path).unwrap());
-    let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
-    let core = FileWriter::new(core, queue.admission.clone());
+    let (queue, receiver, core) = queue_metrics_tests::channel(core, BUDGET);
     let mut failing = pin!(queue.append(index(), batch(), None));
     let mut queued = pin!(queue.append(index(), batch(), None));
     assert!(poll!(&mut failing).is_pending());
@@ -393,7 +398,16 @@ async fn test_io_failure_stops_writer_and_releases_pending_requests() {
     assert!(matches!(failing.await, Err(IngestError::Internal(_))));
     assert!(matches!(queued.await, Err(IngestError::Unavailable)));
     assert!(worker.await.unwrap().is_err());
-    assert_eq!((byte_usage(&queue).0, byte_usage(&queue).1), (0, 0));
+    assert_eq!(byte_usage(&queue), (0, 0, retained_bytes));
+    assert_eq!(queue_metrics_tests::usage(&queue), byte_usage(&queue));
+    {
+        let admission = queue.admission.lock().unwrap();
+        assert_eq!(admission.metrics.validation.valid_docs.get(), 1);
+        assert_eq!(admission.metrics.unavailable.get(), 0);
+        assert_eq!(admission.metrics.queue_limit_bytes.get(), BUDGET as f64);
+        assert_eq!(admission.metrics.disk_limit_bytes.get(), BUDGET as f64);
+        assert_eq!(admission.metrics.capacity_score.delta(), 0.0);
+    }
     assert!(matches!(
         queue.append(index(), batch(), None).await,
         Err(IngestError::Unavailable)
