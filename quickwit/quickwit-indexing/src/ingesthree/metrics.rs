@@ -14,7 +14,15 @@
 
 use std::sync::LazyLock;
 
-use quickwit_metrics::{Counter, Gauge, LazyGauge, counter, gauge, lazy_gauge};
+use quickwit_metrics::{
+    Counter, Gauge, LazyCounter, LazyGauge, counter, gauge, lazy_counter, lazy_gauge,
+};
+
+pub(super) static MEMORY_FLUSHES: LazyCounter = lazy_counter!(
+    name: "ingesthree_memory_flushes_total",
+    description: "Flushes triggered by the split-writer memory threshold, including attempts that later fail.",
+    subsystem: "indexing",
+);
 
 pub(super) static ACTIVE_ASSIGNMENTS: LazyGauge = lazy_gauge!(
     name: "ingesthree_active_assignments",

@@ -158,6 +158,14 @@ async fn list_splits(worker: &mut S3Indexer, index_uid: &IndexUid) -> Vec<Split>
         .unwrap()
 }
 
+fn memory_flush_counter(worker: &S3Indexer, index_uid: &IndexUid) -> Counter {
+    counter!(
+        parent: super::metrics::MEMORY_FLUSHES,
+        "index" => index_label(&index_uid.index_id).to_string(),
+        "source" => worker.source_id.clone(),
+    )
+}
+
 fn publication_counters(worker: &S3Indexer, index_uid: &IndexUid) -> [Counter; 4] {
     let labels = label_values!(
         PUBLISHED_SPLIT => index_label(&index_uid.index_id).to_string(),
@@ -284,17 +292,20 @@ async fn test_files_publish_searchable_splits_and_completion_together() {
 }
 
 #[tokio::test]
-async fn test_batch_task_flushes_and_indexes_all_files() {
+async fn test_batch_task_ignores_document_target() {
     let mut config = IndexConfig::for_test("batch", "ram:///splits");
     config.indexing_settings.split_num_docs_target = 100;
+    config.indexing_settings.resources.heap_size = bytesize::ByteSize::mb(100);
     let (mut worker, index_uid) = setup(config).await;
+    let memory_flushes = memory_flush_counter(&worker, &index_uid);
     let mut inputs = Vec::new();
     for _ in 0..3 {
         inputs.push(register_file(&mut worker, &index_uid, &[DOC; 300]).await);
     }
     let result = worker.index_next(assignment()).await.unwrap().unwrap();
     assert!(result.published);
-    assert_eq!(result.splits.len(), 7);
+    assert_eq!(result.splits.len(), 1);
+    assert_eq!(memory_flushes.get(), 0);
     assert_eq!(
         result
             .splits
@@ -339,11 +350,12 @@ async fn test_batch_task_flushes_and_indexes_all_files() {
 }
 
 #[tokio::test]
-async fn test_document_target_flushes_without_completing_partial_groups() {
+async fn test_memory_limit_flushes_without_completing_partial_groups() {
     let mut config = IndexConfig::for_test("flush", "ram:///splits");
-    config.indexing_settings.split_num_docs_target = 1;
+    config.indexing_settings.resources.heap_size = bytesize::ByteSize(1);
     let (mut worker, index_uid) = setup(config).await;
     let counters = publication_counters(&worker, &index_uid);
+    let memory_flushes = memory_flush_counter(&worker, &index_uid);
     let first = register_file(&mut worker, &index_uid, &[DOC]).await;
     let second = register_file(&mut worker, &index_uid, &[DOC_LATER]).await;
     let result = worker.index_next(assignment()).await.unwrap().unwrap();
@@ -351,6 +363,7 @@ async fn test_document_target_flushes_without_completing_partial_groups() {
     assert_eq!(result.splits.len(), 2);
     assert_publication_counters(&counters, &result.splits);
     assert!(result.splits.iter().all(|split| split.num_docs == 1));
+    assert_eq!(memory_flushes.get(), 2);
     assert_eq!(
         read_file(&mut worker, &first).await.publication_id,
         read_file(&mut worker, &second).await.publication_id
@@ -383,7 +396,7 @@ async fn test_all_invalid_documents_complete_without_outputs() {
 #[tokio::test]
 async fn test_corrupt_input_preserves_group_without_uploading_outputs() {
     let mut config = IndexConfig::for_test("corrupt", "ram:///splits");
-    config.indexing_settings.split_num_docs_target = 1;
+    config.indexing_settings.resources.heap_size = bytesize::ByteSize(1);
     let (mut worker, index_uid) = setup(config).await;
     let counters = publication_counters(&worker, &index_uid);
     let active_assignments = Gauge::local();

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, ensure};
 use bytes::Bytes;
 use quickwit_common::io::IoControls;
-use quickwit_common::metrics::IN_FLIGHT_INDEX_WRITER;
+use quickwit_common::metrics::{IN_FLIGHT_INDEX_WRITER, index_label};
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_config::{
     IndexConfig, IndexingSettings, RetentionPolicy, SourceInputFormat, build_doc_mapper,
@@ -27,11 +27,12 @@ use quickwit_config::{
 use quickwit_doc_mapper::DocMapper;
 use quickwit_ingest::ingesthree::DocumentFileReader;
 use quickwit_metastore::SplitMetadata;
-use quickwit_metrics::{Gauge, GaugeGuard};
+use quickwit_metrics::{Counter, Gauge, GaugeGuard, counter};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::metastore::DocumentsStagedForUpload;
 use quickwit_storage::SplitPayload;
 
+use super::metrics::MEMORY_FLUSHES;
 use crate::actors::{
     DocumentConverter, OTHER_PARTITION_ID, create_packaged_split, prepare_split_for_upload,
 };
@@ -80,7 +81,7 @@ impl SplitWriter {
     }
 }
 
-/// Converts documents and accumulates splits until their document or memory target is reached.
+/// Converts documents and accumulates splits until their memory target is reached.
 pub(super) struct SplitBuilders {
     converter: DocumentConverter,
     mapper: Arc<DocMapper>,
@@ -93,6 +94,7 @@ pub(super) struct SplitBuilders {
     splits: HashMap<u64, SplitWriter>,
     overflow: Option<SplitWriter>,
     writer_memory: Gauge,
+    memory_flushes: Counter,
 }
 
 impl SplitBuilders {
@@ -117,6 +119,11 @@ impl SplitBuilders {
         Ok(Self {
             converter,
             mapper,
+            memory_flushes: counter!(
+                parent: MEMORY_FLUSHES,
+                "index" => index_label(&pipeline_id.index_uid.index_id).to_string(),
+                "source" => pipeline_id.source_id.clone(),
+            ),
             pipeline_id,
             settings: config.indexing_settings,
             delete_opstamp,
@@ -194,7 +201,11 @@ impl SplitBuilders {
             let documents = read_batch(&mut reader)?;
             let end_of_file = documents.is_empty();
             self.add_documents(documents)?;
-            if self.should_flush() || (end_of_file && last_file) {
+            let memory_limit_reached = self.should_flush();
+            if memory_limit_reached {
+                self.memory_flushes.inc();
+            }
+            if memory_limit_reached || (end_of_file && last_file) {
                 prepared.extend(self.prepare_splits(
                     merge_policy,
                     retention,
@@ -241,14 +252,11 @@ impl SplitBuilders {
     }
 
     pub fn should_flush(&self) -> bool {
-        let mut num_docs = 0;
         let mut num_bytes = 0;
         for split in self.splits.values().chain(self.overflow.iter()) {
-            num_docs += split.builder.split_attrs.num_docs;
             num_bytes += split.builder.mem_usage() as u64;
         }
-        num_docs >= self.settings.split_num_docs_target as u64
-            || num_bytes >= self.settings.resources.heap_size.as_u64()
+        num_bytes >= self.settings.resources.heap_size.as_u64()
     }
 
     pub fn take_splits(&mut self) -> Vec<SplitWriter> {

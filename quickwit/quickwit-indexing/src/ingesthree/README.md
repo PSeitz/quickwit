@@ -59,16 +59,18 @@ There are no stage actors or stage channels. One blocking-runtime task creates t
 directory and builders, including the mapper. All files in the assignment are downloaded
 before one blocking-runtime task processes the entire assignment: opening files, incremental
 reading, document conversion/insertion, serialization, and packaging. Internal document
-batches preserve the document/heap flush checks without dispatching another task per file
+batches preserve the heap flush checks without dispatching another task per file
 or document batch. Storage/metastore calls remain async.
 Running synchronous work retains the scratch root after caller cancellation and checks a
 kill switch before read batches, between documents, and during serialization. Synchronous
 work may finish its current operation before releasing the directory.
 
 Existing document routing and its overflow partition are preserved. Builders flush after
-batches when their aggregate document or heap target is reached, and at group end. All
-splits remain unpublished until every input has been processed. Flushed splits are serialized
-to scratch within the assignment task and uploaded after every assigned file is consumed.
+batches when their aggregate writer memory reaches `indexing_settings.resources.heap_size`,
+and at group end. `split_num_docs_target` affects merge maturity, rather than triggering
+an indexing flush. All splits remain unpublished until every input has been processed.
+Flushed splits are serialized to scratch within the assignment task and uploaded after
+every assigned file is consumed.
 Partially filled builders carry across files and flush at group end. All input files initially
 occupy scratch space and are removed individually after processing. Packaged files, metadata,
 and hotcache payloads accumulate until the assignment task returns, increasing per-assignment
@@ -132,6 +134,11 @@ metrics. Those count processing attempts, including work that later fails or los
 publication. Writer-memory estimates use
 `quickwit_memory_in_flight_data_bytes{component="index_writer"}` and stay with each
 writer through serialization and cancellation.
+
+`quickwit_indexing_ingesthree_memory_flushes_total{index, source}` counts flushes triggered
+by the writer-memory threshold. Each event counts once even if it produces multiple
+partition splits. End-of-group flushes below the threshold do not increment it. The
+counter includes attempts that later fail or lose publication.
 
 Worker metrics use the `quickwit_indexing_ingesthree_` prefix:
 
