@@ -194,20 +194,12 @@ impl S3Indexer {
         let files_to_index = files.clone();
         let input_directory = directory.clone();
         let prepared = run_indexing(directory.clone(), active_assignment.clone(), move || {
-            let mut prepared = Vec::new();
-            for (file_index, file) in files_to_index.iter().enumerate() {
-                let path = input_directory.path().join(file_index.to_string());
-                prepared.extend(builders.index_file(
-                    &path,
-                    file,
-                    &merge_policy,
-                    retention.as_ref(),
-                    file_index + 1 == files_to_index.len(),
-                    prepared.len(),
-                )?);
-                std::fs::remove_file(path)?;
-            }
-            Ok(prepared)
+            builders.index_files(
+                input_directory.path(),
+                &files_to_index,
+                &merge_policy,
+                retention.as_ref(),
+            )
         })
         .await?;
         let mut splits = Vec::new();

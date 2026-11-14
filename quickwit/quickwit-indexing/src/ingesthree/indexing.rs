@@ -178,44 +178,41 @@ impl SplitBuilders {
         Ok(())
     }
 
-    /// Processes a whole file synchronously, preserving partially filled builders across files.
+    /// Processes the assignment synchronously, preserving partially filled builders across files.
+    /// Downloads must be named by their position in `files`. Consumed inputs are removed locally.
     /// Flushes serialize to scratch here. Uploads happen after the entire assignment is consumed.
-    pub fn index_file(
+    pub fn index_files(
         &mut self,
-        path: &Path,
-        file: &DocumentsStagedForUpload,
+        directory: &Path,
+        files: &[DocumentsStagedForUpload],
         merge_policy: &Arc<dyn MergePolicy>,
         retention: Option<&RetentionPolicy>,
-        last_file: bool,
-        num_existing_splits: usize,
     ) -> anyhow::Result<Vec<PreparedSplit>> {
-        let _guard = self.io_controls.check_if_alive()?;
-        let index_uid = file
-            .index_uid
-            .as_ref()
-            .context("assigned file has no index UID")?;
-        let mut reader = DocumentFileReader::open(path, index_uid, file.num_bytes)?;
         let mut prepared = Vec::new();
-        loop {
+        for (file_index, file) in files.iter().enumerate() {
             let _guard = self.io_controls.check_if_alive()?;
-            let documents = read_batch(&mut reader)?;
-            let end_of_file = documents.is_empty();
-            self.add_documents(documents)?;
-            let memory_limit_reached = self.should_flush();
-            if memory_limit_reached {
-                self.memory_flushes.inc();
+            let path = directory.join(file_index.to_string());
+            let index_uid = file
+                .index_uid
+                .as_ref()
+                .context("assigned file has no index UID")?;
+            let mut reader = DocumentFileReader::open(&path, index_uid, file.num_bytes)?;
+            loop {
+                let _guard = self.io_controls.check_if_alive()?;
+                let documents = read_batch(&mut reader)?;
+                if documents.is_empty() {
+                    break;
+                }
+                self.add_documents(documents)?;
+                if self.should_flush() {
+                    self.memory_flushes.inc();
+                    self.prepare_splits(merge_policy, retention, &mut prepared)?;
+                }
             }
-            if memory_limit_reached || (end_of_file && last_file) {
-                prepared.extend(self.prepare_splits(
-                    merge_policy,
-                    retention,
-                    num_existing_splits + prepared.len(),
-                )?);
-            }
-            if end_of_file {
-                break;
-            }
+            drop(reader);
+            std::fs::remove_file(path)?;
         }
+        self.prepare_splits(merge_policy, retention, &mut prepared)?;
         Ok(prepared)
     }
 
@@ -223,14 +220,13 @@ impl SplitBuilders {
         &mut self,
         merge_policy: &Arc<dyn MergePolicy>,
         retention: Option<&RetentionPolicy>,
-        num_existing_splits: usize,
-    ) -> anyhow::Result<Vec<PreparedSplit>> {
+        prepared: &mut Vec<PreparedSplit>,
+    ) -> anyhow::Result<()> {
         let splits = self.take_splits();
         ensure!(
-            num_existing_splits + splits.len() <= 1000,
+            prepared.len() + splits.len() <= 1000,
             "assigned group exceeds the publication split limit"
         );
-        let mut prepared = Vec::with_capacity(splits.len());
         for split in splits {
             let io_controls = self.io_controls.clone().set_component("index_serializer");
             let _guard = io_controls.check_if_alive()?;
@@ -248,7 +244,7 @@ impl SplitBuilders {
                 payload,
             });
         }
-        Ok(prepared)
+        Ok(())
     }
 
     pub fn should_flush(&self) -> bool {
