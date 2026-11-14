@@ -18,12 +18,22 @@ The worker count must be positive. Each worker requests up to 1,000 files from o
 incarnation per assignment, with a default target of 100,000,000 input bytes. Set
 `QW_INGESTHREE_INDEXER_BATCH_SIZE` on indexers to override it, for example `1GB`,
 `512MiB`, or an integer byte count. Zero, invalid, unreadable, or values above `INT64_MAX`
-fail worker startup. Restart the service to apply changes. An oversized first file is
-still assigned for progress. File rotation remains independently controlled by
-`QW_INGESTHREE_TARGET_UPLOAD_SIZE`. With both defaults, full-size files generally remain
-single-file assignments. The metastore collects available files up to the configured target,
-subject to the 1,000-file cap, without waiting for more files to arrive. Each assignment is
-processed by one indexing task, sharing these node resources and `INGEST_V2_SOURCE_ID`.
+fail worker startup. Restart the service to apply changes. The batch includes the file
+that reaches or crosses the target, including an oversized first file. File rotation
+remains independently controlled by `QW_INGESTHREE_TARGET_UPLOAD_SIZE`.
+
+The metastore claims a same-index batch only when its bytes reach the target or its
+oldest eligible file has waited `QW_INGESTHREE_INDEXER_MAX_WAIT_SECS` since registration
+(default `15`). This setting accepts an integer from `0` through `4294967295` seconds;
+`0` disables waiting, and invalid or unreadable values fail worker startup. The 1,000-file
+cap alone leaves an underfilled batch waiting. Unassigned files remain available for
+later polling, and an underfilled index does not block ready batches from other indexes.
+Only eligible, unlocked files contribute bytes and age. The age threshold controls
+eligibility; polling and worker availability can delay pickup beyond it. Old metastores
+ignore the added protocol field, so upgrade them to enforce waiting. For 500 MB batches
+or a 15-second wait, set `QW_INGESTHREE_INDEXER_BATCH_SIZE=500MB` and
+`QW_INGESTHREE_INDEXER_MAX_WAIT_SECS=15`. Each assignment is processed by one indexing task,
+sharing these node resources and `INGEST_V2_SOURCE_ID`.
 Successful groups are followed immediately by another
 assignment request. Empty assignments back off from
 100 ms to 5 seconds. Each worker restarts independently after errors, panics, or unexpected

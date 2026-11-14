@@ -45,9 +45,9 @@ pub(crate) struct S3IndexerSupervisor {
 }
 
 impl S3IndexerSupervisor {
-    pub fn spawn(worker: S3Indexer, max_num_bytes: u64) -> Self {
+    pub fn spawn(worker: S3Indexer, max_num_bytes: u64, max_wait_secs: u32) -> Self {
         Self::supervise(
-            move || run(worker.clone(), max_num_bytes),
+            move || run(worker.clone(), max_num_bytes, max_wait_secs),
             SUPERVISOR_METRICS.clone(),
         )
     }
@@ -103,15 +103,16 @@ impl Drop for S3IndexerSupervisor {
     }
 }
 
-async fn run(mut worker: S3Indexer, max_num_bytes: u64) -> anyhow::Result<()> {
+async fn run(mut worker: S3Indexer, max_num_bytes: u64, max_wait_secs: u32) -> anyhow::Result<()> {
     let mut idle_delay = IDLE_MIN;
     loop {
-        // Group files up to the byte budget and the metastore's 1,000-file limit.
-        // An oversized first file is still assigned to ensure forward progress.
+        // Claim only after the byte target or registration-age threshold is reached.
+        // Include the file crossing the byte target, subject to the 1,000-file limit.
         let assignment = AssignFilesForIndexing {
             max_num_files: 1_000,
             max_num_bytes,
             retry_after_secs: 60,
+            max_wait_secs,
         };
         match worker.index_next(assignment).await? {
             Some(_) => idle_delay = IDLE_MIN,
@@ -250,7 +251,9 @@ mod tests {
         let mut metastore = MockMetastoreService::new();
         metastore
             .expect_assign_files_for_indexing()
-            .returning(move |_| {
+            .returning(move |request| {
+                assert_eq!(request.max_num_bytes, 100_000_000);
+                assert_eq!(request.max_wait_secs, 15);
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(Default::default())
             });
@@ -267,7 +270,7 @@ mod tests {
         };
         let metrics = SupervisorMetrics::for_test();
         let supervisor = S3IndexerSupervisor::supervise(
-            move || run(worker.clone(), 100_000_000),
+            move || run(worker.clone(), 100_000_000, 15),
             metrics.clone(),
         );
         tokio::task::yield_now().await;

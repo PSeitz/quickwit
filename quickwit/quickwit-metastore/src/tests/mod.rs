@@ -28,6 +28,7 @@ use quickwit_proto::types::IndexUid;
 pub(crate) mod completed_files;
 pub(crate) mod delete_task;
 pub(crate) mod file_assignment;
+pub(crate) mod file_assignment_wait;
 pub(crate) mod file_publication;
 pub(crate) mod file_publication_validation;
 pub(crate) mod get_identity;
@@ -225,6 +226,30 @@ macro_rules! metastore_test_suite {
             #[serial_test::file_serial]
             async fn test_assign_files_count_and_byte_prefix() {
                 $crate::tests::file_assignment::test_assign_files_count_and_byte_prefix::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_wait_for_prefix() {
+                $crate::tests::file_assignment_wait::test_assign_files_wait_for_prefix::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_wait_skips_underfilled_indexes() {
+                $crate::tests::file_assignment_wait::test_assign_files_wait_skips_underfilled_indexes::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_wait_excludes_completed_and_inflight() {
+                $crate::tests::file_assignment_wait::test_assign_files_wait_excludes_completed_and_inflight::<$metastore_type>().await;
+            }
+
+            #[tokio::test]
+            #[serial_test::file_serial]
+            async fn test_assign_files_wait_concurrent() {
+                $crate::tests::file_assignment_wait::test_assign_files_wait_concurrent::<$metastore_type>().await;
             }
 
             #[tokio::test]

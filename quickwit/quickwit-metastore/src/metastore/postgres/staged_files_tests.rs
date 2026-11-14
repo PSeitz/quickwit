@@ -149,6 +149,7 @@ async fn test_assignment_skips_locked_files_and_concurrent_groups_are_disjoint()
         max_num_files: 2,
         max_num_bytes: 1_000,
         retry_after_secs: 60,
+        max_wait_secs: 0,
     };
     let first = timeout(
         Duration::from_secs(5),
@@ -214,6 +215,7 @@ async fn test_assignment_and_publication_lock_order_with_index_deletion() {
             max_num_files: 1,
             max_num_bytes: 1_000,
             retry_after_secs: 60,
+            max_wait_secs: 0,
         }),
     )
     .await

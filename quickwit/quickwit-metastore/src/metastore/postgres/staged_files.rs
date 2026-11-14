@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use super::pool::TrackedPool;
 use crate::SplitState;
 use crate::metastore::staged_file::{
-    assignment_file_count, publication_outcome, validate_assignment,
+    assignment_file_count, assignment_is_ready, publication_outcome, validate_assignment,
     validate_completed_files_request, validate_publication, validate_registration,
 };
 
@@ -111,70 +111,82 @@ pub(super) async fn assign_files_for_indexing(
     request: AssignFilesForIndexing,
 ) -> MetastoreResult<AssignFilesForIndexingResponse> {
     validate_assignment(&request)?;
-    let mut tx = pool.begin().await?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let retry_before = now - i64::from(request.retry_after_secs);
+    let mut waiting_indexes: Vec<String> = Vec::new();
 
-    // Assignment only locks files. Taking a parent index lock afterwards would invert the
-    // index -> file lock order used by publication and cascading index deletion.
-    let oldest = sqlx::query_as::<_, PgStagedFile>(
-        "SELECT * FROM staged_files
-         WHERE completed_timestamp IS NULL
-           AND (processing_started_timestamp IS NULL OR processing_started_timestamp < \
-         to_timestamp($1))
-         ORDER BY create_timestamp, file_id
-         LIMIT 1 FOR UPDATE SKIP LOCKED",
-    )
-    .bind(retry_before as f64)
-    .fetch_optional(tx.as_mut())
-    .await?;
-    let Some(oldest) = oldest else {
+    loop {
+        // Rejected groups release their locks before trying another index. Only lock
+        // files: a parent lock would invert publication/deletion's index -> file order.
+        let mut tx = pool.begin().await?;
+        let oldest = sqlx::query_as::<_, PgStagedFile>(
+            "SELECT * FROM staged_files
+             WHERE completed_timestamp IS NULL AND NOT (index_uid = ANY($2))
+               AND (processing_started_timestamp IS NULL OR processing_started_timestamp < \
+             to_timestamp($1))
+             ORDER BY create_timestamp, file_id
+             LIMIT 1 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(retry_before as f64)
+        .bind(&waiting_indexes)
+        .fetch_optional(tx.as_mut())
+        .await?;
+        let Some(oldest) = oldest else {
+            tx.commit().await?;
+            return Ok(AssignFilesForIndexingResponse::default());
+        };
+        let index_uid = oldest.index_uid.clone();
+        // Earlier locked rows stay outside this group even if unlocked between queries.
+        // Limit the rows read per index instead of aggregating the whole backlog.
+        let additional = sqlx::query_as::<_, PgStagedFile>(
+            "SELECT * FROM staged_files
+             WHERE index_uid = $1 AND completed_timestamp IS NULL
+               AND (processing_started_timestamp IS NULL OR processing_started_timestamp < \
+             to_timestamp($2))
+               AND (create_timestamp, file_id) > ($3, $4)
+             ORDER BY create_timestamp, file_id
+             LIMIT $5 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(&index_uid)
+        .bind(retry_before as f64)
+        .bind(oldest.create_timestamp)
+        .bind(&oldest.file_id)
+        .bind(i64::from(request.max_num_files - 1))
+        .fetch_all(tx.as_mut())
+        .await?;
+        let mut staged_files: Vec<DocumentsStagedForUpload> = std::iter::once(oldest)
+            .chain(additional)
+            .map(Into::into)
+            .collect();
+        staged_files.truncate(assignment_file_count(
+            staged_files.iter().map(|file| file.num_bytes),
+            request.max_num_bytes,
+        ));
+        // Only locked files contribute bytes and age. An underfilled index must not
+        // prevent assignment from another index during this request.
+        if !assignment_is_ready(staged_files.iter(), &request, now) {
+            tx.rollback().await?;
+            waiting_indexes.push(index_uid.to_string());
+            continue;
+        }
+        let file_ids: Vec<&str> = staged_files
+            .iter()
+            .map(|file| file.file_id.as_str())
+            .collect();
+        sqlx::query(
+            "UPDATE staged_files SET processing_started_timestamp = to_timestamp($2)
+             WHERE file_id = ANY($1)",
+        )
+        .bind(&file_ids)
+        .bind(now as f64)
+        .execute(tx.as_mut())
+        .await?;
+        for file in &mut staged_files {
+            file.processing_started_timestamp = Some(now);
+        }
         tx.commit().await?;
-        return Ok(AssignFilesForIndexingResponse::default());
-    };
-    // Earlier rows skipped because they were locked stay outside this group even if their
-    // locks are released between these statements. The selected oldest file is always included.
-    let additional = sqlx::query_as::<_, PgStagedFile>(
-        "SELECT * FROM staged_files
-         WHERE index_uid = $1 AND completed_timestamp IS NULL
-           AND (processing_started_timestamp IS NULL OR processing_started_timestamp < \
-         to_timestamp($2))
-           AND (create_timestamp, file_id) > ($3, $4)
-         ORDER BY create_timestamp, file_id
-         LIMIT $5 FOR UPDATE SKIP LOCKED",
-    )
-    .bind(&oldest.index_uid)
-    .bind(retry_before as f64)
-    .bind(oldest.create_timestamp)
-    .bind(&oldest.file_id)
-    .bind(i64::from(request.max_num_files - 1))
-    .fetch_all(tx.as_mut())
-    .await?;
-    let mut staged_files: Vec<DocumentsStagedForUpload> = std::iter::once(oldest)
-        .chain(additional)
-        .map(Into::into)
-        .collect();
-    staged_files.truncate(assignment_file_count(
-        staged_files.iter().map(|file| file.num_bytes),
-        request.max_num_bytes,
-    ));
-    let file_ids: Vec<&str> = staged_files
-        .iter()
-        .map(|file| file.file_id.as_str())
-        .collect();
-    sqlx::query(
-        "UPDATE staged_files SET processing_started_timestamp = to_timestamp($2)
-         WHERE file_id = ANY($1)",
-    )
-    .bind(&file_ids)
-    .bind(now as f64)
-    .execute(tx.as_mut())
-    .await?;
-    for file in &mut staged_files {
-        file.processing_started_timestamp = Some(now);
+        return Ok(AssignFilesForIndexingResponse { staged_files });
     }
-    tx.commit().await?;
-    Ok(AssignFilesForIndexingResponse { staged_files })
 }
 
 pub(super) async fn list_completed_files(

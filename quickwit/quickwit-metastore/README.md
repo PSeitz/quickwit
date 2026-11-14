@@ -46,17 +46,24 @@ cargo nextest run -p quickwit-metastore --features postgres register_file_for_in
 ## Ingesthree assignment and publication
 
 `AssignFilesForIndexing` atomically claims eligible inputs for one index incarnation.
-It selects the globally oldest eligible file, then a same-index prefix ordered by
-registration time in Unix seconds and file ID. Eligible means unfinished and either
+It selects the oldest ready same-index prefix ordered by registration time in Unix
+seconds and file ID. Eligible means unfinished and either
 never assigned or started strictly before metastore time minus `retry_after_secs`.
 The retry delay must be positive and should be configured consistently across workers.
 It controls duplicate work versus recovery delay, not an exclusive publication right.
 
 Requests specify `max_num_files` (1–1000) and `max_num_bytes` (1–INT64_MAX).
-The oldest file is always included, even if it exceeds the byte target. Additional
-files stop at the first one that would exceed the target. Claims never wait to fill
-a group. An empty response means no eligible work was available. Losing an assignment
-response leaves work recoverable after the retry threshold without an assignment journal.
+The byte target is soft: the prefix includes the file that reaches or crosses it,
+even if the oldest file alone exceeds it. With `max_wait_secs > 0`, a count-capped
+prefix becomes ready when its bytes reach the target or its oldest eligible file's
+registration age reaches `max_wait_secs`. Reaching the file-count cap alone leaves
+an underfilled batch waiting. Zero preserves immediate, no-wait assignment. The
+ingesthree caller uses a 15-second wait. This is an eligibility threshold measured
+from metastore registration, while polling, worker capacity and concurrent claims
+can delay actual pickup. Underfilled indexes are skipped so other ready indexes
+can progress. Waiting leaves processing timestamps unchanged. An empty response
+means no ready batch was claimed. Losing an assignment response leaves work
+recoverable after the retry threshold without an assignment journal.
 
 `PublishFileSplits` takes the index UID, 1–1000 distinct input file IDs, up to 1000
 distinct staged output split IDs, and a canonical ULID `publication_id` generated
@@ -78,8 +85,14 @@ not an assignment lease. No additional publication journal is stored.
 PostgreSQL migration `31_add-file-publication` adds the winner ID and global/per-index
 assignment indexes excluding completed history. It normalizes existing unfinished
 registration timestamps to whole seconds and uses that precision for new registrations,
-matching the API and file-backed ordering. Assignment uses `FOR UPDATE SKIP LOCKED`,
-so concurrent claims can skip locked inputs. Publication locks the index incarnation,
+matching the API and file-backed ordering. Assignment selects the oldest eligible file
+and a count-capped same-index suffix using `FOR UPDATE SKIP LOCKED`, then checks bytes
+and age using only the locked prefix. Each candidate has its own transaction. An
+underfilled prefix releases its locks and excludes that index for the rest of this
+request before trying another index. A ready first candidate needs three SQL statements;
+underfilled indexes add transactions and queries. There is no whole-backlog aggregation. Cancelled transactions roll
+back. Assignment locks only files, preserving the index-to-file lock order used by
+publication and deletion. Publication locks the index incarnation,
 then input and output rows in consistent ID order, and commits both state changes in
 one transaction. Staging and split cleanup use the same output lock order.
 

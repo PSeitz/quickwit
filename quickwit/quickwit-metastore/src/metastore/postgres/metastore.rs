@@ -2075,6 +2075,10 @@ impl crate::tests::DefaultForTest for PostgresqlMetastore {
 mod staged_files_tests;
 
 #[cfg(test)]
+#[path = "staged_files_wait_tests.rs"]
+mod staged_files_wait_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 

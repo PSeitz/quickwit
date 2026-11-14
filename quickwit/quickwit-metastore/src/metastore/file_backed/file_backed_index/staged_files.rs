@@ -21,7 +21,9 @@ use time::OffsetDateTime;
 
 use super::FileBackedIndex;
 use crate::file_backed::MutationOccurred;
-use crate::metastore::staged_file::{assignment_file_count, is_eligible, publication_outcome};
+use crate::metastore::staged_file::{
+    assignment_file_count, assignment_is_ready, is_eligible, publication_outcome,
+};
 
 impl FileBackedIndex {
     pub fn register_file_for_indexing(
@@ -63,12 +65,29 @@ impl FileBackedIndex {
             .collect()
     }
 
-    pub(crate) fn oldest_eligible_file(&self, retry_before: i64) -> Option<(i64, String)> {
-        self.staged_files
+    pub(crate) fn ready_assignment_files(
+        &self,
+        request: &AssignFilesForIndexing,
+        now: i64,
+        retry_before: i64,
+    ) -> Vec<&DocumentsStagedForUpload> {
+        let mut files: Vec<_> = self
+            .staged_files
             .values()
             .filter(|file| is_eligible(file, retry_before))
-            .min_by_key(|file| (file.create_timestamp, &file.file_id))
-            .map(|file| (file.create_timestamp, file.file_id.clone()))
+            .k_smallest_by(request.max_num_files as usize, |left, right| {
+                (left.create_timestamp, &left.file_id)
+                    .cmp(&(right.create_timestamp, &right.file_id))
+            })
+            .collect();
+        files.truncate(assignment_file_count(
+            files.iter().map(|file| file.num_bytes),
+            request.max_num_bytes,
+        ));
+        if !assignment_is_ready(files.iter().copied(), request, now) {
+            files.clear();
+        }
+        files
     }
 
     /// The caller holds the exclusive metastore mutation guard from global selection through
@@ -80,22 +99,13 @@ impl FileBackedIndex {
         retry_before: i64,
     ) -> MutationOccurred<Vec<DocumentsStagedForUpload>> {
         let mut files: Vec<_> = self
-            .staged_files
-            .values()
-            .filter(|file| is_eligible(file, retry_before))
+            .ready_assignment_files(request, now, retry_before)
+            .into_iter()
+            .cloned()
             .collect();
         if files.is_empty() {
-            return MutationOccurred::No(Vec::new());
+            return MutationOccurred::No(files);
         }
-        files.sort_unstable_by(|left, right| {
-            (left.create_timestamp, &left.file_id).cmp(&(right.create_timestamp, &right.file_id))
-        });
-        files.truncate(request.max_num_files as usize);
-        files.truncate(assignment_file_count(
-            files.iter().map(|file| file.num_bytes),
-            request.max_num_bytes,
-        ));
-        let mut files: Vec<_> = files.into_iter().cloned().collect();
         for file in &mut files {
             file.processing_started_timestamp = Some(now);
             self.staged_files.insert(file.file_id.clone(), file.clone());
@@ -176,6 +186,7 @@ mod tests {
             max_num_files: 10,
             max_num_bytes: 1000,
             retry_after_secs: 60,
+            max_wait_secs: 0,
         };
         assert!(matches!(
             index.assign_files_for_indexing(&request, 100, 40),
@@ -233,6 +244,7 @@ mod tests {
                     max_num_files: 1,
                     max_num_bytes: 100,
                     retry_after_secs: 60,
+                    max_wait_secs: 0,
                 })
                 .await
                 .unwrap_err(),
@@ -275,6 +287,7 @@ mod tests {
                             max_num_files: 1,
                             max_num_bytes: 100,
                             retry_after_secs: 60,
+                            max_wait_secs: 0,
                         })
                         .await
                         .unwrap();
@@ -316,6 +329,7 @@ mod tests {
             max_num_files: 10,
             max_num_bytes: 1000,
             retry_after_secs: 60,
+            max_wait_secs: 0,
         };
         let assigned = metastore
             .assign_files_for_indexing(assignment)

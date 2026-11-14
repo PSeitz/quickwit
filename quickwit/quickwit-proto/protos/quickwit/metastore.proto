@@ -266,7 +266,7 @@ message DocumentsStagedForUpload {
   uint64 num_bytes = 4;
   // Metastore registration time, in Unix seconds. Retries preserve this value.
   int64 create_timestamp = 5;
-  // Neither timestamp set means ready. Processing without completion means in flight.
+  // Neither timestamp set means unassigned. Processing without completion means in flight.
   // Completion takes precedence, including after a competing attempt finishes.
   optional int64 processing_started_timestamp = 6;
   optional int64 completed_timestamp = 7;
@@ -286,21 +286,26 @@ message RegisterFileForIndexingResponse {
   DocumentsStagedForUpload staged_file = 1;
 }
 
-// Select the globally oldest eligible file, then a same-index prefix. Eligibility
-// means unfinished and either never assigned or started strictly before
-// metastore time minus retry_after_secs. Ordering is registration time, then file ID.
+// Select the oldest ready same-index prefix. Eligible files are unfinished and
+// either never assigned or started strictly before metastore time minus retry_after_secs.
+// Ordering is registration time, then file ID. Underfilled indexes are skipped.
 message AssignFilesForIndexing {
-  // Between 1 and 1000 files. Claims never wait for a group to fill.
+  // Between 1 and 1000 files. Reaching this cap alone does not make a batch ready.
   uint32 max_num_files = 1;
-  // Between 1 and INT64_MAX bytes. The oldest file is always included, even if it
-  // alone exceeds this target. Stop before the first additional file that would exceed it.
+  // Soft byte target, between 1 and INT64_MAX. Include the file that reaches or
+  // crosses the target, even if the oldest file alone exceeds it.
   uint64 max_num_bytes = 2;
   // Positive retry delay. All workers should use the same configured value.
   uint32 retry_after_secs = 3;
+  // A prefix is ready when its bytes reach the target or its oldest eligible file
+  // was registered at least this many seconds ago. Zero disables waiting for
+  // backward compatibility. Age determines eligibility, not an actual pickup deadline:
+  // polling, worker capacity and concurrent claims can delay assignment further.
+  uint32 max_wait_secs = 4;
 }
 
 message AssignFilesForIndexingResponse {
-  // Empty when no eligible work is available. Processing start is recorded before reply.
+  // Empty when no ready batch is claimed. Processing start is recorded before reply.
   repeated DocumentsStagedForUpload staged_files = 1;
 }
 

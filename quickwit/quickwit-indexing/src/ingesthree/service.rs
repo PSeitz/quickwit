@@ -41,6 +41,21 @@ fn indexer_batch_bytes() -> anyhow::Result<u64> {
     Ok(num_bytes)
 }
 
+/// Reads how long an underfilled indexer batch waits, in seconds since registration.
+fn indexer_max_wait_secs() -> anyhow::Result<u32> {
+    const ENV_KEY: &str = "QW_INGESTHREE_INDEXER_MAX_WAIT_SECS";
+    match std::env::var(ENV_KEY) {
+        Ok(value) => value.parse::<u32>().with_context(|| {
+            format!(
+                "{ENV_KEY} must be an integer between 0 and {} seconds",
+                u32::MAX
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(15),
+        Err(error) => Err(error).with_context(|| format!("failed to read {ENV_KEY}")),
+    }
+}
+
 impl IndexingService {
     pub(crate) fn enable_ingesthree(&mut self) -> anyhow::Result<()> {
         ensure!(
@@ -56,6 +71,7 @@ impl IndexingService {
             return Ok(());
         }
         let max_num_bytes = indexer_batch_bytes()?;
+        let max_wait_secs = indexer_max_wait_secs()?;
         let num_workers = quickwit_common::num_cpus();
         ensure!(num_workers > 0, "S3 indexing requires at least one CPU");
         let scratch_directory = temp_dir::Builder::default()
@@ -73,7 +89,7 @@ impl IndexingService {
             fingerprinter: self.fingerprinter_opt.clone(),
         };
         self.s3_indexers = (0..num_workers)
-            .map(|_| S3IndexerSupervisor::spawn(worker.clone(), max_num_bytes))
+            .map(|_| S3IndexerSupervisor::spawn(worker.clone(), max_num_bytes, max_wait_secs))
             .collect();
         Ok(())
     }
@@ -262,7 +278,8 @@ mod tests {
         index_uid: &IndexUid,
         num_splits: usize,
     ) -> Vec<SplitMetadata> {
-        tokio::time::timeout(Duration::from_secs(15), async {
+        // Allow the default 15-second batch wait, polling backoff, and indexing.
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let splits = published_splits(worker, index_uid).await;
                 if splits.len() == num_splits {
@@ -313,7 +330,11 @@ mod tests {
         metastore
             .expect_assign_files_for_indexing()
             .returning(move |request| {
-                assert_eq!(request.max_num_files, 1);
+                assert_eq!(request.max_num_files, 1_000);
+                assert_eq!(
+                    request.max_wait_secs,
+                    super::indexer_max_wait_secs().unwrap()
+                );
                 sender.send(tokio::task::id()).unwrap();
                 Ok(Default::default())
             });
@@ -343,9 +364,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let universe = Universe::new();
         let (service, handle) = spawn_service(directory.path(), &universe, &worker, true).await;
-        let splits = wait_for_publications(&mut worker, &index_uid, 2).await;
+        let splits = wait_for_publications(&mut worker, &index_uid, 1).await;
         for split in splits {
-            assert_eq!(split.num_docs, 1);
+            // Both files share a batch and a split, which remains eligible for compaction.
+            assert_eq!(split.num_docs, 2);
+            assert!(!split.is_mature(time::OffsetDateTime::now_utc()));
             assert_eq!(split.num_merge_ops, 0);
             assert_eq!(split.source_id, INGEST_V2_SOURCE_ID);
             assert_eq!(split.node_id, worker.node_id.as_str());
@@ -367,6 +390,7 @@ mod tests {
             .index_next(AssignFilesForIndexing {
                 max_num_files: 1,
                 max_num_bytes: 1_000_000,
+                max_wait_secs: 0,
                 retry_after_secs: 60,
             })
             .await
@@ -375,7 +399,7 @@ mod tests {
         assert!(remaining.published);
         assert_eq!(remaining.splits.len(), 1);
         assert_eq!(remaining.splits[0].num_docs, 1);
-        assert_eq!(published_splits(&mut worker, &index_uid).await.len(), 3);
+        assert_eq!(published_splits(&mut worker, &index_uid).await.len(), 2);
         service.ask(StopS3Indexers).await.unwrap();
         universe.assert_quit().await;
     }

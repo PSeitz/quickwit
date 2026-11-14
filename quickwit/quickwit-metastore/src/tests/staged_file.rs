@@ -73,6 +73,7 @@ pub(crate) fn assignment_request() -> AssignFilesForIndexing {
         max_num_files: 1000,
         max_num_bytes: i64::MAX as u64,
         retry_after_secs: 3600,
+        max_wait_secs: 0,
     }
 }
 

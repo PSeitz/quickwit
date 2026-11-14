@@ -59,7 +59,7 @@ pub struct DocumentsStagedForUpload {
     /// Metastore registration time, in Unix seconds. Retries preserve this value.
     #[prost(int64, tag = "5")]
     pub create_timestamp: i64,
-    /// Neither timestamp set means ready. Processing without completion means in flight.
+    /// Neither timestamp set means unassigned. Processing without completion means in flight.
     /// Completion takes precedence, including after a competing attempt finishes.
     #[prost(int64, optional, tag = "6")]
     pub processing_started_timestamp: ::core::option::Option<i64>,
@@ -88,27 +88,33 @@ pub struct RegisterFileForIndexingResponse {
     #[prost(message, optional, tag = "1")]
     pub staged_file: ::core::option::Option<DocumentsStagedForUpload>,
 }
-/// Select the globally oldest eligible file, then a same-index prefix. Eligibility
-/// means unfinished and either never assigned or started strictly before
-/// metastore time minus retry_after_secs. Ordering is registration time, then file ID.
+/// Select the oldest ready same-index prefix. Eligible files are unfinished and
+/// either never assigned or started strictly before metastore time minus retry_after_secs.
+/// Ordering is registration time, then file ID. Underfilled indexes are skipped.
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AssignFilesForIndexing {
-    /// Between 1 and 1000 files. Claims never wait for a group to fill.
+    /// Between 1 and 1000 files. Reaching this cap alone does not make a batch ready.
     #[prost(uint32, tag = "1")]
     pub max_num_files: u32,
-    /// Between 1 and INT64_MAX bytes. The oldest file is always included, even if it
-    /// alone exceeds this target. Stop before the first additional file that would exceed it.
+    /// Soft byte target, between 1 and INT64_MAX. Include the file that reaches or
+    /// crosses the target, even if the oldest file alone exceeds it.
     #[prost(uint64, tag = "2")]
     pub max_num_bytes: u64,
     /// Positive retry delay. All workers should use the same configured value.
     #[prost(uint32, tag = "3")]
     pub retry_after_secs: u32,
+    /// A prefix is ready when its bytes reach the target or its oldest eligible file
+    /// was registered at least this many seconds ago. Zero disables waiting for
+    /// backward compatibility. Age determines eligibility, not an actual pickup deadline:
+    /// polling, worker capacity and concurrent claims can delay assignment further.
+    #[prost(uint32, tag = "4")]
+    pub max_wait_secs: u32,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AssignFilesForIndexingResponse {
-    /// Empty when no eligible work is available. Processing start is recorded before reply.
+    /// Empty when no ready batch is claimed. Processing start is recorded before reply.
     #[prost(message, repeated, tag = "1")]
     pub staged_files: ::prost::alloc::vec::Vec<DocumentsStagedForUpload>,
 }

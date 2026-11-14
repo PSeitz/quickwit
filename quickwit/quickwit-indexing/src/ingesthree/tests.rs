@@ -52,6 +52,7 @@ fn assignment() -> AssignFilesForIndexing {
         max_num_files: 10,
         max_num_bytes: 10_000_000,
         retry_after_secs: 60,
+        max_wait_secs: 0,
     }
 }
 

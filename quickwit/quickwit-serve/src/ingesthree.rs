@@ -470,6 +470,7 @@ mod tests {
                 max_num_files: 1,
                 max_num_bytes: BUDGET,
                 retry_after_secs: 60,
+                max_wait_secs: 0,
             }))
             .await
             .unwrap();

@@ -46,8 +46,14 @@ impl FileBackedMetastore {
             let candidate = self
                 .read_any(&index_id, None, |index| {
                     Ok(index
-                        .oldest_eligible_file(retry_before)
-                        .map(|candidate| (candidate, index.index_uid().clone())))
+                        .ready_assignment_files(request, now, retry_before)
+                        .first()
+                        .map(|file| {
+                            (
+                                (file.create_timestamp, file.file_id.clone()),
+                                index.index_uid().clone(),
+                            )
+                        }))
                 })
                 .await?;
             if let Some(candidate) = candidate

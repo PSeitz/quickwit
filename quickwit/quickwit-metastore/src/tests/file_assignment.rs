@@ -105,7 +105,7 @@ pub async fn test_assign_files_count_and_byte_prefix<
     let mut metastore = M::default_for_test().await;
     // Each expected group is a prefix. A large intervening file cannot be skipped.
     for (sizes, max_num_files, max_num_bytes, group_lengths) in [
-        (vec![40, 70, 10], 3, 100, vec![1, 2]),
+        (vec![40, 70, 10], 3, 100, vec![2, 1]),
         (vec![40, 20, 10], 2, 100, vec![2, 1]),
         (vec![40, 60, 10], 3, 100, vec![2, 1]),
         (vec![150, 10], 3, 100, vec![1, 1]),

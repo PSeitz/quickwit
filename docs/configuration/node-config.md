@@ -326,11 +326,26 @@ an indexing worker claims per metastore assignment (default `100MB`, or 100,000,
 It accepts sizes such as `1GB`, `512MiB`, or an integer byte count. Values must be positive
 and at most `INT64_MAX` bytes. Invalid or unreadable values fail worker startup before
 workers are spawned. Restart the service to apply changes. Each assignment groups at
-most 1,000 files from one index incarnation. The first file can exceed the target so
-large files still make progress. This setting is independent of file rotation and queue
-memory limits. Files are downloaded and processed sequentially within the group.
-The existing 60-second reassignment timeout is unchanged, so larger groups can cause
-concurrent retries if processing exceeds that interval.
+most 1,000 files from one index incarnation and includes the file that reaches or
+crosses the byte target. This setting is independent of file rotation and queue memory
+limits. All assigned files download before one task indexes the group.
+
+Set `QW_INGESTHREE_INDEXER_MAX_WAIT_SECS` to control how long an underfilled batch waits
+since its oldest eligible file's metastore registration (default `15` seconds). It accepts
+integer seconds from `0` through `4294967295`; `0` disables waiting. Invalid or unreadable
+values fail worker startup. Restart the service to apply changes. Files are claimed only
+when the byte target or age threshold is reached. Reaching the file-count cap alone
+leaves an underfilled batch waiting. Other ready indexes can still be claimed. Polling
+and worker availability can delay pickup beyond the age threshold. For example:
+
+```bash
+QW_INGESTHREE_INDEXER_BATCH_SIZE=500MB
+QW_INGESTHREE_INDEXER_MAX_WAIT_SECS=15
+```
+
+Metastores must support the added `max_wait_secs` protocol field to enforce waiting;
+older metastores ignore it. The existing 60-second reassignment timeout is unchanged,
+so larger groups can cause concurrent retries if processing exceeds that interval.
 
 This path supports JSON ingest sources without a source transform and Auto commits.
 Force, WaitFor, and legacy ingest requests are rejected. Acknowledgment means local
