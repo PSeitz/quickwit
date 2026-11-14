@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::ensure;
@@ -103,21 +103,27 @@ fn read_metadata(reader: &mut impl Read) -> anyhow::Result<IndexUid> {
     Ok(std::str::from_utf8(&payload)?.parse()?)
 }
 
-/// Reads documents from a finished file, checking its size, index incarnation, and checksums.
-/// Reading never repairs or truncates the file. Run filesystem operations on a blocking thread.
-pub struct DocumentFileReader {
-    reader: BufReader<File>,
+/// Reads a finished input from disk or memory, checking its size, index incarnation, and checksums.
+/// Reading never repairs or truncates the input. Run filesystem operations on a blocking thread.
+pub struct DocumentFileReader<R = BufReader<File>> {
+    reader: R,
     remaining_bytes: u64,
 }
 
 impl DocumentFileReader {
     pub fn open(path: &Path, index_uid: &IndexUid, num_bytes: u64) -> anyhow::Result<Self> {
-        let file = File::open(path)?;
+        Self::new(BufReader::new(File::open(path)?), index_uid, num_bytes)
+    }
+}
+
+impl<R: Read + Seek> DocumentFileReader<R> {
+    /// Validates the complete input length and reads its header from the start.
+    pub fn new(mut reader: R, index_uid: &IndexUid, num_bytes: u64) -> anyhow::Result<Self> {
         ensure!(
-            file.metadata()?.len() == num_bytes,
+            reader.seek(SeekFrom::End(0))? == num_bytes,
             "input file size mismatch"
         );
-        let mut reader = BufReader::new(file);
+        reader.rewind()?;
         ensure!(
             read_metadata(&mut reader)? == *index_uid,
             "input index UID mismatch"
@@ -207,6 +213,37 @@ pub(super) fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_document_reader_from_memory() {
+        let index_uid = IndexUid::for_test("memory-reader", 1);
+        let mut contents = MAGIC.to_vec();
+        write_record(&mut contents, &encode_metadata(&index_uid).unwrap()).unwrap();
+        write_record(&mut contents, b"document").unwrap();
+        let num_bytes = contents.len() as u64;
+        let open = |data: Vec<u8>, uid: &IndexUid, size| {
+            DocumentFileReader::new(io::Cursor::new(data), uid, size)
+        };
+        let mut reader = open(contents.clone(), &index_uid, num_bytes).unwrap();
+        assert_eq!(reader.read_document().unwrap().unwrap(), &b"document"[..]);
+        assert!(reader.read_document().unwrap().is_none());
+        assert!(open(contents.clone(), &index_uid, num_bytes + 1).is_err());
+        assert!(
+            open(
+                contents.clone(),
+                &IndexUid::for_test("memory-reader", 2),
+                num_bytes
+            )
+            .is_err()
+        );
+        let mut bad_checksum = contents.clone();
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        for damaged in [bad_checksum, contents[..contents.len() - 1].to_vec()] {
+            let size = damaged.len() as u64;
+            let mut reader = open(damaged, &index_uid, size).unwrap();
+            assert!(reader.read_document().is_err());
+        }
+    }
 
     #[test]
     fn test_document_reader_checks_frames_and_identity() {

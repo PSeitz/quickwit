@@ -174,32 +174,25 @@ impl S3Indexer {
             },
         )
         .await?;
-        for (file_index, file) in files.iter().enumerate() {
+        // Download the entire assignment into memory before dispatching its indexing task.
+        let mut downloaded_files = Vec::with_capacity(files.len());
+        for file in &files {
             let uri: Uri = file.file_uri.parse()?;
             let storage = self
                 .storage_resolver
                 .resolve(&uri.parent().context("input URI has no parent")?)
                 .await?;
-            // Download the entire assignment before dispatching its indexing task.
-            // Local names are independent of remote paths and unique within this attempt.
-            let path = directory.path().join(file_index.to_string());
-            let size = storage
-                .copy_to_file(uri.file_name().context("input URI has no filename")?, &path)
+            let contents = storage
+                .get_all(uri.file_name().context("input URI has no filename")?)
                 .await?;
             ensure!(
-                size == file.num_bytes,
+                contents.len() as u64 == file.num_bytes,
                 "downloaded input size differs from registration"
             );
+            downloaded_files.push(contents);
         }
-        let files_to_index = files.clone();
-        let input_directory = directory.clone();
         let prepared = run_indexing(directory.clone(), active_assignment.clone(), move || {
-            builders.index_files(
-                input_directory.path(),
-                &files_to_index,
-                &merge_policy,
-                retention.as_ref(),
-            )
+            builders.index_files(downloaded_files, &merge_policy, retention.as_ref())
         })
         .await?;
         let mut splits = Vec::new();

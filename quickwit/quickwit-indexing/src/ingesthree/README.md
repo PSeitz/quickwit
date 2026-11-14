@@ -57,8 +57,9 @@ so another worker can claim the inputs while an upload is still retrying.
 
 There are no stage actors or stage channels. One blocking-runtime task creates the scratch
 directory and builders, including the mapper. All files in the assignment are downloaded
-before one blocking-runtime task processes the entire assignment: opening files, incremental
-reading, document conversion/insertion, serialization, and packaging. Internal document
+into owned memory buffers before one blocking-runtime task processes the entire assignment:
+incremental decoding, document conversion/insertion, serialization, and packaging. Input
+buffers are passed directly to the task, with no local input files. Internal document
 batches preserve the heap flush checks without dispatching another task per file
 or document batch. Storage/metastore calls remain async.
 Running synchronous work retains the scratch root after caller cancellation and checks a
@@ -71,8 +72,11 @@ and at group end. `split_num_docs_target` affects merge maturity, rather than tr
 an indexing flush. All splits remain unpublished until every input has been processed.
 Flushed splits are serialized to scratch within the assignment task and uploaded after
 every assigned file is consumed.
-Partially filled builders carry across files and flush at group end. All input files initially
-occupy scratch space and are removed individually after processing. Packaged files, metadata,
+Partially filled builders carry across inputs and flush at group end. Each input buffer is
+released after processing that input. At download completion, each worker holds the entire
+uncompressed assignment in memory. The assignment byte target is soft and permits an
+oversized input. These buffers are additional to writer memory and are outside its heap
+flush threshold and writer-memory gauge. Packaged files still use scratch disk. Their metadata
 and hotcache payloads accumulate until the assignment task returns, increasing per-assignment
 scratch and packaging-memory needs. A corrupt input fails the task before any output is staged
 or uploaded. Serialization concurrency follows worker count. The shared upload

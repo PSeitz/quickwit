@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{Context, ensure};
@@ -29,8 +29,7 @@ use quickwit_ingest::ingesthree::DocumentFileReader;
 use quickwit_metastore::SplitMetadata;
 use quickwit_metrics::{Counter, Gauge, GaugeGuard, counter};
 use quickwit_proto::indexing::IndexingPipelineId;
-use quickwit_proto::metastore::DocumentsStagedForUpload;
-use quickwit_storage::SplitPayload;
+use quickwit_storage::{OwnedBytes, SplitPayload};
 
 use super::metrics::MEMORY_FLUSHES;
 use crate::actors::{
@@ -179,24 +178,23 @@ impl SplitBuilders {
     }
 
     /// Processes the assignment synchronously, preserving partially filled builders across files.
-    /// Downloads must be named by their position in `files`. Consumed inputs are removed locally.
+    /// Owns downloaded input buffers and releases each one after processing it.
     /// Flushes serialize to scratch here. Uploads happen after the entire assignment is consumed.
     pub fn index_files(
         &mut self,
-        directory: &Path,
-        files: &[DocumentsStagedForUpload],
+        files: Vec<OwnedBytes>,
         merge_policy: &Arc<dyn MergePolicy>,
         retention: Option<&RetentionPolicy>,
     ) -> anyhow::Result<Vec<PreparedSplit>> {
         let mut prepared = Vec::new();
-        for (file_index, file) in files.iter().enumerate() {
+        for contents in files {
             let _guard = self.io_controls.check_if_alive()?;
-            let path = directory.join(file_index.to_string());
-            let index_uid = file
-                .index_uid
-                .as_ref()
-                .context("assigned file has no index UID")?;
-            let mut reader = DocumentFileReader::open(&path, index_uid, file.num_bytes)?;
+            let num_bytes = contents.len() as u64;
+            let mut reader = DocumentFileReader::new(
+                Cursor::new(contents),
+                &self.pipeline_id.index_uid,
+                num_bytes,
+            )?;
             loop {
                 let _guard = self.io_controls.check_if_alive()?;
                 let documents = read_batch(&mut reader)?;
@@ -209,8 +207,6 @@ impl SplitBuilders {
                     self.prepare_splits(merge_policy, retention, &mut prepared)?;
                 }
             }
-            drop(reader);
-            std::fs::remove_file(path)?;
         }
         self.prepare_splits(merge_policy, retention, &mut prepared)?;
         Ok(prepared)
@@ -269,7 +265,7 @@ impl SplitBuilders {
 }
 
 /// Read incrementally inside the assignment task. The final document can exceed the byte target.
-fn read_batch(reader: &mut DocumentFileReader) -> anyhow::Result<Vec<Bytes>> {
+fn read_batch(reader: &mut DocumentFileReader<Cursor<OwnedBytes>>) -> anyhow::Result<Vec<Bytes>> {
     let mut documents = Vec::new();
     let mut num_bytes = 0;
     while documents.len() < 128 && num_bytes < 1024 * 1024 {

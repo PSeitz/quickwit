@@ -56,8 +56,7 @@ fn assignment() -> AssignFilesForIndexing {
     }
 }
 
-async fn setup(mut config: IndexConfig) -> (S3Indexer, IndexUid) {
-    config.indexing_settings.resources.heap_size = bytesize::ByteSize::mb(100);
+async fn setup(config: IndexConfig) -> (S3Indexer, IndexUid) {
     let metastore = MetastoreServiceClient::new(FileBackedMetastore::for_test(Arc::new(
         RamStorage::default(),
     )));
@@ -206,7 +205,8 @@ fn assert_publication_counters(counters: &[Counter; 4], splits: &[SplitMetadata]
 
 #[tokio::test]
 async fn test_files_publish_searchable_splits_and_completion_together() {
-    let config = IndexConfig::for_test("files", "ram:///splits");
+    let mut config = IndexConfig::for_test("files", "ram:///splits");
+    config.indexing_settings.resources.heap_size = bytesize::ByteSize::mb(100);
     let mapping_uid = config.doc_mapping.doc_mapping_uid;
     let (mut worker, index_uid) = setup(config).await;
     let counters = publication_counters(&worker, &index_uid);
@@ -435,6 +435,30 @@ async fn test_corrupt_input_preserves_group_without_uploading_outputs() {
     // Packaging earlier inputs stays local until the whole assignment succeeds.
     assert!(splits.is_empty());
     assert_eq!(storage.get_all(path).await.unwrap().as_slice(), damaged);
+}
+
+#[tokio::test]
+async fn test_download_rejects_wrong_input_size() {
+    let (mut worker, index_uid) = setup(IndexConfig::for_test("input-size", "ram:///splits")).await;
+    let input = register_file(&mut worker, &index_uid, &[DOC]).await;
+    let storage = worker
+        .storage_resolver
+        .resolve(&Uri::for_test("ram:///inputs"))
+        .await
+        .unwrap();
+    let path = Path::new(&input.file_id);
+    let mut contents = storage.get_all(path).await.unwrap().to_vec();
+    contents.pop().unwrap();
+    storage.put(path, Box::new(contents)).await.unwrap();
+    let error = worker.index_next(assignment()).await.unwrap_err();
+    assert!(error.to_string().contains("downloaded input size differs"));
+    assert!(list_splits(&mut worker, &index_uid).await.is_empty());
+    assert!(
+        read_file(&mut worker, &input)
+            .await
+            .completed_timestamp
+            .is_none()
+    );
 }
 
 #[tokio::test]
