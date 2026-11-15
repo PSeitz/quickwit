@@ -18,30 +18,35 @@ Local input uses `<data_dir>/ingesthree`. Uploaded input uses
 Keep this prefix unchanged while local inputs remain. Queue/disk budgets and shutdown
 limits reuse `max_queue_memory_usage`, `max_queue_disk_usage`, and `decommission_timeout`.
 
-Discovery includes an ingesthree capability and a node-wide `ingesthree_capacity`
-score. Intake advertises capacity immediately and every five seconds using the v2
-0–10 score, based on queue memory, retained disk bytes plus reservations, and their
-recent change. Either budget at or below 5% remaining yields zero. The trend penalty
-and integer scoring can yield zero earlier when headroom is shrinking. Closed intake
-also advertises zero. The score measures buffer headroom, rather than CPU or MB/s.
-Routers require ready ingesthree indexers with a positive score. Missing feedback is
-ineligible until advertised. Routers always try their own node first when it is eligible,
-even if a peer advertises more capacity. Otherwise, and on retries, they prefer peers in
-the same AZ and randomly sample two distinct candidates per attempt. The higher capacity
-score wins. Equal scores use stable per-index affinity. Sampling spreads peer traffic
-for a single index while retaining a soft index preference. The previous 5% local-affinity
-bonus is replaced by this local-first rule.
-Retries exclude previously attempted nodes, including a rejected own node, and fall back
-across AZs when no same-AZ candidates remain. They try up to three destinations on capacity/unavailability failures. Skipping a node
-with zero/missing capacity consumes no attempt. Local admission remains authoritative
-because gossip can lag and other routers can consume capacity. Capacity failures,
-including all known destinations advertising zero, return HTTP 429. Saturation observed
-through gossip or rejection is preserved if the other destinations are unavailable.
-No ready destination with capacity feedback returns HTTP 503. File-presence hints remain
-unimplemented. Requests never fall back to v2 or create shards.
-The distinct internal RPC requires exactly one `ingest-version: ingesthree` metadata
-value before any lookup or write. Public clients need no new header. Ingesthree nodes
-expose this intake RPC instead of the v2 router RPC.
+### Capacity
+
+- Nodes advertise ingesthree support and a node-wide `ingesthree_capacity` score
+  immediately and every five seconds.
+- The v2 0–10 score tracks queue/disk headroom, reservations, and recent growth.
+  Either budget at ≤5% remaining gives zero. Growth can reduce it to zero earlier.
+  Closed intake also scores zero. CPU usage and throughput are not measured.
+- Gossip guides routing. Local admission checks enforce the budgets.
+
+### Routing
+
+Only ready ingesthree nodes with an advertised positive score are eligible.
+
+1. Try the router's own node first when eligible, regardless of peer scores.
+2. Otherwise, sample two peers and choose the higher score. Prefer the same AZ,
+   falling back to other AZs. Ties use stable per-index affinity.
+3. Retry capacity/unavailability failures on up to three distinct destinations total.
+   Skipped ineligible nodes consume no attempt.
+
+Capacity failures return **HTTP 429**, including when all known nodes advertise zero.
+Observed saturation takes precedence over unavailability. **HTTP 503** means no
+eligible node was found and no saturation was observed.
+
+### Protocol
+
+- Public clients need no new header. Internal RPCs require exactly one
+  `ingest-version: ingesthree` value before any lookup or write.
+- Ingesthree indexers expose this intake RPC in place of the v2 router RPC.
+  Requests never fall back to v2 or create shards.
 
 Public routing dispatches through `IngestRouterClient`. Ingesthree request and per-index
 errors use `IngestServiceError`, preserving HTTP 400 for invalid input, 429 for overload,
@@ -140,12 +145,14 @@ overhead, indexing scratch, and other workloads require separate monitoring.
   `QW_DISABLE_DOCUMENT_VALIDATION` override is preserved. Index/configuration
   resolution remains the caller's responsibility.
 - Validation runs through `run_cpu_intensive`. File IO runs through
-  `spawn_blocking`. Only valid documents reach the core. An all-invalid batch
-  returns its errors without creating a file.
+  `spawn_blocking`. The writer iterates the validated batch directly, retaining it
+  with its reservation until writing finishes. An all-invalid batch returns its
+  errors without creating a file.
 - Admission reserves queue and disk bytes together before enqueueing. Queue-full,
   storage-full, invalid-request, and unavailable errors are distinct. The queue
   budget charges queued and processing input, descriptors, a possible filtered
-  payload copy, and request overhead. Validator scratch, error-response allocations,
+  payload copy, descriptor capacity growth during filtering, and request overhead.
+  Validator scratch, error-response allocations,
   allocator overhead, and externally shared backing buffers are outside this input
   budget.
 - Disk reservations include framing and conservatively allow a new header for

@@ -258,18 +258,8 @@ async fn test_blocking_append_keeps_reservations_after_awaiter_cancellation() {
     let WriterRequest::Append(append) = receiver.try_recv().unwrap() else {
         panic!("expected append")
     };
-    let AppendRequest {
-        index_uid,
-        batch,
-        reply,
-        reservation,
-        ..
-    } = append;
-    let documents = ValidatedDocuments {
-        documents: batch.docs().map(|(_, bytes)| bytes).collect(),
-        reservation,
-    };
-    drop(batch);
+    let metrics = queue.admission.lock().unwrap().metrics.validation.clone();
+    let validated = append.validate(&metrics);
     let (started, ready) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
     let (finished, done) = oneshot::channel();
@@ -277,7 +267,7 @@ async fn test_blocking_append_keeps_reservations_after_awaiter_cancellation() {
         tokio::task::spawn_blocking(move || {
             started.send(()).unwrap();
             released.recv().unwrap();
-            let writer = append_validated(writer, index_uid, documents, Vec::new(), reply).unwrap();
+            let writer = append_validated(writer, validated).unwrap();
             drop(writer);
             finished.send(()).unwrap();
         })

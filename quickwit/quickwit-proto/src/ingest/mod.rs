@@ -147,7 +147,7 @@ impl ShardPKey {
 }
 
 impl DocBatchV2 {
-    pub fn docs(&self) -> impl Iterator<Item = (DocUid, Bytes)> + '_ {
+    pub fn docs(&self) -> impl Iterator<Item = (DocUid, Bytes)> + Clone + '_ {
         zip(&self.doc_uids, &self.doc_lengths).scan(
             self.doc_buffer.clone(),
             |doc_buffer, (doc_uid, doc_len)| {

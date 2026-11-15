@@ -364,7 +364,7 @@ fn test_rejections_create_no_input_files() {
     let dir = tempfile::tempdir().unwrap();
     let index = IndexUid::for_test("logs", 1);
     let mut ingester = Ingester::open(dir.path(), 0).unwrap();
-    assert!(ingester.append(&index, &[]).is_err());
+    assert!(ingester.append(&index, &[] as &[Bytes]).is_err());
     assert!(ingester.append(&index, &documents()).is_err());
     assert_eq!(
         fs::read_dir(dir.path().join("ingesthree")).unwrap().count(),

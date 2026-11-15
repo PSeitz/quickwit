@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
 use bytes::Bytes;
 use futures::future::OptionFuture;
 use quickwit_cluster::Cluster;
@@ -172,7 +173,7 @@ struct AppendRequest {
 struct ValidatedRequest {
     index_uid: IndexUid,
     reply: oneshot::Sender<Result<AppendResponse, IngestError>>,
-    documents: Result<(Vec<Bytes>, Vec<ParseFailure>), IngestError>,
+    validation: Result<(DocBatchV2, Vec<ParseFailure>), IngestError>,
     reservation: Reservation,
 }
 
@@ -185,11 +186,11 @@ impl AppendRequest {
             reply,
             reservation,
         } = self;
-        let documents = validate_documents(batch, mapper, metrics);
+        let validation = validate_documents(batch, mapper, metrics);
         ValidatedRequest {
             index_uid,
             reply,
-            documents,
+            validation,
             reservation,
         }
     }
@@ -420,13 +421,16 @@ fn num_bytes(index_uid: &IndexUid, batch: &DocBatchV2) -> Result<(u64, u64), Ing
     }
     let metadata = encode_metadata(index_uid)
         .map_err(|error| IngestError::InvalidRequest(error.to_string()))?;
-    // Count input buffers, a possible filtered payload, and request overhead.
+    // Count input buffers, a possible filtered payload, descriptor growth, and request overhead.
     let mut queue_bytes = size_of::<AppendRequest>() as u64 + metadata.len() as u64;
     for (count, size) in [
         (batch.doc_buffer.len(), 2),
         (batch.doc_lengths.capacity(), size_of::<u32>()),
         (batch.doc_uids.capacity(), size_of::<DocUid>()),
-        (batch.doc_lengths.len(), size_of::<Bytes>()),
+        (
+            batch.doc_lengths.len(),
+            size_of::<u32>() + size_of::<DocUid>(),
+        ),
     ] {
         queue_bytes = (count as u64)
             .checked_mul(size as u64)
@@ -443,12 +447,12 @@ fn num_bytes(index_uid: &IndexUid, batch: &DocBatchV2) -> Result<(u64, u64), Ing
     Ok((queue_bytes, disk_bytes))
 }
 
-/// Validates a batch and returns its documents and parse failures.
+/// Validates a batch and returns its valid documents and parse failures.
 fn validate_documents(
     batch: DocBatchV2,
     mapper: Option<Arc<DocMapper>>,
     metrics: &ValidationMetrics,
-) -> Result<(Vec<Bytes>, Vec<ParseFailure>), IngestError> {
+) -> Result<(DocBatchV2, Vec<ParseFailure>), IngestError> {
     let document_bytes = batch
         .doc_lengths
         .iter()
@@ -464,10 +468,7 @@ fn validate_documents(
         _ => (batch, Vec::new()),
     };
     metrics.record(&batch, parse_failures.len(), original_bytes);
-    Ok((
-        batch.docs().map(|(_, bytes)| bytes).collect(),
-        parse_failures,
-    ))
+    Ok((batch, parse_failures))
 }
 
 /// Writes batches and finishes files while upload and registration make progress.
@@ -615,12 +616,6 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     }
 }
 
-// Owns validated document buffers and their reservation in drop order.
-struct ValidatedDocuments {
-    documents: Vec<Bytes>,
-    reservation: Reservation,
-}
-
 /// Validates and writes one batch, settles its reservation, and replies to the caller.
 async fn append_batch(ingester: FileWriter, append: AppendRequest) -> anyhow::Result<FileWriter> {
     let metrics = append
@@ -633,13 +628,22 @@ async fn append_batch(ingester: FileWriter, append: AppendRequest) -> anyhow::Re
         .clone();
     // Move the request into validation. Cancellation can leave CPU work running,
     // and a discarded result must drop its buffers before its reservation.
+    let validated = run_cpu_intensive(move || append.validate(&metrics)).await?;
+    tokio::task::spawn_blocking(move || append_validated(ingester, validated)).await?
+}
+
+fn append_validated(
+    mut ingester: FileWriter,
+    validated: ValidatedRequest,
+) -> anyhow::Result<FileWriter> {
     let ValidatedRequest {
         index_uid,
         reply,
-        documents: result,
+        validation,
         reservation,
-    } = run_cpu_intensive(move || append.validate(&metrics)).await?;
-    let (documents, parse_failures) = match result {
+    } = validated;
+    // Declared after the reservation so the batch drops first during unwinding.
+    let (batch, parse_failures) = match validation {
         Ok(documents_and_failures) => documents_and_failures,
         Err(error) => {
             drop(reservation);
@@ -647,8 +651,8 @@ async fn append_batch(ingester: FileWriter, append: AppendRequest) -> anyhow::Re
             return Ok(ingester);
         }
     };
-    if documents.is_empty() {
-        drop(documents);
+    if batch.is_empty() {
+        drop(batch);
         drop(reservation);
         let _ = reply.send(Ok(AppendResponse {
             file_id: None,
@@ -657,29 +661,11 @@ async fn append_batch(ingester: FileWriter, append: AppendRequest) -> anyhow::Re
         }));
         return Ok(ingester);
     }
-    let documents = ValidatedDocuments {
-        documents,
-        reservation,
-    };
-    tokio::task::spawn_blocking(move || {
-        append_validated(ingester, index_uid, documents, parse_failures, reply)
-    })
-    .await?
-}
-
-fn append_validated(
-    mut ingester: FileWriter,
-    index_uid: IndexUid,
-    documents: ValidatedDocuments,
-    parse_failures: Vec<ParseFailure>,
-    reply: oneshot::Sender<Result<AppendResponse, IngestError>>,
-) -> anyhow::Result<FileWriter> {
     let previous_disk_bytes = ingester.disk_bytes;
-    let num_docs = documents.documents.len() as u64;
-    let result = ingester.append(&index_uid, &documents.documents);
+    let num_docs = batch.num_docs() as u64;
+    let result = ingester.append(&index_uid, batch.docs().map(|(_, document)| document));
     let written_bytes = ingester.disk_bytes - previous_disk_bytes;
-    drop(documents.documents);
-    let reservation = documents.reservation;
+    drop(batch);
     match result {
         Ok(file_id) => {
             // Settle in the blocking task even if its awaiting future was cancelled.

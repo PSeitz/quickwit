@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
+#[cfg(test)]
 use bytes::Bytes;
 use bytesize::ByteSize;
 use quickwit_proto::types::IndexUid;
@@ -214,18 +215,25 @@ impl Ingester {
     /// Files reaching the size target are finished after a whole batch, which can exceed the
     /// target. WriteQueue's writer loop finishes expired files between requests.
     /// At the open-file limit, requests needing an additional writer are rejected.
-    pub fn append(&mut self, index_uid: &IndexUid, documents: &[Bytes]) -> anyhow::Result<Ulid> {
+    /// Cloning the iterator must preserve document lengths for the disk-budget preflight.
+    pub fn append(
+        &mut self,
+        index_uid: &IndexUid,
+        documents: impl IntoIterator<Item: AsRef<[u8]>, IntoIter: Clone>,
+    ) -> anyhow::Result<Ulid> {
         ensure!(
             !self.requires_recovery,
             "ingester requires recovery after an IO failure"
         );
-        ensure!(!documents.is_empty(), "empty document batch");
+        let documents = documents.into_iter();
         let mut added_bytes = 0u64;
-        for document in documents {
+        for document in documents.clone() {
             added_bytes = added_bytes
-                .checked_add(record_size(document.len())?)
+                .checked_add(record_size(document.as_ref().len())?)
                 .context("input size overflow")?;
         }
+        // Every document contributes frame overhead, including empty documents.
+        ensure!(added_bytes > 0, "empty document batch");
         let new_header = if self.active.contains_key(index_uid) {
             None
         } else {
@@ -284,6 +292,7 @@ impl Ingester {
             .get_mut(index_uid)
             .expect("active file just created");
         for document in documents {
+            let document = document.as_ref();
             write_record(&mut active.writer, document)?;
             active.input.num_bytes += record_size(document.len())?;
             active.input.num_docs += 1;
