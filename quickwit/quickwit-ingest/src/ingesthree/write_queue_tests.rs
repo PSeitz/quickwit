@@ -219,14 +219,11 @@ async fn test_malformed_batches_do_not_stop_the_writer() {
     truncated.doc_lengths[0] += 1;
     let mut trailing_bytes = batch();
     trailing_bytes.doc_lengths[0] -= 1;
-    let mut duplicate_ids = DocBatchV2::for_test(["{}", "{}"]);
-    duplicate_ids.doc_uids[1] = duplicate_ids.doc_uids[0];
     for malformed in [
         DocBatchV2::default(),
         mismatched_ids,
         truncated,
         trailing_bytes,
-        duplicate_ids,
     ] {
         assert!(matches!(
             queue.append(index(), malformed, None).await,
@@ -234,9 +231,16 @@ async fn test_malformed_batches_do_not_stop_the_writer() {
         ));
         assert_eq!(byte_usage(&queue), (0, 0, 0));
     }
+    // Like v2, intake relies on the request builder to assign unique document IDs.
+    let mut duplicate_ids = DocBatchV2::for_test(["{}", "{}"]);
+    duplicate_ids.doc_uids[1] = duplicate_ids.doc_uids[0];
     assert_eq!(
-        queue.append(index(), batch(), None).await.unwrap().num_docs,
-        1
+        queue
+            .append(index(), duplicate_ids, None)
+            .await
+            .unwrap()
+            .num_docs,
+        2
     );
     queue.finish().await.unwrap();
 }

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -454,11 +453,9 @@ fn validate_documents(
         .doc_lengths
         .iter()
         .try_fold(0usize, |sum, len| sum.checked_add(*len as usize));
-    if document_bytes != Some(batch.doc_buffer.len())
-        || batch.doc_uids.iter().collect::<HashSet<_>>().len() != batch.doc_uids.len()
-    {
+    if document_bytes != Some(batch.doc_buffer.len()) {
         return Err(IngestError::InvalidRequest(
-            "inconsistent lengths or duplicate document IDs".into(),
+            "inconsistent document lengths".into(),
         ));
     }
     let original_bytes = batch.num_bytes();

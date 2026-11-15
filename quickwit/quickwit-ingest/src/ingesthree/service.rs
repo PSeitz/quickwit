@@ -199,7 +199,6 @@ pub(super) fn validate_request(request: &IngestRequestV2) -> Result<(), IngestSe
         if batch.is_empty()
             || batch.doc_lengths.len() != batch.doc_uids.len()
             || document_bytes != Some(batch.doc_buffer.len())
-            || batch.doc_uids.iter().collect::<HashSet<_>>().len() != batch.doc_uids.len()
         {
             return Err(IngestServiceError::BadRequest(
                 "empty or inconsistent document batch".into(),

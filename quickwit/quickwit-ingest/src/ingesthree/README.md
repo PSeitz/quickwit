@@ -47,6 +47,9 @@ Public routing dispatches through `IngestRouterClient`. Ingesthree request and p
 errors use `IngestServiceError`, preserving HTTP 400 for invalid input, 429 for overload,
 and 503 for unavailability. Bulk responses retain successful items alongside failed items.
 The intake RPC reuses existing request/success messages and index/source lookup failures.
+Like v2, intake relies on the request builder to assign unique document IDs for
+per-document error reporting. Batch checks verify lengths and document counts without
+scanning IDs for duplicates.
 Other intake failures use gRPC status codes. The v2 error enums and router remain unchanged.
 
 Intake caches index/source configuration and the document mapper per index. Concurrent
