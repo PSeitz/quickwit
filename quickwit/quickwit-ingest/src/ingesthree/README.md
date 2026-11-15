@@ -1,322 +1,125 @@
 # Ingesthree intake
 
-This implementation includes the local-storage core, write queue, upload/registration,
-and an opt-in service/router path. V2 remains the default.
+Experimental, opt-in ingestion through local files and object storage. V2 remains the default.
 
-## Enable the service
+```text
+request → validate → append locally → ACK
+                          ↓
+                  finish file → upload → register → index
+```
 
-Set `ingest_api.enable_ingesthree: true` on public-router and ingesthree indexer nodes.
-The existing ingest, Elasticsearch bulk, and enabled OTLP endpoints then use the file
-router. Indexer nodes start gated intake recovery and one independently supervised
-S3 indexing worker per configured CPU (`QW_NUM_CPUS`).
-Ingesthree indexers require `enable_standalone_compactors: true`, with a standalone
-planner on a Janitor node and merge workers on separate Compactor nodes. Router-only
-nodes need no compaction opt-in. The planner discovers published splits through the
-metastore, independently of the publishing indexer.
-Local input uses `<data_dir>/ingesthree`. Uploaded input uses
-`<default_index_root_uri>/.ingesthree/<file_id>` on storage readable by every indexer.
-Keep this prefix unchanged while local inputs remain. Queue/disk budgets and shutdown
-limits reuse `max_queue_memory_usage`, `max_queue_disk_usage`, and `decommission_timeout`.
+**ACK means the local write was flushed to the kernel.** It does not guarantee fsync,
+host-loss durability, upload, or searchability. Delivery is at least once.
 
-### Capacity
+## Setup
 
-- Nodes advertise ingesthree support and a node-wide `ingesthree_capacity` score
-  immediately and every five seconds.
-- The v2 0–10 score tracks queue/disk headroom, reservations, and recent growth.
-  Either budget at ≤5% remaining gives zero. Growth can reduce it to zero earlier.
-  Closed intake also scores zero. CPU usage and throughput are not measured.
-- Gossip guides routing. Local admission checks enforce the budgets.
+- Set `ingest_api.enable_ingesthree: true` on routers and ingesthree indexers.
+- Set `enable_standalone_compactors: true` on ingesthree indexers. Compactor workers
+  handle later merges. Initial split publication works without them.
+- Use the built-in JSON ingest source without a transform. Only `Auto` commits are supported.
+- Existing ingest, Elasticsearch bulk, and enabled OTLP endpoints need no new client header.
+  Internal RPCs require exactly one `ingest-version: ingesthree` value. There is no v2 fallback.
 
-### Routing
+| Storage | Location |
+| --- | --- |
+| Local input | `<data_dir>/ingesthree` |
+| Uploaded input | `<default_index_root_uri>/.ingesthree/<file_id>` |
 
-Only ready ingesthree nodes with an advertised positive score are eligible.
+All indexers need access to uploaded input. Keep the upload location unchanged while
+local files remain. See [node configuration](../../../../docs/configuration/node-config.md#experimental-ingesthree).
 
-1. Try the router's own node first when eligible, regardless of peer scores.
-2. Otherwise, sample two peers and choose the higher score. Prefer the same AZ,
-   falling back to other AZs. Ties use stable per-index affinity.
+## Intake and limits
+
+- One writer per node validates and appends batches serially. Each index incarnation
+  has its own active file. Queued batches are not combined.
+- `validate_docs: false` skips document-schema validation. Batch-length checks remain.
+  Invalid documents produce per-document errors. Valid documents continue through intake.
+- Queue and disk bytes are reserved before enqueueing and remain charged through processing.
+  These budgets cover input accounting, not total process memory or physical disk usage.
+
+| Limit | Default / setting |
+| --- | --- |
+| File size target | 100 MB; override with `QW_INGESTHREE_TARGET_UPLOAD_SIZE` |
+| File age | 10 seconds from creation, checked between batches |
+| Active files | 1,024 per node; existing files can still accept appends at the limit |
+| Queue budget | `max_queue_memory_usage` |
+| Disk budget | `max_queue_disk_usage` |
+
+Files finish after a whole batch, so they can exceed the size target. Finishing keeps
+the disk charge until local deletion. Invalid or zero size targets fail startup.
+
+## Routing
+
+Only ready ingesthree nodes with positive advertised capacity are eligible.
+
+1. Try the router's own node first when eligible.
+2. Otherwise, sample two peers and choose the higher capacity. Prefer the same AZ,
+   then other AZs. Ties use per-index affinity.
 3. Retry capacity/unavailability failures on up to three distinct destinations total.
-   Skipped ineligible nodes consume no attempt.
 
-Capacity failures return **HTTP 429**, including when all known nodes advertise zero.
-Observed saturation takes precedence over unavailability. **HTTP 503** means no
-eligible node was found and no saturation was observed.
+Capacity is a 0–10 queue/disk-headroom score, advertised immediately and every five
+seconds. It reaches zero at ≤5% remaining, earlier under growth, or when intake closes.
+Local admission enforces the budgets. CPU usage is not part of the score.
 
-### Protocol
+Errors use **400** for invalid input, **429** for saturation, and **503** for unavailability.
+Observed saturation takes precedence over unavailability. Bulk responses preserve partial successes.
 
-- Public clients need no new header. Internal RPCs require exactly one
-  `ingest-version: ingesthree` value before any lookup or write.
-- Ingesthree indexers expose this intake RPC in place of the v2 router RPC.
-  Requests never fall back to v2 or create shards.
+## Upload and recovery
 
-Public routing dispatches through `IngestRouterClient`. Ingesthree request and per-index
-errors use `IngestServiceError`, preserving HTTP 400 for invalid input, 429 for overload,
-and 503 for unavailability. Bulk responses retain successful items alongside failed items.
-The intake RPC reuses existing request/success messages and index/source lookup failures.
-Like v2, intake relies on the request builder to assign unique document IDs for
-per-document error reporting. Batch checks verify lengths and document counts without
-scanning IDs for duplicates.
-Other intake failures use gRPC status codes. The v2 error enums and router remain unchanged.
+Finished files are uploaded, registered in the metastore, then deleted locally.
+Disk charges remain until deletion succeeds.
 
-Intake caches index/source configuration and the document mapper per index. Concurrent
-misses share initialization. Mutation notifications invalidate the cache, and background
-reconciliation repairs missed notifications. See [metadata lifecycle](../../../../docs/internals/ingesthree-metadata-cache.md).
-The source must be the built-in JSON ingest source without a transform. Auto commits are supported.
-Force, WaitFor, and legacy ingest are rejected explicitly. ACK means local append/kernel
-flush, rather than fsync, upload, or search visibility.
+- Retries and recovery reuse the file's ID and bytes. Restart can replay an upload or registration.
+- If registration finds the index incarnation was deleted, discard that input.
+  Recreating the same index name never redirects old documents to it.
+- Permanent upload/registration errors close intake and retain local data for recovery.
+  Local IO failures also require reopening before more writes.
+- Recovery repairs incomplete final records in open files. Corruption fails recovery.
+  Finished files are immutable and never repaired.
 
-Startup completes recovered handoffs before advertising readiness. Shutdown closes
-intake, drains accepted files, and stops indexing restarts. A drain timeout retains local
-data for recovery. Unexpected writer closure fails the server so process supervision
-can restart it and recover retained files. V2 retains its existing retirement sequence.
-See [node configuration](../../../../docs/configuration/node-config.md#experimental-ingesthree)
-and [file indexing and compaction](../../../quickwit-indexing/src/ingesthree/README.md).
+The experimental format uses length-prefixed records with CRC32 checksums.
+See [file format and recovery code](documents_staged_for_upload.rs).
+
+## Startup and shutdown
+
+| Operation | Result |
+| --- | --- |
+| `open()` with an uploader | Recover, upload/register or discard, and delete retained files before opening intake. |
+| `finish()` or drop all handles | Stop intake, drain queued writes, and finish files locally. Upload completion is not required. |
+| `drain()` | Stop intake and wait for queued writes, uploads, registration, and local deletion. Requires an uploader. |
+
+- Cancellation or timeout retains remaining local files for recovery. Reopen to resume.
+- Directory ownership lasts until local filesystem work finishes.
+- Server shutdown uses `decommission_timeout`. Draining does not wait for indexing or remote cleanup.
 
 ## Metrics
 
-Intake reuses `quickwit_ingest_docs_total` and `quickwit_ingest_docs_bytes_total`
-with `validity="valid|invalid"`. These count validation attempts before append,
-including all-invalid batches. Bytes include the document payload and batch length
-entries. Validation-disabled documents count as valid. Retries can count documents
-again. These counters measure input processing rather than durable publication.
-
-Routing reuses `quickwit_ingest_ingest_result_total{result}` for final subrequest
-outcomes and `quickwit_ingest_ingest_attempts{az_routing}` for destination attempts.
-Capacity-filtered destinations consume no attempt. Invalid requests use
-`result="bad_request"`. Request buffers use
-`quickwit_memory_in_flight_data_bytes{component="ingest_router"}`.
-The common `quickwit_grpc_*` families cover internal calls with
-`service="ingesthree"`, `grpc_service="ingesthree"`, `kind="client|server"`, and
-`rpc="ingest"`. RPC success can contain an application-level subrequest failure.
-
-The following node-level gauges use the `quickwit_ingesthree_` prefix:
+Node-level metrics use the `quickwit_ingesthree_` prefix:
 
 | Suffix | Meaning |
 | --- | --- |
-| `queue_bytes` | Reserved queued and processing input bytes, including validation copies and descriptors. Also exposed as memory in-flight bytes with `component="ingesthree_queue"`. |
-| `queue_limit_bytes` | Configured queue byte budget. |
-| `disk_bytes` | Last-known logical framed-file bytes in the node's ingesthree directory, including recovered files and pending local deletion. |
-| `disk_reserved_bytes` | Reservations for queued and processing appends. |
-| `disk_limit_bytes` | Configured logical disk byte budget. |
-| `capacity_score` | Last sampled 0–10 gossip score. Zero before sampling and after intake closes. |
+| `queue_bytes`, `queue_limit_bytes` | Reserved input bytes and queue budget |
+| `disk_bytes`, `disk_reserved_bytes`, `disk_limit_bytes` | Retained file bytes, pending-write reservations, and disk budget |
+| `capacity_score` | Last sampled 0–10 capacity score |
+| `admission_rejections_total{reason}` | Rejections: `queue_full`, `storage_full`, `open_file_limit`, or `unavailable` |
 
-`quickwit_ingesthree_admission_rejections_total{reason}` counts destination admission
-rejections as `queue_full`, `storage_full`, `open_file_limit`, or `unavailable`.
-The same request can encounter multiple destination rejections before its final result.
+Other useful metrics:
 
-Input reservations follow their buffers through cancellation and blocking work.
-The disk and configured-limit gauges are snapshots for the node's single ingesthree
-directory. Retained bytes survive writer shutdown, and reopening replaces the disk
-snapshot with recovered charges. Failed partial writes are reconciled on recovery.
-Disk gauges describe logical admission accounting; physical free space, filesystem
-overhead, indexing scratch, and other workloads require separate monitoring.
+- `quickwit_ingest_docs_total` and `quickwit_ingest_docs_bytes_total`, labeled by validity:
+  validation attempts before append. Retries can count again. These are not publication counters.
+- `quickwit_ingest_ingest_result_total` and `quickwit_ingest_ingest_attempts`: routing outcomes and attempts.
+- `quickwit_grpc_*` with `service="ingesthree"`: internal RPCs. RPC success can include subrequest failures.
 
-## Implemented
+Monitor physical disk space and process memory separately from the input-accounting gauges.
 
-- `Ingester::open(data_dir, max_disk_bytes)` uses `<data_dir>/ingesthree`, with an
-  exclusive directory lock held through writer destruction. Storage paths derive from
-  the existing data directory and index-root settings.
-- `append(index_uid, documents)` accumulates opaque, caller-validated documents in
-  one active file per index incarnation. It returns the file ID after flushing the
-  userspace buffer to the kernel. It does not fsync or promise host-crash survival.
-- Each filename carries the file ULID. The header stores only the index UID,
-  including the incarnation.
-- The storage budget includes metadata, document bytes, and framing. Recovery
-  counts retained files even when they exceed the current budget. Rejection before
-  writing leaves the ingester usable. An IO failure stops further appends until
-  reopen/recovery, preventing acknowledged records after an incomplete record.
-- `Ingester::finish_file(index_uid)` closes the active file without changing its
-  bytes. The next append uses a new file ID. `finish()` finishes all active files
-  and releases the directory. These operations retain every input on disk.
-- Startup checks and finishes surviving open files under their original IDs. New
-  intake always uses fresh files. A complete unacknowledged record may survive,
-  consistent with at-least-once delivery.
+## Remaining rollout work
 
-## Write queue
+- Node-wide indexing memory/scratch admission and progress for oversized assignments.
+- Physical disk/inode checks and recovery reserves.
+- Remote input/orphan cleanup, late-upload races, and completion-evidence expiry.
+- Live AWS, multipart crash windows, host-loss behavior, and performance validation.
 
-- `WriteQueue::open(data_dir, max_queue_bytes, max_disk_bytes, uploader)` recovers
-  the core on the blocking pool. With `Some(Uploader::new(storage, metastore))`, it
-  uploads, registers, and deletes every recovered local file before returning the
-  queue. Registration delays therefore keep intake closed. `None` enables local-only writing.
-  Clones share queue and disk byte limits. The queue passes document batches
-  to the writer for validation and writing to per-index files.
-- `append(index_uid, batch, mapper)` accepts the existing `DocBatchV2` payload.
-  `Some(mapper)` reuses JSON/schema validation and per-document `ParseFailure`
-  results. `None` corresponds to `validate_docs=false`. The existing
-  `QW_DISABLE_DOCUMENT_VALIDATION` override is preserved. Index/configuration
-  resolution remains the caller's responsibility.
-- Validation runs through `run_cpu_intensive`. File IO runs through
-  `spawn_blocking`. The writer iterates the validated batch directly, retaining it
-  with its reservation until writing finishes. An all-invalid batch returns its
-  errors without creating a file.
-- Admission reserves queue and disk bytes together before enqueueing. Queue-full,
-  storage-full, invalid-request, and unavailable errors are distinct. The queue
-  budget charges queued and processing input, descriptors, a possible filtered
-  payload copy, descriptor capacity growth during filtering, and request overhead.
-  Validator scratch, error-response allocations,
-  allocator overhead, and externally shared backing buffers are outside this input
-  budget.
-- Disk reservations include framing and conservatively allow a new header for
-  every queued request. After a successful append, reservations transfer atomically
-  to retained file bytes. Validation failures release unused reservations.
-  Recovery includes existing files in the disk budget.
-- IO failure stops the worker and rejects pending/new work. Reopen recovers files
-  and reconstructs accounting. `finish()` stops admission across all clones,
-  drains the queue, and finishes files locally.
-
-## Upload handoff
-
-The writer polls one upload/registration future alongside file deadlines and incoming
-batches. The future completes after registration. The writer handles local deletion
-and its retries separately. Network waits leave the writer free to process requests.
-Each finished file follows this sequence:
-
-1. Stream its unchanged bytes through `Storage::put` to `<configured-prefix>/<file_id>`.
-   The object key contains the bare ULID. Resolve storage at the complete upload prefix.
-2. Call `RegisterFileForIndexing` with its index UID, file ID, full object URI, and
-   framed byte size. Registration leaves any existing processing/completion state intact.
-3. Delete the local file on the blocking pool, while the writer owns the directory.
-4. Release the file's disk charge from both the core and shared admission accounting.
-
-Failed uploads retry the same bytes and key. After a confirmed upload, only
-registration retries. After confirmed registration, only deletion retries. Retryable
-failures log their error and wait one second. Metastore connection/database/internal/IO
-errors, timeouts, unavailability, and throttling retry. Authorization and missing-resource
-upload errors fail immediately. Other storage errors retry because their categories
-can include transient failures. S3 HTTP 403/404 errors retain these classifications,
-except multipart `NoSuchUpload`, which allows replay after an ambiguous completion.
-
-If registration reports that the index incarnation no longer exists, log an error and
-discard that file. Delete its uploaded object, then its local copy, release its disk
-charge, and continue with other files. This also applies during startup and drain.
-Recreating the same index name never redirects old input to the new incarnation.
-Remote deletion retries every second; an already-missing object counts as deleted.
-Local files and disk charges remain until cleanup succeeds.
-
-Other permanent registration errors stop the writer and close intake. Accepted local
-data is finished and retained. Startup returns permanent upload or registration errors.
-Drain returns operation errors. Background failures are logged.
-Handoff processes one file at a time, so transient failures still hold up later files.
-
-Upload progress is kept in memory. Restart replays retained files under their original
-IDs, including files whose earlier upload or registration response was lost. Keep the
-upload destination unchanged while retained files exist. Re-uploading a completed file
-can recreate an object already deleted by remote cleanup. That cleanup protocol remains
-unimplemented.
-
-### Startup and shutdown
-
-With an uploader, `open()` completes upload, registration, and local deletion for each
-recovered file before exposing intake. Recovery processes one file at a time. Registration
-or deletion delays block later recovery files and keep intake closed. After recovery,
-the normal writer starts with fresh files and no recovered disk charges. Cancelling
-startup retains remaining files and releases the directory after local filesystem work
-completes. This replaces the earlier upload-only gate and deferred-registration queue.
-
-`finish()` and dropping all queue handles stop handoff, drain queued appends, and finish
-remaining files locally. They retain files whose deletion has not completed and return
-local metadata on explicit `finish()`.
-
-`drain()` stops admission across all clones, completes queued appends, finishes active
-files, and waits for upload, registration, and local deletion. Existing handoff progress
-is preserved. Success releases the directory lock and all disk charges, even while queue
-handles remain alive. Drain requires an uploader. Without one, it finishes locally and
-returns an error.
-
-Dropping the drain future cancels network handoff and releases the directory after local
-filesystem work completes. Admission stays closed and retained files remain available for
-recovery. A caller can use `tokio::time::timeout` to limit shutdown waits. Reopen to resume
-after cancellation or error. Cancellation can race with successful deletion or a remote
-commit, so recovery always uses stable IDs. Local drain does not wait for indexing or
-perform Janitor's remote-object cleanup.
-
-## Finishing files
-
-Finishing a file closes it and makes its contents immutable for upload.
-The next append creates a fresh file with a new ID. The core implements this with
-`finish_file(index_uid)`. Finished files use the `.finished` filename extension.
-
-The defaults are **100 MB**, **10 seconds**, and **1,024 active files**.
-Set `QW_INGESTHREE_TARGET_UPLOAD_SIZE` on ingesting nodes to override the size target,
-for example `QW_INGESTHREE_TARGET_UPLOAD_SIZE=250MB` or `256MiB`. A bare integer means
-bytes. The variable is read when intake opens. Invalid or zero sizes fail startup
-before local recovery changes any files. The target applies per index incarnation
-on each ingesting node. The 10-second deadline and node-wide memory/disk budgets
-remain unchanged.
-
-- Size includes the header and document framing: 100 MB means 100,000,000 file
-  bytes. The core finishes the file after a batch reaches the target. A batch
-  stays in one file and can push it over the target.
-- The deadline is fixed at creation plus 10 seconds. Appends leave it unchanged.
-  The writer loop finishes files at their deadlines. It wakes for idle files and
-  prioritizes expired deadlines over queued requests. A batch already being
-  validated or written can finish in its current file after expiry. The loop
-  finishes expired files before taking the next request.
-- At the active-file limit, reject requests needing an additional writer with
-  `IngestError::OpenFileLimit`. The writer checks this after validation, before
-  file IO, and releases the request's queue/disk reservations on rejection.
-  Existing writers continue. Finishing files at size/time limits allows new
-  writers. Rejection leaves the worker running and existing files unchanged. The
-  cap limits open input writers and their buffers, independently of retained disk usage.
-- Finishing preserves bytes and disk charges. Later requests reserve a new header
-  and receive a fresh file ID. Recovery finishes surviving open files under their
-  original IDs. IO errors while finishing stop further writes until recovery.
-
-## Experimental file format
-
-```text
-8-byte magic: QWINPUT followed by version byte 1
-one framed metadata record: UTF-8 index UID
-zero or more framed opaque documents
-
-frame = u32 little-endian payload length
-      + CRC32 of those four length bytes
-      + payload
-      + CRC32 of the payload
-```
-
-The index UID includes its incarnation (`index_id:incarnation_id`) and occupies
-the entire metadata payload. Metadata is limited to 16 KiB.
-Document lengths must fit in `u32`. CRC32 provides
-accidental-corruption detection, not authentication. Recovery scans document
-payloads with fixed memory rather than loading the input backlog into RAM.
-The format is experimental and is not a released compatibility contract.
-Recovery obtains the file ID from the filename.
-
-File lifecycle:
-
-1. Create `<id>.creating`, write and flush the header.
-2. Rename to `<id>.open` before appending any documents.
-3. Append framed documents and flush before returning success.
-4. Finish by renaming to `<id>.finished`. Finished contents remain unchanged.
-
-File creation and finishing use atomic renames, relying on unique file IDs and
-exclusive directory ownership to keep destination paths unused.
-
-Recovery removes `.creating` files: these can contain only headers, never
-acknowledged documents. In an `.open` file it truncates only an incomplete final
-record. It removes files with no complete documents. Bad checksums, unknown
-formats, invalid metadata, and unexpected directory entries fail
-recovery. Finished files are validated and never repaired. This protocol assumes
-surviving storage and process failure, not external truncation or host/storage loss.
-
-## Still required before production rollout
-
-- Memory and physical scratch-space admission for indexing, and a progress policy for
-  inputs exceeding the 1,000-output publication limit.
-- Filesystem allocation/inode overhead, free-space checks, and drain/recovery
-  reserves. The current logical byte budget is one component of disk admission.
-- Cleanup after late uploads and index deletion after successful registration.
-  Missing-index registration already discards the input and continues.
-- Deployment/host-loss behavior, live AWS operation, and performance validation.
-- Remote input/orphan cleanup and completion-evidence expiry.
-
-Metastore registration, assignment, and atomic publication/completion are implemented in
-both backends. See the [metastore contract](../../../quickwit-metastore/README.md#ingesthree-assignment-and-publication).
-
-## Tests
-
-The [TLA+ handoff model](tla/README.md) checks the proposed handoff, assignment,
-publication, and cleanup protocol separately from the Rust implementation.
+## Tests and related docs
 
 From the Rust workspace:
 
@@ -324,39 +127,7 @@ From the Rust workspace:
 cargo nextest run -p quickwit-ingest ingesthree
 ```
 
-Tests cover visibility before writer destruction, an abrupt subprocess exit that
-bypasses destructors, every incomplete final-frame prefix, the metadata/first-document
-recovery boundary, and corruption rejection. Property tests cover empty documents,
-multi-chunk payloads, and corruption beyond the first chunk. Tests also cover
-finished-file immutability, stable file identity, index-incarnation isolation,
-logical disk-budget accounting, flush failure, and directory exclusion. Write-queue
-tests cover concurrent admission, queued/processing reservations, recovered disk
-usage, validation and malformed batches, worker failure, and draining. File-limit
-tests cover exact size boundaries, oversized batches, idle and continuous traffic,
-independent index deadlines, open-file rejection without eviction, disk reservations, restart,
-drain, and IO failures. `handoff_tests.rs` covers handoff/capacity release, stage-specific
-retries, registration replay, startup gating, queued/active drain, cancellation, and
-permanent failures. Missing-index tests cover continued intake, index recreation,
-startup/drain cleanup, and deletion retries. Tests inspect payloads, requests, retained
-files, and usable capacity.
-Metastore backend tests cover processing/completion preservation. Time-based tests use
-a paused clock. Ingress/router tests cover metadata checks, source/schema validation,
-capacity retries, discovery changes, and v2 separation. Running-server tests in
-`quickwit-integration-tests/src/tests/ingesthree_tests.rs` exercise HTTP and ES bulk,
-actual standalone compaction, searchability, mixed nodes, guarded RPCs, unsupported commits,
-drain, and restart. `ingesthree_compaction_tests.rs` contains shared compaction assertions
-and checks discovery after planner restart with the publishing indexer stopped.
-Serve tests reject local-merge configuration on ingesthree indexers and verify that
-writer failures trigger supervision while preserving accepted files.
-
-`tests/ingesthree_s3.rs` uses the S3 client and persistent file-backed metastore. Its
-standalone HTTP test stalls actual uploads and checks startup/drain cancellation and
-connection closure. External tests verify remote bytes, keys, metadata, and local cleanup.
-They kill child processes during upload, after an upload commits but before its response,
-before registration, after registration commits but before its response, and after local
-deletion. Restart must preserve identity, bytes, and any committed registration.
-
-Run the external tests against a loopback S3-compatible server with an existing bucket:
+External S3 tests require a loopback S3-compatible server and an existing bucket:
 
 ```bash
 INGESTHREE_S3_ENDPOINT=http://127.0.0.1:4566 \
@@ -364,6 +135,7 @@ INGESTHREE_S3_BUCKET=ingesthree-test AWS_EC2_METADATA_DISABLED=true \
 cargo test -p quickwit-ingest --test ingesthree_s3 s3_ -- --ignored --nocapture
 ```
 
-These tests passed with Moto 5.2.5 S3 emulation. They cover small single-PUT objects.
-Live AWS, multipart crash windows, host/storage loss, remote cleanup races, and
-end-to-end migration verification remain outside this evidence.
+- [Metadata cache](../../../../docs/internals/ingesthree-metadata-cache.md)
+- [Indexing and compaction](../../../quickwit-indexing/src/ingesthree/README.md)
+- [Metastore contract](../../../quickwit-metastore/README.md#ingesthree-assignment-and-publication)
+- [TLA+ handoff model](tla/README.md)
