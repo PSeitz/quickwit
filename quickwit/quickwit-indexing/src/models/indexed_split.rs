@@ -20,22 +20,21 @@ use anyhow::Context;
 use quickwit_common::io::IoControls;
 use quickwit_common::metrics::index_label;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_config::IndexingSettings;
+use quickwit_config::{DocsClusteringConfig, IndexingSettings};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
-use quickwit_metrics::{GaugeGuard, label_values};
+use quickwit_metrics::{GaugeGuard, histogram, label_values};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::directory::{MmapDirectory, RamDirectory};
 use tantivy::store::{Compressor, ZstdCompressor};
-use tantivy::{DateTime, DocId, IndexBuilder, IndexSettings};
-use tracing::{Span, error, instrument};
+use tantivy::{ClusteringConfig, DateTime, IndexBuilder, IndexSettings};
+use tracing::{Span, instrument};
 
 use crate::controlled_directory::ControlledDirectory;
-use crate::docs_clustering::DocIdClusterer;
 use crate::merge_policy::MergeTask;
-use crate::metrics::INDEX_SOURCE;
+use crate::metrics::{DOCS_CLUSTER_GROUP_SIZE, INDEX_SOURCE};
 use crate::models::{ProcessedDoc, PublishLock, SplitAttrs};
 
 pub struct IndexedSplitBuilder {
@@ -43,7 +42,6 @@ pub struct IndexedSplitBuilder {
     pub index_writer: tantivy::SingleSegmentIndexWriter,
     pub split_scratch_directory: TempDirectory,
     pub controlled_directory: ControlledDirectory,
-    pub doc_id_clusterer_opt: Option<DocIdClusterer>,
     ram_directory_opt: Option<RamDirectory>,
 }
 
@@ -78,7 +76,6 @@ impl fmt::Debug for IndexedSplitBuilder {
             .field("split_id", &self.split_attrs.split_id)
             .field("dir", &self.split_scratch_directory.path())
             .field("num_docs", &self.split_attrs.num_docs)
-            .field("doc_id_clusterer_opt", &self.doc_id_clusterer_opt.is_some())
             .finish()
     }
 }
@@ -94,7 +91,7 @@ impl IndexedSplitBuilder {
         indexing_settings: &IndexingSettings,
         scratch_directory: TempDirectory,
         io_controls: IoControls,
-        clustering_enabled: bool,
+        clustering_config: Option<&DocsClusteringConfig>,
     ) -> anyhow::Result<Self> {
         let docstore_compression = Compressor::Zstd(ZstdCompressor {
             compression_level: Some(indexing_settings.docstore_compression_level),
@@ -104,8 +101,7 @@ impl IndexedSplitBuilder {
             docstore_blocksize: indexing_settings.docstore_blocksize,
             docstore_compression,
             docstore_compress_dedicated_thread: true,
-            // The clusterer supplies the mapping when the split is finalized.
-            manual_doc_id_mapping: clustering_enabled,
+            manual_doc_id_mapping: false,
         };
         let index_builder = IndexBuilder::new()
             .settings(index_settings)
@@ -124,7 +120,7 @@ impl IndexedSplitBuilder {
             scratch_directory,
             index_builder,
             io_controls,
-            clustering_enabled.then(DocIdClusterer::default),
+            clustering_config,
         )
     }
 
@@ -137,7 +133,7 @@ impl IndexedSplitBuilder {
         scratch_directory: TempDirectory,
         index_builder: IndexBuilder,
         io_controls: IoControls,
-        doc_id_clusterer_opt: Option<DocIdClusterer>,
+        clustering_config: Option<&DocsClusteringConfig>,
     ) -> anyhow::Result<Self> {
         // We avoid intermediary merge, and instead merge all segments in the packager.
         // The benefit is that we don't have to wait for potentially existing merges,
@@ -158,8 +154,18 @@ impl IndexedSplitBuilder {
                 Box::new(controlled_directory.clone())
             };
 
-        let index_writer =
+        let mut index_writer =
             index_builder.single_segment_index_writer(indexing_directory, 15_000_000)?;
+        if let Some(config) = clustering_config {
+            config.validate()?;
+            // Paths address the mapped schema, including explicit `_dynamic` JSON paths.
+            // Tantivy rejects unknown fields and traversal through non-JSON fields.
+            index_writer = index_writer
+                .with_clustering(ClusteringConfig {
+                    fields: config.fields.clone(),
+                })
+                .context("invalid clustering schema paths (dynamic fields require `_dynamic.`)")?;
+        }
         Ok(Self {
             split_attrs: SplitAttrs {
                 node_id: pipeline_id.node_id,
@@ -176,7 +182,6 @@ impl IndexedSplitBuilder {
                 num_merge_ops: 0,
             },
             index_writer,
-            doc_id_clusterer_opt,
             split_scratch_directory,
             controlled_directory,
             ram_directory_opt,
@@ -189,18 +194,12 @@ impl IndexedSplitBuilder {
     pub(crate) fn add_document(&mut self, processed_doc: ProcessedDoc) -> anyhow::Result<()> {
         let ProcessedDoc {
             doc,
-            fingerprint_opt,
             timestamp_opt,
             num_bytes,
             ..
         } = processed_doc;
         self.split_attrs.uncompressed_docs_size_in_bytes += num_bytes as u64;
-        // Tantivy doc IDs are local to the split and continue across processed-doc batches.
-        let split_doc_id = self.split_attrs.num_docs as DocId;
         self.split_attrs.num_docs += 1;
-        if let Some(doc_id_clusterer) = self.doc_id_clusterer_opt.as_mut() {
-            doc_id_clusterer.push(fingerprint_opt, split_doc_id);
-        }
         if let Some(timestamp) = timestamp_opt {
             record_timestamp(timestamp, &mut self.split_attrs.time_range);
         }
@@ -226,26 +225,19 @@ impl IndexedSplitBuilder {
     )]
     pub fn finalize(self) -> anyhow::Result<IndexedSplit> {
         let split_attrs = self.split_attrs;
-        let index = if let Some(doc_id_clusterer) = self.doc_id_clusterer_opt {
-            // Update metrics for document clustering.
+        if let Some(group_sizes) = self.index_writer.clustering_group_sizes() {
             let index_label = index_label(&split_attrs.index_uid.index_id);
             let labels = label_values!(
                 INDEX_SOURCE => index_label.to_string(),
                 split_attrs.source_id.to_string()
             );
-            doc_id_clusterer.observe_cluster_group_sizes(labels);
-
-            // Finalize the index with the doc id mapping.
-            let doc_id_mapping = doc_id_clusterer
-                .into_doc_id_mapping()
-                .inspect_err(|error| {
-                    error!(?error, "failed to create doc id mapping");
-                })?;
-            self.index_writer
-                .finalize_with_doc_id_mapping(&doc_id_mapping)?
-        } else {
-            self.index_writer.finalize()?
-        };
+            let histogram = histogram!(parent: DOCS_CLUSTER_GROUP_SIZE, labels: [labels]);
+            for group_size in group_sizes {
+                histogram.observe(group_size as f64);
+            }
+        }
+        // Buffered indexing errors propagate before the split can be packaged or uploaded.
+        let index = self.index_writer.finalize()?;
         let index = if let Some(ram_directory) = self.ram_directory_opt {
             ram_directory.persist(&self.controlled_directory)?;
             // Persist copies files but leaves RAM intact. Return a disk-backed index so packaging
@@ -403,7 +395,6 @@ mod tests {
             index_writer,
             split_scratch_directory,
             controlled_directory,
-            doc_id_clusterer_opt: None,
             ram_directory_opt: Some(ram_directory.clone()),
         };
         let split = builder.finalize()?;

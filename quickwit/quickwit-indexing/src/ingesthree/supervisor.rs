@@ -294,7 +294,7 @@ mod tests {
             split_cache: Arc::new(IndexingSplitCache::no_caching()),
             max_concurrent_split_uploads: 1,
             indexing_io_throughput_limiter: None,
-            fingerprinter: None,
+            clustering_config: None,
         };
         let metrics = SupervisorMetrics::for_test();
         let supervisor = S3IndexerSupervisor::supervise(

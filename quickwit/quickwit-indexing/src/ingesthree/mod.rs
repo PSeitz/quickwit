@@ -36,6 +36,7 @@ use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
 #[cfg(test)]
 use quickwit_common::uri::Uri;
+use quickwit_config::DocsClusteringConfig;
 use quickwit_metastore::{IndexMetadataResponseExt, SplitMetadata, StageSplitsRequestExt};
 use quickwit_metrics::{Gauge, GaugeGuard};
 use quickwit_proto::indexing::IndexingPipelineId;
@@ -51,7 +52,6 @@ use ulid::Ulid;
 use self::indexing::{PreparedSplit, SplitBuilders};
 use self::metrics::ACTIVE_ASSIGNMENTS;
 use crate::actors::acquire_indexing_upload_permit;
-use crate::docs_clustering::Fingerprinter;
 use crate::merge_policy::merge_policy_from_settings;
 use crate::metrics::record_published_split;
 use crate::{IndexingSplitCache, IndexingSplitStore};
@@ -71,7 +71,7 @@ pub struct S3Indexer {
     pub split_cache: Arc<IndexingSplitCache>,
     pub max_concurrent_split_uploads: usize,
     pub indexing_io_throughput_limiter: Option<Limiter>,
-    pub fingerprinter: Option<Fingerprinter>,
+    pub clustering_config: Option<DocsClusteringConfig>,
 }
 
 /// A definite publication outcome. Only a winner returns published split metadata.
@@ -158,7 +158,7 @@ impl S3Indexer {
             pipeline_uid: PipelineUid::random(),
         };
         let scratch_directory = self.scratch_directory.clone();
-        let fingerprinter = self.fingerprinter.clone();
+        let clustering_config = self.clustering_config.clone();
         let (directory, mut builders) = run_indexing(
             scratch_directory.clone(),
             active_assignment.clone(),
@@ -170,7 +170,7 @@ impl S3Indexer {
                     delete_opstamp,
                     directory.clone(),
                     io_controls,
-                    fingerprinter,
+                    clustering_config,
                 )?;
                 Ok((directory, builders))
             },

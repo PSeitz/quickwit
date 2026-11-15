@@ -22,7 +22,8 @@ use quickwit_common::io::IoControls;
 use quickwit_common::metrics::{IN_FLIGHT_INDEX_WRITER, index_label};
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_config::{
-    IndexConfig, IndexingSettings, RetentionPolicy, SourceInputFormat, build_doc_mapper,
+    DocsClusteringConfig, IndexConfig, IndexingSettings, RetentionPolicy, SourceInputFormat,
+    build_doc_mapper,
 };
 use quickwit_doc_mapper::DocMapper;
 use quickwit_ingest::ingesthree::DocumentFileReader;
@@ -36,7 +37,6 @@ use super::metrics::MEMORY_FLUSHES;
 use crate::actors::{
     DocumentConverter, OTHER_PARTITION_ID, create_packaged_split, prepare_split_for_upload,
 };
-use crate::docs_clustering::Fingerprinter;
 use crate::merge_policy::MergePolicy;
 use crate::models::{IndexedSplit, IndexedSplitBuilder, ProcessedDoc};
 
@@ -90,7 +90,7 @@ pub(super) struct SplitBuilders {
     delete_opstamp: u64,
     directory: TempDirectory,
     pub io_controls: IoControls,
-    clustering_enabled: bool,
+    clustering_config: Option<DocsClusteringConfig>,
     splits: HashMap<u64, SplitWriter>,
     overflow: Option<SplitWriter>,
     writer_memory: Gauge,
@@ -104,7 +104,7 @@ impl SplitBuilders {
         delete_opstamp: u64,
         directory: TempDirectory,
         io_controls: IoControls,
-        fingerprinter: Option<Fingerprinter>,
+        clustering_config: Option<DocsClusteringConfig>,
     ) -> anyhow::Result<Self> {
         let mapper = build_doc_mapper(&config.doc_mapping, &config.search_settings)?;
         // Ingesthree files contain JSON documents. Source decoding/transforms belong before intake.
@@ -114,7 +114,6 @@ impl SplitBuilders {
             mapper.clone(),
             None,
             SourceInputFormat::Json,
-            fingerprinter.clone(),
         )?;
         Ok(Self {
             converter,
@@ -129,7 +128,7 @@ impl SplitBuilders {
             delete_opstamp,
             directory,
             io_controls,
-            clustering_enabled: fingerprinter.is_some(),
+            clustering_config,
             splits: HashMap::new(),
             overflow: None,
             writer_memory: IN_FLIGHT_INDEX_WRITER.clone(),
@@ -145,7 +144,7 @@ impl SplitBuilders {
             &self.settings,
             self.directory.clone(),
             self.io_controls.clone().set_component("indexer"),
-            self.clustering_enabled,
+            self.clustering_config.as_ref(),
         )?;
         Ok(SplitWriter::new(builder, &self.writer_memory))
     }
@@ -288,6 +287,8 @@ mod tests {
     use quickwit_config::DocsClusteringConfig;
     use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
     use quickwit_storage::PutPayload;
+    use tantivy::schema::Value;
+    use tantivy::{DocAddress, TantivyDocument};
 
     use super::*;
     use crate::ingesthree::run_indexing;
@@ -299,7 +300,7 @@ mod tests {
         config.doc_mapping.max_num_partitions = NonZeroU32::new(1).unwrap();
         config.indexing_settings.resources.heap_size = bytesize::ByteSize(1);
         let clustering: DocsClusteringConfig = serde_json::from_value(serde_json::json!([
-            {"fingerprint": [{"kind": "raw", "path": "owner"}]}
+            {"kind": "raw", "path": "owner"}
         ]))
         .unwrap();
         let mut builders = SplitBuilders::new(
@@ -313,7 +314,7 @@ mod tests {
             7,
             TempDirectory::for_test(),
             IoControls::default(),
-            Some(Fingerprinter::new(&clustering)),
+            Some(clustering),
         )
         .unwrap();
         let writer_memory = Gauge::local();
@@ -368,12 +369,36 @@ mod tests {
         assert_eq!(writer_memory.get(), expected_bytes as f64);
         for split in splits {
             assert_eq!(split.builder.split_attrs.num_docs, 2);
-            assert!(split.builder.doc_id_clusterer_opt.is_some());
+            let is_overflow = split.builder.split_attrs.partition_id == OTHER_PARTITION_ID;
+            let expected_groups = if is_overflow { vec![1, 1] } else { vec![2] };
+            assert_eq!(
+                split.builder.index_writer.clustering_group_sizes(),
+                Some(expected_groups)
+            );
             let memory_before = writer_memory.get();
             let split_bytes = split.memory_usage.delta();
             let split = split.finalize().unwrap();
             assert_eq!(writer_memory.get(), memory_before - split_bytes);
-            assert_eq!(split.index.reader().unwrap().searcher().num_docs(), 2);
+            let reader = split.index.reader().unwrap();
+            let searcher = reader.searcher();
+            assert_eq!(searcher.num_docs(), 2);
+            let owner_field = split.index.schema().get_field("owner").unwrap();
+            let owners: Vec<String> = (0..2)
+                .map(|doc_id| {
+                    let doc: TantivyDocument = searcher.doc(DocAddress::new(0, doc_id)).unwrap();
+                    doc.get_first(owner_field)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            let expected_owners = if is_overflow {
+                ["bob", "charlie"]
+            } else {
+                ["alice", "alice"]
+            };
+            assert_eq!(owners, expected_owners);
         }
         assert_eq!(writer_memory.get(), 0.0);
     }

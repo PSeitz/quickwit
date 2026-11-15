@@ -10,7 +10,11 @@
 5. Publish all outputs and complete all contributing inputs using `PublishFileSplits`.
 
 The caller supplies the node/source labels, metastore, storage resolver, scratch directory,
-shared split cache, upload limit, optional shared IO limiter, and optional fingerprinter.
+shared split cache, upload limit, optional shared IO limiter, and optional document clustering config.
+Clustering buffers mapped documents in Tantivy per split and indexes them during finalization.
+Use schema paths, including explicit `_dynamic.` paths for unmapped JSON fields.
+The memory flush target counts retained documents. Finalization needs additional indexing memory.
+Finalization errors fail the assignment before any splits are uploaded or published.
 With `ingest_api.enable_ingesthree` enabled, each indexer node starts
 `quickwit_common::num_cpus()` workers, controlled by `QW_NUM_CPUS`. Without that override,
 the existing CPU detection uses `KUBERNETES_LIMITS_CPU`, then the OS, then a default of 2.

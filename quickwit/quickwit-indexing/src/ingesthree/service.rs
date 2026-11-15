@@ -86,7 +86,7 @@ impl IndexingService {
             split_cache: self.split_cache.clone(),
             max_concurrent_split_uploads: self.max_concurrent_split_uploads,
             indexing_io_throughput_limiter: self.indexing_io_throughput_limiter_opt.clone(),
-            fingerprinter: self.fingerprinter_opt.clone(),
+            clustering_config: self.clustering_config.clone(),
         };
         self.s3_indexers = (0..num_workers)
             .map(|_| S3IndexerSupervisor::spawn(worker.clone(), max_num_bytes, max_wait_secs))
@@ -167,7 +167,7 @@ mod tests {
             split_cache: Arc::new(IndexingSplitCache::no_caching()),
             max_concurrent_split_uploads: 2,
             indexing_io_throughput_limiter: None,
-            fingerprinter: None,
+            clustering_config: None,
         };
         (worker, index_uid)
     }

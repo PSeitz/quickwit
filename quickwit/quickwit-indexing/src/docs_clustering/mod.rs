@@ -12,108 +12,165 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fingerprint-based document clustering for better log compression.
+//! Tantivy retains documents in each split writer and indexes them in cluster order.
 //!
-//! # Warning
+//! `DocsClusteringConfig::fields` is an ordered list of mapped schema/JSON paths.
+//! Mapped object leaves use their schema names, such as `attributes.service`.
+//! Unmapped dynamic values require explicit paths such as `_dynamic.service`.
+//! Unknown schema fields and traversal through scalar fields fail writer creation.
+//! There is no fallback to `_source`, `_dynamic`, or another field. JSON paths use
+//! Tantivy's dot escaping. They traverse retained object keys, so a literal dotted
+//! JSON key needs an escaped dot even when its indexing options expand dots.
 //!
-//! This feature is experimental. Its configuration and behavior may change, and it should be
-//! validated on representative workloads before production use.
+//! Strings define groups. Repeated fields and arrays use the first value. Missing
+//! and non-string values share an ignored bucket. Larger groups come first at
+//! each level. Equal-size groups follow first arrival, and leaf groups retain
+//! document arrival order. Document contents remain unchanged.
 //!
-//! # Motivation
-//!
-//! Logs normally enter Tantivy segments in arrival order, which is driven by batching, load
-//! balancing, and event timing rather than message structure. A segment can therefore interleave
-//! unrelated templates:
-//!
-//! ```text
-//! api:    "server started at 8080"
-//! worker: "job 123 finished in 42ms"
-//! api:    "server started at 9090"
-//! db:     "connection from 1.2.3.4"
-//! worker: "job 456 finished in 13ms"
-//! ```
-//!
-//! Stored log bodies and repeated fields compress better when similar documents are adjacent.
-//! Reordering documents before segment finalization gives the doc-store compressor longer repeated
-//! runs without changing the logical query model.
-//!
-//! # Design
-//!
-//! Document clustering is enabled process-wide when `NodeConfig::docs_clustering_config` contains a
-//! policy, unless `QW_DISABLE_DOCS_CLUSTERING=true`. Deployments should configure it only on
-//! indexers whose workloads are intended to use document clustering.
-//!
-//! [`Fingerprinter`] computes one hash for each configured fingerprint policy:
-//!
-//! 1. A structure policy hashes the sorted set of leaf JSON paths, excluding configured paths.
-//! 2. Raw and tokenized policies hash configured JSON values and tokenized string signatures.
-//!
-//! Tokenized fields hash token types rather than literal values. They use up to 50 tokens by
-//! default, configurable through `max_tokens`. This groups volatile values with the same shape:
-//!
-//! ```text
-//! "server started at 8080" -> Word Gap Word Gap Word Gap Number
-//! "server started at 9090" -> Word Gap Word Gap Word Gap Number
-//! ```
-//!
-//! Missing and non-string grouping values are encoded as absent so each configured field retains
-//! its position in the policy hash.
-//!
-//! ```text
-//! Raw document
-//!     |
-//!     v
-//! DocProcessor
-//!     |  computes Fingerprint { hashes }
-//!     v
-//! ProcessedDoc { doc, fingerprint_opt, ... }
-//!     |
-//!     v
-//! Indexer
-//!     |  records each split-local doc ID in DocIdClusterer
-//!     v
-//! IndexedSplitBuilder::finalize
-//!     |  builds a DocIdMapping: largest groups first at every fingerprint level
-//!     v
-//! Tantivy segment with similar documents stored together
-//! ```
-//!
-//! The fingerprint exists only in the in-memory indexing pipeline:
-//!
-//! 1. `DocProcessor` computes it from the processed JSON document.
-//! 2. `ProcessedDoc::fingerprint_opt` carries it to the `Indexer`.
-//! 3. `Indexer` pushes `(fingerprint_opt, doc_id)` into [`DocIdClusterer`].
-//! 4. At split finalization, [`DocIdClusterer`] creates the Tantivy `DocIdMapping`. Documents
-//!    without fingerprints are appended in insertion order.
-//!
-//! Sorting is applied once to each fresh split. Later merges use Tantivy's native merge path and
-//! preserve the ordering of their input splits without repeating the remapping and doc-store
-//! rewrite.
-//!
-//! # Consequences
-//!
-//! Benefits:
-//!
-//! - Recurring schemas, message templates, and stable dimensions gain better compression locality.
-//! - Search semantics, checkpoints, split metadata, and user-visible schemas remain unchanged.
-//! - Dynamic log schemas do not require a fixed sort schema.
-//!
-//! Trade-offs and risks:
-//!
-//! - Manual doc ID mapping writes a temporary uncompressed doc store and then rewrites it in
-//!   permuted, compressed order, increasing local disk traffic.
-//! - Fingerprinting adds ingest CPU, particularly for tokenized fields.
-//! - [`DocIdClusterer`] retains document IDs and hash-map entries outside Tantivy's reported memory
-//!   usage; high-cardinality policies and multiple open partitions require memory headroom.
-//! - Fingerprints provide best-effort locality, not a total order or query-pruning structure.
-//! - Policies that include volatile data can under-group, while broad exclusions can over-group.
-//!   Compression gains therefore depend on workload entropy and should be measured on a
-//!   representative corpus together with CPU, memory, and temporary disk writes.
+//! Clustering is optional. Node configuration applies `QW_DISABLE_DOCS_CLUSTERING`.
+//! Writers receive clustering before any documents and use ordinary finalization.
+//! Memory-based flushes count retained document capacities and grouping allocations.
+//! Finalization also needs memory for growing indexing structures and output buffers.
+//! Its peak is outside this retained-memory estimate. Indexing errors propagate at
+//! finalization. Ingesthree finishes every split before starting uploads, so any such
+//! error fails the whole assignment.
 
-mod clusterer;
-mod fingerprinter;
-mod tokenizer;
+#[cfg(test)]
+mod tests {
+    use quickwit_common::KillSwitch;
+    use quickwit_common::io::IoControls;
+    use quickwit_common::temp_dir::TempDirectory;
+    use quickwit_config::{DocsClusteringConfig, IndexingSettings};
+    use quickwit_doc_mapper::DocMapper;
+    use quickwit_proto::indexing::IndexingPipelineId;
+    use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
+    use tantivy::schema::Value;
+    use tantivy::{DocAddress, Document, TantivyDocument, doc};
 
-pub use clusterer::DocIdClusterer;
-pub use fingerprinter::{Fingerprint, Fingerprinter};
-pub use tokenizer::tokenize;
+    use crate::models::{IndexedSplitBuilder, ProcessedDoc};
+
+    fn mapper() -> DocMapper {
+        serde_json::from_value(serde_json::json!({
+            "mode": "dynamic",
+            "field_mappings": [
+                {"name": "body", "type": "text"},
+                {"name": "attributes", "type": "object", "field_mappings": [
+                    {"name": "service", "type": "text"}
+                ]},
+                {"name": "labels", "type": "json"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn builder(mapper: &DocMapper, fields: &[&str]) -> anyhow::Result<IndexedSplitBuilder> {
+        IndexedSplitBuilder::from_doc_mapper(
+            IndexingPipelineId {
+                index_uid: IndexUid::for_test("clustering", 1),
+                source_id: "test-source".into(),
+                node_id: NodeId::from_str("test-node"),
+                pipeline_uid: PipelineUid::default(),
+            },
+            0,
+            0,
+            mapper,
+            &IndexingSettings::for_test(),
+            TempDirectory::for_test(),
+            IoControls::default(),
+            Some(&DocsClusteringConfig {
+                fields: fields.iter().map(|field| field.to_string()).collect(),
+            }),
+        )
+    }
+
+    #[test]
+    fn test_clustering_schema_paths() {
+        let mapper = mapper();
+        for path in [
+            "body",
+            "attributes.service",
+            "labels.service",
+            "_dynamic.service",
+        ] {
+            assert!(builder(&mapper, &[path]).is_ok(), "{path}");
+        }
+        // An unmapped source field must name its dynamic schema container explicitly.
+        for path in ["service", "body.service", "attributes"] {
+            assert!(builder(&mapper, &[path]).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_clustering_finalization_propagates_cancellation() -> anyhow::Result<()> {
+        let mapper = mapper();
+        let mut builder = builder(&mapper, &["body"])?;
+        let body = mapper.schema().get_field("body")?;
+        builder.add_document(ProcessedDoc {
+            doc: doc!(body => "hello"),
+            timestamp_opt: None,
+            partition: 0,
+            num_bytes: 5,
+        })?;
+        let kill_switch = KillSwitch::default();
+        builder
+            .controlled_directory
+            .set_io_controls(IoControls::default().set_kill_switch(kill_switch.clone()));
+        kill_switch.kill();
+        assert!(builder.finalize().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_clustering_json_paths_preserve_documents() -> anyhow::Result<()> {
+        let mapper = mapper();
+        let mut builder = builder(&mapper, &["_dynamic.service", "labels.status"])?;
+        let documents = [
+            serde_json::json!({"body": "first", "service": "a", "labels": {"status": "ok"}}),
+            serde_json::json!({"body": "second", "service": "b", "labels": {"status": "ok"}}),
+            serde_json::json!({"body": "third", "service": "a", "labels": {"status": "error"}}),
+            serde_json::json!({"body": "fourth", "service": "a", "labels": {"status": "error"}}),
+        ];
+        for document in documents {
+            let num_bytes = document.to_string().len();
+            let (partition, doc) = mapper
+                .doc_from_json_obj(document.as_object().unwrap().clone(), num_bytes as u64)?;
+            builder.add_document(ProcessedDoc {
+                doc,
+                partition,
+                num_bytes,
+                timestamp_opt: None,
+            })?;
+        }
+        assert_eq!(
+            builder.index_writer.clustering_group_sizes(),
+            Some(vec![2, 1, 1])
+        );
+        let split = builder.finalize()?;
+        let reader = split.index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 4);
+        let schema = split.index.schema();
+        let body = schema.get_field("body")?;
+        let mut bodies = Vec::new();
+        for (doc_id, (service, status)) in
+            [("a", "error"), ("a", "error"), ("a", "ok"), ("b", "ok")]
+                .into_iter()
+                .enumerate()
+        {
+            let document: TantivyDocument = searcher.doc(DocAddress::new(0, doc_id as u32))?;
+            bodies.push(
+                document
+                    .get_first(body)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let stored: serde_json::Value = serde_json::from_str(&document.to_json(&schema))?;
+            assert_eq!(stored["_dynamic"][0]["service"], service);
+            assert_eq!(stored["labels"][0]["status"], status);
+        }
+        assert_eq!(bodies, ["third", "fourth", "first", "second"]);
+        Ok(())
+    }
+}

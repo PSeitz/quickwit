@@ -76,7 +76,7 @@ async fn setup(config: IndexConfig) -> (S3Indexer, IndexUid) {
         split_cache: Arc::new(IndexingSplitCache::no_caching()),
         max_concurrent_split_uploads: 4,
         indexing_io_throughput_limiter: None,
-        fingerprinter: None,
+        clustering_config: None,
     };
     (worker, index_uid)
 }
@@ -527,7 +527,7 @@ fn worker_for_observation(worker: &S3Indexer) -> S3Indexer {
         split_cache: worker.split_cache.clone(),
         max_concurrent_split_uploads: worker.max_concurrent_split_uploads,
         indexing_io_throughput_limiter: None,
-        fingerprinter: None,
+        clustering_config: None,
     }
 }
 

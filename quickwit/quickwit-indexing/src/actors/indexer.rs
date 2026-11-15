@@ -29,7 +29,7 @@ use quickwit_common::io::{IoControls, Limiter};
 use quickwit_common::metrics::IN_FLIGHT_INDEX_WRITER;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_config::IndexingSettings;
+use quickwit_config::{DocsClusteringConfig, IndexingSettings};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::checkpoint::{IndexCheckpointDelta, SourceCheckpointDelta};
 use quickwit_metrics::GaugeGuard;
@@ -45,7 +45,6 @@ use ulid::Ulid;
 
 use super::IndexSerializer;
 use super::cooperative_indexing::{CooperativeIndexingCycle, CooperativeIndexingPeriod};
-use crate::docs_clustering::Fingerprinter;
 use crate::metrics::SPLIT_BUILDERS;
 use crate::models::{
     CommitTrigger, EmptySplit, IndexedSplitBatchBuilder, IndexedSplitBuilder, NewPublishLock,
@@ -86,7 +85,7 @@ struct IndexerState {
     metastore: MetastoreServiceClient,
     indexing_directory: TempDirectory,
     indexing_settings: IndexingSettings,
-    fingerprinter_opt: Option<Fingerprinter>,
+    clustering_config: Option<DocsClusteringConfig>,
     publish_lock: PublishLock,
     doc_mapper: Arc<DocMapper>,
     max_num_partitions: NonZeroU32,
@@ -114,7 +113,7 @@ impl IndexerState {
             &self.indexing_settings,
             self.indexing_directory.clone(),
             io_controls,
-            self.fingerprinter_opt.is_some(),
+            self.clustering_config.as_ref(),
         )?;
         debug!(
             split_id=%indexed_split.split_id(),
@@ -481,7 +480,7 @@ impl Indexer {
         indexing_settings: IndexingSettings,
         cooperative_indexing_permits_opt: Option<Arc<Semaphore>>,
         index_serializer_mailbox: Mailbox<IndexSerializer>,
-        fingerprinter_opt: Option<Fingerprinter>,
+        clustering_config: Option<DocsClusteringConfig>,
         indexing_io_throughput_limiter_opt: Option<Limiter>,
     ) -> Self {
         let cooperative_indexing_opt: Option<CooperativeIndexingCycle> =
@@ -498,7 +497,7 @@ impl Indexer {
                 metastore: metastore.clone(),
                 indexing_directory,
                 indexing_settings,
-                fingerprinter_opt,
+                clustering_config,
                 publish_lock: PublishLock::default(),
                 max_num_partitions: doc_mapper.max_num_partitions(),
                 doc_mapper,
@@ -645,7 +644,6 @@ mod tests {
     use tantivy::{DateTime, DocAddress, TantivyDocument, doc};
 
     use super::*;
-    use crate::docs_clustering::Fingerprint;
     use crate::models::ProcessedDoc;
 
     #[allow(clippy::too_many_arguments)]
@@ -657,7 +655,7 @@ mod tests {
         indexing_settings: IndexingSettings,
         cooperative_indexing_permits_opt: Option<Arc<Semaphore>>,
         index_serializer_mailbox: Mailbox<IndexSerializer>,
-        fingerprinter_opt: Option<Fingerprinter>,
+        clustering_config: Option<DocsClusteringConfig>,
     ) -> Indexer {
         Indexer::new(
             pipeline_id,
@@ -667,7 +665,7 @@ mod tests {
             indexing_settings,
             cooperative_indexing_permits_opt,
             index_serializer_mailbox,
-            fingerprinter_opt,
+            clustering_config,
             None,
         )
     }
@@ -720,7 +718,6 @@ mod tests {
                             body_field=>"this is a test document",
                             timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
                         ),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
@@ -730,7 +727,6 @@ mod tests {
                             body_field=>"this is a test document 2",
                             timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
                         ),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
@@ -748,7 +744,6 @@ mod tests {
                             body_field=>"this is a test document 3",
                             timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435i64)
                         ),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435i64)),
                         partition: 1,
                         num_bytes: 30,
@@ -758,7 +753,6 @@ mod tests {
                             body_field=>"this is a test document 4",
                             timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
                         ),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
@@ -775,7 +769,6 @@ mod tests {
                         body_field=>"this is a test document 5",
                         timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
                     ),
-                    fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                     partition: 1,
                     num_bytes: 30,
@@ -862,7 +855,6 @@ mod tests {
             let num_bytes = body.len() * 2;
             ProcessedDoc {
                 doc: doc!(body_field=>body),
-                fingerprint_opt: None,
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes,
@@ -942,7 +934,6 @@ mod tests {
                                 body_field=>"this is a test document",
                                 timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
                             ),
-                            fingerprint_opt: None,
                             timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                             partition: 1,
                             num_bytes: 30,
@@ -1022,7 +1013,6 @@ mod tests {
                         body_field=>"this is a test document 5",
                         timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
                     ),
-                    fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                     partition: 1,
                     num_bytes: 30,
@@ -1111,7 +1101,6 @@ mod tests {
                         body_field=>"this is a test document 5",
                         timestamp_field=> DateTime::from_timestamp_secs(1_662_529_435)
                     ),
-                    fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                     partition: 1,
                     num_bytes: 30,
@@ -1144,7 +1133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_indexer_collects_fingerprints_when_clustering_is_enabled() -> anyhow::Result<()> {
+    async fn test_indexer_clusters_mapped_documents() -> anyhow::Result<()> {
         let universe = Universe::with_accelerated_time();
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
@@ -1154,6 +1143,7 @@ mod tests {
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
+        let timestamp_field = doc_mapper.schema().get_field("timestamp").unwrap();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let mut mock_metastore = MockMetastoreService::new();
         mock_metastore.expect_publish_splits().never();
@@ -1169,62 +1159,38 @@ mod tests {
             IndexingSettings::for_test(),
             None,
             index_serializer_mailbox,
-            Some(Fingerprinter::new(
-                &serde_json::from_value::<DocsClusteringConfig>(serde_json::json!([
-                    {
-                        "fingerprint": [{
-                            "kind": "structure"
-                        }]
-                    },
-                    {
-                        "fingerprint": [{
-                            "path": "body",
-                            "kind": "raw"
-                        }]
-                    },
-                    {
-                        "fingerprint": [{
-                            "path": "body",
-                            "kind": "tokenized"
-                        }]
-                    }
-                ]))
-                .unwrap(),
-            )),
+            Some(DocsClusteringConfig {
+                fields: vec!["body".into()],
+            }),
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         let docs = vec![
             ProcessedDoc {
-                doc: doc!(body_field=>"first"),
-                fingerprint_opt: Some(Fingerprint::new([1, 1, 1])),
+                doc: doc!(body_field=>"first", timestamp_field=>DateTime::from_timestamp_secs(1)),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"second"),
-                fingerprint_opt: Some(Fingerprint::new([1, 2, 1])),
+                doc: doc!(body_field=>"second", timestamp_field=>DateTime::from_timestamp_secs(2)),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 6,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"third"),
-                fingerprint_opt: Some(Fingerprint::new([1, 2, 1])),
+                doc: doc!(body_field=>"second", timestamp_field=>DateTime::from_timestamp_secs(3)),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"fourth"),
-                fingerprint_opt: Some(Fingerprint::new([1, 1, 1])),
+                doc: doc!(body_field=>"first", timestamp_field=>DateTime::from_timestamp_secs(4)),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 6,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"fifth"),
-                fingerprint_opt: Some(Fingerprint::new([1, 1, 2])),
+                doc: doc!(body_field=>"first", timestamp_field=>DateTime::from_timestamp_secs(5)),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
@@ -1250,6 +1216,7 @@ mod tests {
         let reader = indexed_split.index.reader()?;
         let searcher = reader.searcher();
         let mut bodies = Vec::new();
+        let mut timestamps = Vec::new();
         for doc_id in 0..5 {
             let doc: TantivyDocument = searcher.doc(DocAddress::new(0, doc_id))?;
             let body = doc
@@ -1257,8 +1224,16 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .unwrap();
             bodies.push(body.to_string());
+            timestamps.push(
+                doc.get_first(timestamp_field)
+                    .unwrap()
+                    .as_datetime()
+                    .unwrap()
+                    .into_timestamp_secs(),
+            );
         }
-        assert_eq!(bodies, ["first", "fourth", "fifth", "second", "third"]);
+        assert_eq!(bodies, ["first", "first", "first", "second", "second"]);
+        assert_eq!(timestamps, [1, 4, 5, 2, 3]);
         universe.assert_quit().await;
         Ok(())
     }
@@ -1317,7 +1292,6 @@ mod tests {
                             body_field=>"doc 2",
                             tenant_field=>"tenant_1",
                         ),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 1,
                         num_bytes: 30,
@@ -1327,7 +1301,6 @@ mod tests {
                             body_field=>"doc 2",
                             tenant_field=>"tenant_2",
                         ),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 3,
                         num_bytes: 30,
@@ -1414,7 +1387,6 @@ mod tests {
                 .send_message(ProcessedDocBatch::new(
                     vec![ProcessedDoc {
                         doc: doc!(body_field=>"doc {i}"),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition,
                         num_bytes: 30,
@@ -1494,7 +1466,6 @@ mod tests {
                 .send_message(ProcessedDocBatch::new(
                     vec![ProcessedDoc {
                         doc: doc!(body_field=>"doc 1"),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 0,
                         num_bytes: 30,
@@ -1567,7 +1538,6 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
                     doc: doc!(body_field=>"doc 1"),
-                    fingerprint_opt: None,
                     timestamp_opt: None,
                     partition: 0,
                     num_bytes: 30,
@@ -1625,7 +1595,6 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
                     doc: doc!(body_field=>"doc 1"),
-                    fingerprint_opt: None,
                     timestamp_opt: None,
                     partition: 0,
                     num_bytes: 30,
