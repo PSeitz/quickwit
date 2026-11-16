@@ -107,6 +107,11 @@ fn batch() -> DocBatchV2 {
     DocBatchV2::for_test([r#"{"message":"hello"}"#])
 }
 
+pub(super) fn record_bytes(batch: &DocBatchV2) -> u64 {
+    let compressed = CompressedBatch::new(batch.docs().map(|(_, document)| document)).unwrap();
+    FRAME_OVERHEAD + compressed.data.len() as u64
+}
+
 fn mapper() -> Arc<DocMapper> {
     let mapping: DocMapping = serde_json::from_str(
         r#"{
@@ -205,6 +210,13 @@ async fn test_validation_can_be_disabled() {
         crate::ingesthree::tests::read_input(&files[0].path).1,
         vec![b"invalid JSON".to_vec(), Vec::new()]
     );
+    // Both documents occupy exactly one checksummed compressed record.
+    use crate::ingesthree::documents_staged_for_upload::write_record;
+    let compressed = CompressedBatch::new([b"invalid JSON".as_slice(), b""]).unwrap();
+    let mut expected = MAGIC.to_vec();
+    write_record(&mut expected, &encode_metadata(&index()).unwrap()).unwrap();
+    write_record(&mut expected, &compressed.data).unwrap();
+    assert_eq!(fs::read(&files[0].path).unwrap(), expected);
 }
 
 #[tokio::test]
@@ -316,7 +328,12 @@ async fn test_disk_budget_includes_queued_requests() {
     ));
     let worker = tokio::spawn(write_batches(core, receiver, queue.admission.clone(), None));
     first.await.unwrap();
-    assert_eq!(byte_usage(&queue), (0, 0, disk_bytes));
+    let actual_bytes = MAGIC.len() as u64
+        + FRAME_OVERHEAD
+        + encode_metadata(&index()).unwrap().len() as u64
+        + record_bytes(&batch());
+    assert!(actual_bytes < disk_bytes);
+    assert_eq!(byte_usage(&queue), (0, 0, actual_bytes));
     assert!(matches!(
         queue.append(index(), batch(), None).await,
         Err(IngestError::StorageFull)
@@ -331,17 +348,78 @@ async fn test_reservations_settle_to_file_growth() {
     let queue = WriteQueue::open(dir.path().to_path_buf(), BUDGET, BUDGET, None)
         .await
         .unwrap();
-    let (_, disk_bytes) = num_bytes(&index(), &batch()).unwrap();
+    let (_, reserved_bytes) = num_bytes(&index(), &batch()).unwrap();
+    let doc_size = record_bytes(&batch());
+    let disk_bytes = MAGIC.len() as u64
+        + FRAME_OVERHEAD
+        + encode_metadata(&index()).unwrap().len() as u64
+        + doc_size;
+    assert!(disk_bytes < reserved_bytes);
     let first_id = queue.append(index(), batch(), None).await.unwrap().file_id;
     assert_eq!(byte_usage(&queue), (0, 0, disk_bytes));
     assert_eq!(
         queue.append(index(), batch(), None).await.unwrap().file_id,
         first_id
     );
-    let doc_size = batch().doc_buffer.len() as u64 + FRAME_OVERHEAD;
     assert_eq!(byte_usage(&queue), (0, 0, disk_bytes + doc_size));
     let files = queue.finish().await.unwrap();
     assert_eq!(files[0].num_bytes, disk_bytes + doc_size);
+}
+
+#[tokio::test]
+async fn test_incompressible_batch_reserves_capacity_and_settles_actual_bytes() {
+    // Deterministic pseudorandom opaque bytes exercise zstd expansion.
+    let mut state = 0x1234_5678u32;
+    let payload: Vec<u8> = (0..16_384)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let batch = DocBatchV2 {
+        doc_buffer: Bytes::from(payload),
+        doc_lengths: vec![8192, 8192],
+        doc_uids: vec![DocUid::for_test(0), DocUid::for_test(1)],
+    };
+    let compressed = CompressedBatch::new(batch.docs().map(|(_, document)| document)).unwrap();
+    assert!(compressed.data.len() > batch.doc_buffer.len());
+    let capacity = CompressedBatch::max_encoded_len(batch.doc_buffer.len(), 2).unwrap();
+    assert!(compressed.data.capacity() <= capacity);
+    let (queue_bytes, disk_bytes) = num_bytes(&index(), &batch).unwrap();
+    let metadata = encode_metadata(&index()).unwrap();
+    assert_eq!(
+        queue_bytes,
+        (size_of::<AppendRequest>()
+            + metadata.len()
+            + 3 * batch.doc_buffer.len()
+            + 4 * batch.doc_lengths.len()
+            + capacity
+            + batch.doc_lengths.capacity() * size_of::<u32>()
+            + batch.doc_uids.capacity() * size_of::<DocUid>()
+            + 2 * batch.doc_lengths.len() * (size_of::<u32>() + size_of::<DocUid>()))
+            as u64
+    );
+    let header_bytes = MAGIC.len() as u64 + FRAME_OVERHEAD + metadata.len() as u64;
+    assert_eq!(disk_bytes, header_bytes + FRAME_OVERHEAD + capacity as u64);
+    let actual_bytes = header_bytes + FRAME_OVERHEAD + compressed.data.len() as u64;
+    assert!(actual_bytes <= disk_bytes);
+    let dir = tempfile::tempdir().unwrap();
+    let core = Ingester::open(dir.path(), disk_bytes).unwrap();
+    let (queue, mut receiver, writer) = queue_metrics_tests::channel(core, queue_bytes);
+    let mut response = pin!(queue.append(index(), batch, None));
+    assert!(poll!(&mut response).is_pending());
+    assert_eq!(byte_usage(&queue), (queue_bytes, disk_bytes, 0));
+    let WriterRequest::Append(request) = receiver.try_recv().unwrap() else {
+        panic!("expected append")
+    };
+    let writer = append_batch(writer, request).await.unwrap();
+    assert_eq!(response.await.unwrap().num_docs, 2);
+    assert_eq!(byte_usage(&queue), (0, 0, actual_bytes));
+    assert_eq!(queue_metrics_tests::usage(&queue), (0, 0, actual_bytes));
+    let files = writer.finish().unwrap();
+    assert_eq!(fs::metadata(&files[0].path).unwrap().len(), actual_bytes);
 }
 
 #[tokio::test]

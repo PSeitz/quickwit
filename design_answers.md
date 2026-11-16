@@ -244,6 +244,39 @@ The physical layout matters:
 
 For scale only, a continuously busy single shared log batching every 10 ms would have roughly 100 group synchronizations per second. That is not a device IOPS estimate. Separate active files, metadata writes, filesystem behavior, and the storage device change the actual I/O count and latency. No batch interval has been selected.
 
+### Disk and network sizing
+
+With co-located intake/indexing, balanced steady-state load and in-memory index construction,
+let `R = CPUs × raw input bytes/sec per CPU`. Measure these ratios against the same raw
+accepted-document bytes: `s = staged file bytes / raw bytes`, `o = output split bytes / raw bytes`,
+and `w = incoming wire bytes / raw bytes`.
+
+| Resource | Logical bytes/sec |
+| --- | --- |
+| Disk writes | `(s + o) × R`: staged input and finalized splits |
+| Disk reads | `(s + o) × R`: input and split uploads |
+| Network receive | `(w + s) × R`: ingestion and S3 input downloads |
+| Network transmit | `(s + o) × R`: input and split uploads |
+
+Disk read+write bandwidth is approximately `2 × (s + o) × R`. Network RX+TX is
+`(w + 2s + o) × R`; also check directional limits. Page cache can reduce physical disk
+reads. Add headroom for packaging, retries, recovery, skew and shared-host contention.
+Separate compactors are outside these figures. During catch-up, intake/upload/indexing
+rates differ, so account for each leg separately rather than assuming equal rates.
+
+Local capacity is approximately `s × R × retention time + peak output scratch + reserve`.
+Retained input grows at staged-byte intake minus safely deleted bytes/sec. HPA controls
+pod count; host disk/network limits still apply to the sum of co-located pods.
+
+Each accepted batch is serialized with document lengths, zstd-compressed at level 1,
+and appended with one batch checksum. Files are uploaded unchanged. Incoming wire
+compression is decoded before validation and is independent of staging compression.
+V1 files remain readable. V2 batches require upgraded indexing workers before writers
+admit new data. See [format and rollout](quickwit/quickwit-ingest/src/ingesthree/README.md#upload-and-recovery).
+File and assignment size targets count compressed stored bytes; decoded work and memory
+can increase substantially at unchanged targets. These formulas are sizing models,
+not measured throughput or peak-memory guarantees.
+
 ### Disk requirements to measure
 
 Disk selection needs a workload and acknowledgment-latency target. Raw IOPS alone is insufficient.

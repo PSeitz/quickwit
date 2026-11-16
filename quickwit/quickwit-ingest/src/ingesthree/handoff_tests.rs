@@ -519,7 +519,9 @@ async fn test_drain_closes_clones_and_finishes_queued_and_active_files() {
         .append(&index_uid, &[Bytes::from_static(DOCUMENT.as_bytes())])
         .unwrap();
     let mut expected = fs::read(&core.active[&index_uid].input.path).unwrap();
-    super::super::documents_staged_for_upload::write_record(&mut expected, b"queued").unwrap();
+    let compressed = CompressedBatch::new([b"queued"]).unwrap();
+    super::super::documents_staged_for_upload::write_record(&mut expected, &compressed.data)
+        .unwrap();
     let (storage, mut uploads) = capture_uploads(vec![Ok(()), Ok(())]);
     let mut mock = MockMetastoreService::new();
     mock.expect_register_file_for_indexing()

@@ -23,9 +23,9 @@
 //! JSON key needs an escaped dot even when its indexing options expand dots.
 //!
 //! Strings define groups. Repeated fields and arrays use the first value. Missing
-//! and non-string values share an ignored bucket. Larger groups come first at
-//! each level. Equal-size groups follow first arrival, and leaf groups retain
-//! document arrival order. Document contents remain unchanged.
+//! and non-string values share an ignored bucket. At each level the ignored bucket
+//! comes first, followed by string groups in ascending lexicographic order. Leaf
+//! groups retain document arrival order. Document contents remain unchanged.
 //!
 //! Clustering is optional. Node configuration applies `QW_DISABLE_DOCS_CLUSTERING`.
 //! Writers receive clustering before any documents and use ordinary finalization.
@@ -125,10 +125,10 @@ mod tests {
         let mapper = mapper();
         let mut builder = builder(&mapper, &["_dynamic.service", "labels.status"])?;
         let documents = [
-            serde_json::json!({"body": "first", "service": "a", "labels": {"status": "ok"}}),
-            serde_json::json!({"body": "second", "service": "b", "labels": {"status": "ok"}}),
-            serde_json::json!({"body": "third", "service": "a", "labels": {"status": "error"}}),
-            serde_json::json!({"body": "fourth", "service": "a", "labels": {"status": "error"}}),
+            serde_json::json!({"body": "first", "service": "b", "labels": {"status": "ok"}}),
+            serde_json::json!({"body": "second", "service": "a", "labels": {"status": "ok"}}),
+            serde_json::json!({"body": "third", "service": "b", "labels": {"status": "error"}}),
+            serde_json::json!({"body": "fourth", "service": "b", "labels": {"status": "error"}}),
         ];
         for document in documents {
             let num_bytes = document.to_string().len();
@@ -143,7 +143,7 @@ mod tests {
         }
         assert_eq!(
             builder.index_writer.clustering_group_sizes(),
-            Some(vec![2, 1, 1])
+            Some(vec![1, 2, 1])
         );
         let split = builder.finalize()?;
         let reader = split.index.reader()?;
@@ -153,7 +153,7 @@ mod tests {
         let body = schema.get_field("body")?;
         let mut bodies = Vec::new();
         for (doc_id, (service, status)) in
-            [("a", "error"), ("a", "error"), ("a", "ok"), ("b", "ok")]
+            [("a", "ok"), ("b", "error"), ("b", "error"), ("b", "ok")]
                 .into_iter()
                 .enumerate()
         {
@@ -170,7 +170,7 @@ mod tests {
             assert_eq!(stored["_dynamic"][0]["service"], service);
             assert_eq!(stored["labels"][0]["status"], status);
         }
-        assert_eq!(bodies, ["third", "fourth", "first", "second"]);
+        assert_eq!(bodies, ["second", "third", "fourth", "first"]);
         Ok(())
     }
 }

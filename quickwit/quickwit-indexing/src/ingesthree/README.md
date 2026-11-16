@@ -5,7 +5,8 @@
 1. Claim eligible files using `AssignFilesForIndexing`. An empty assignment returns `None`.
 2. Load the index configuration and delete-opstamp snapshot for the group.
 3. Download one input at a time. Check its registered length, index incarnation, framing,
-   and checksums with `DocumentFileReader`.
+   and checksums with `DocumentFileReader`. V2 input batches are zstd-decompressed and
+   validated before documents are exposed. V1 uncompressed input remains readable.
 4. Convert JSON documents, build splits, serialize, package, stage, and upload them.
 5. Publish all outputs and complete all contributing inputs using `PublishFileSplits`.
 
@@ -25,6 +26,9 @@ incarnation per assignment, with a default target of 100,000,000 input bytes. Se
 fail worker startup. Restart the service to apply changes. The batch includes the file
 that reaches or crosses the target, including an oversized first file. File rotation
 remains independently controlled by `QW_INGESTHREE_TARGET_UPLOAD_SIZE`.
+Both targets count stored input bytes, including compressed batch framing. Compression
+increases decoded work per assignment at the same target. Recheck throughput and retry
+intervals before increasing targets; neither target bounds decoded memory.
 
 Reassignment uses `max(120, ceil(configured batch bytes / 3,000,000))` seconds, assuming
 3 MB/s with a two-minute minimum: 120 seconds for `100MB`, 167 seconds for `500MB`.
@@ -90,7 +94,9 @@ happens before the GET, and the full response is consumed without waiting for in
 Once indexing takes a file, its reservation is released so downloading can continue. That
 active input is separate from the download budget and its buffer is released after processing.
 Thus input memory includes the ~100 MB download queue, up to one file of overshoot, and the
-active input file. These buffers are additional to writer memory and are outside its heap
+active input file. Decoding also holds a compressed batch copy and its decoded allocation;
+returned document slices retain that allocation until consumed. Recovery decodes one batch
+at a time too. These buffers are additional to writer memory and are outside its heap
 flush threshold and writer-memory gauge. Indexing failure cancels outstanding downloads.
 Download errors follow already queued inputs and fail the assignment before staging or
 publication. Packaged files still use scratch disk. Prepared outputs retain their scratch-directory

@@ -19,7 +19,8 @@ use quickwit_proto::ingest::DocBatchV2;
 use super::IngestError;
 use crate::metrics::{DOCS_BYTES_TOTAL, DOCS_TOTAL, VALIDITY};
 
-// Documents and framed batch bytes measured after validation, before file append.
+// Documents and uncompressed batch bytes (including u32 document lengths)
+// measured after validation, before compression and file append.
 #[derive(Clone)]
 pub(super) struct ValidationMetrics {
     pub valid_docs: Counter,
@@ -89,7 +90,7 @@ impl QueueMetrics {
             queue_bytes: GaugeGuard::new(
                 &gauge!(
                     name: "queue_bytes",
-                    description: "Reserved bytes for queued and processing input, including validation copies and descriptors.",
+                    description: "Reserved bytes for input, validation copies and descriptors, compression serialization and maximum output capacity. Validator and zstd working scratch are separate.",
                     subsystem: "ingesthree",
                 ),
                 0.0,
@@ -103,7 +104,7 @@ impl QueueMetrics {
             disk_reserved_bytes: GaugeGuard::new(
                 &gauge!(
                     name: "disk_reserved_bytes",
-                    description: "Disk bytes reserved for queued and processing appends, including a possible new file header.",
+                    description: "Maximum compressed record bytes reserved for queued and processing appends, including framing and a possible new file header.",
                     subsystem: "ingesthree",
                 ),
                 0.0,

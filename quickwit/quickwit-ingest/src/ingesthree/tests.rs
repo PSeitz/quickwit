@@ -46,7 +46,21 @@ pub(super) fn read_input(path: &Path) -> (IndexUid, Vec<Vec<u8>>) {
     }
     let payload = records.remove(0);
     let index_uid = std::str::from_utf8(&payload).unwrap().parse().unwrap();
-    (index_uid, records)
+    let mut documents = Vec::new();
+    for batch in records {
+        let num_docs = u64::from_le_bytes(batch[..8].try_into().unwrap());
+        let decoded_len = u64::from_le_bytes(batch[8..16].try_into().unwrap()) as usize;
+        let decoded = zstd::bulk::decompress(&batch[16..], decoded_len).unwrap();
+        assert_eq!(decoded.len(), decoded_len);
+        let mut remaining = decoded.as_slice();
+        for _ in 0..num_docs {
+            let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+            documents.push(remaining[4..4 + len].to_vec());
+            remaining = &remaining[4 + len..];
+        }
+        assert!(remaining.is_empty());
+    }
+    (index_uid, documents)
 }
 
 #[test]
@@ -161,9 +175,10 @@ fn test_recovery_preserves_open_and_finished_files() {
 #[test]
 fn test_recovery_truncates_incomplete_final_frames_and_keeps_complete_frames() {
     let index = IndexUid::for_test("logs", 1);
-    let unacknowledged = Bytes::from_static(b"unacknowledged document");
+    let unacknowledged = [Bytes::from_static(b"unacknowledged document"), Bytes::new()];
+    let batch = CompressedBatch::new(&unacknowledged).unwrap();
     let mut frame = Vec::new();
-    write_record(&mut frame, &unacknowledged).unwrap();
+    write_record(&mut frame, &batch.data).unwrap();
     for prefix_len in 0..=frame.len() {
         let dir = tempfile::tempdir().unwrap();
         let mut ingester = Ingester::open(dir.path(), DISK_BUDGET).unwrap();
@@ -181,7 +196,7 @@ fn test_recovery_truncates_incomplete_final_frames_and_keeps_complete_frames() {
         let mut expected_documents = documents();
         if prefix_len == frame.len() {
             expected_bytes.extend_from_slice(&frame);
-            expected_documents.push(unacknowledged.clone());
+            expected_documents.extend(unacknowledged.clone());
         }
         let recovered = Ingester::open(dir.path(), DISK_BUDGET).unwrap();
         assert_eq!(recovered.finished_files().len(), 1);
@@ -231,7 +246,8 @@ fn test_recovery_distinguishes_incomplete_metadata_from_missing_documents() {
     let mut bytes = MAGIC.to_vec();
     write_record(&mut bytes, &encode_metadata(&index_uid).unwrap()).unwrap();
     let header_len = bytes.len();
-    write_record(&mut bytes, b"first document").unwrap();
+    let batch = CompressedBatch::new([b"first document"]).unwrap();
+    write_record(&mut bytes, &batch.data).unwrap();
     for prefix_len in [header_len - 1, header_len, bytes.len() - 1] {
         let dir = tempfile::tempdir().unwrap();
         drop(Ingester::open(dir.path(), DISK_BUDGET).unwrap());
@@ -280,10 +296,10 @@ proptest! {
         let path = input.path.clone();
         drop(recovered);
 
-        // Skip metadata, the empty document, and the next frame's length/CRC.
+        // Corrupt the compressed batch payload, preserving the outer length/CRC.
         let metadata_len = u32::from_le_bytes(original[8..12].try_into().unwrap()) as usize;
-        let payload_start = MAGIC.len() + 12 + metadata_len + 12 + 8;
-        let position = payload_start + 8192 + corruption_offset % (documents[1].len() - 8192);
+        let payload_start = MAGIC.len() + 12 + metadata_len + 8;
+        let position = payload_start + corruption_offset % (original.len() - 4 - payload_start);
         let mut corrupted = original;
         corrupted[position] ^= 1;
         fs::write(&path, &corrupted).unwrap();
@@ -338,7 +354,8 @@ fn test_budget_includes_framing_and_recovered_files() {
     let mut ingester = Ingester::open(dir.path(), DISK_BUDGET).unwrap();
     ingester.append(&index, &documents()).unwrap();
     let used = ingester.disk_bytes;
-    let extra = record_size(1).unwrap();
+    let batch = CompressedBatch::new([b"x"]).unwrap();
+    let extra = record_size(batch.data.len()).unwrap();
     ingester.max_disk_bytes = used + extra - 1;
     assert!(
         ingester

@@ -17,6 +17,32 @@ use std::process::Command;
 use super::*;
 
 #[test]
+fn test_file_target_and_disk_budget_count_compressed_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let index_uid = IndexUid::for_test("compressed-size", 1);
+    let documents = [vec![b'x'; 32_768], vec![b'x'; 32_768]];
+    let batch = CompressedBatch::new(&documents).unwrap();
+    let header_bytes =
+        MAGIC.len() as u64 + record_size(encode_metadata(&index_uid).unwrap().len()).unwrap();
+    let target_bytes = header_bytes + 2 * record_size(batch.data.len()).unwrap();
+    assert!(target_bytes < 1_000);
+    let mut ingester = Ingester::open(directory.path(), target_bytes).unwrap();
+    ingester.file_limits.target_file_bytes = target_bytes;
+    let first_id = ingester.append(&index_uid, &documents).unwrap();
+    assert_eq!(ingester.active.len(), 1);
+    assert!(ingester.finished_files().is_empty());
+    assert_eq!(ingester.append(&index_uid, &documents).unwrap(), first_id);
+    assert!(ingester.active.is_empty());
+    assert_eq!(ingester.disk_bytes, target_bytes);
+    let input = &ingester.finished_files()[0];
+    assert_eq!(input.num_docs, 4);
+    assert_eq!(input.num_bytes, target_bytes);
+    assert_eq!(fs::metadata(&input.path).unwrap().len(), target_bytes);
+    assert!(ingester.append(&index_uid, &documents).is_err());
+    assert_eq!(ingester.finished_files().len(), 1);
+}
+
+#[test]
 fn test_file_size_environment() {
     const CHILD: &str = "QW_INGESTHREE_FILE_SIZE_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {

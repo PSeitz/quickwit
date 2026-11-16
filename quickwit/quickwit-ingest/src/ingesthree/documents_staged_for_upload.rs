@@ -21,6 +21,8 @@ use bytes::Bytes;
 use quickwit_proto::types::IndexUid;
 use ulid::Ulid;
 
+use super::compressed_batch::DecodedBatch;
+
 /// Documents staged for upload in a local file belonging to one index.
 #[derive(Clone, Debug)]
 pub struct DocumentsStagedForUpload {
@@ -31,12 +33,14 @@ pub struct DocumentsStagedForUpload {
     pub num_docs: u64,
 }
 
-// Versioned magic, one framed metadata record, then framed opaque documents.
+// Versioned magic, one framed metadata record, then framed documents (V1) or
+// compressed request batches (V2). See compressed_batch.rs for the batch payload.
 // Metadata: UTF-8 index UID. The file ID comes from the filename.
 // Each frame: u32 LE length, CRC32(length), payload, CRC32(payload).
 // Checking the length separately prevents a damaged length from being mistaken
 // for an interrupted payload. CRC32 detects accidental corruption, not tampering.
-pub(super) const MAGIC: &[u8; 8] = b"QWINPUT\x01";
+pub(super) const MAGIC: &[u8; 8] = b"QWINPUT\x02";
+pub(super) const MAGIC_V1: &[u8; 8] = b"QWINPUT\x01";
 pub(super) const FRAME_OVERHEAD: u64 = 12;
 const MAX_METADATA_BYTES: usize = 16 * 1024;
 
@@ -91,16 +95,39 @@ fn check_payload_crc(reader: &mut impl Read, actual_crc: u32) -> io::Result<()> 
     Ok(())
 }
 
-fn read_metadata(reader: &mut impl Read) -> anyhow::Result<IndexUid> {
+fn read_metadata(reader: &mut impl Read) -> anyhow::Result<(IndexUid, bool)> {
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
-    ensure!(&magic == MAGIC, "unsupported input file format");
+    ensure!(
+        &magic == MAGIC || &magic == MAGIC_V1,
+        "unsupported input file format"
+    );
     let len = read_length(reader)? as usize;
     ensure!(len <= MAX_METADATA_BYTES, "input metadata too large");
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
     check_payload_crc(reader, crc32fast::hash(&payload))?;
-    Ok(std::str::from_utf8(&payload)?.parse()?)
+    Ok((std::str::from_utf8(&payload)?.parse()?, &magic == MAGIC))
+}
+
+// Only this outer framing layer may report UnexpectedEof during V2 recovery.
+// Complete records with malformed compressed contents must never be truncated.
+fn read_record(reader: &mut impl Read, remaining_bytes: u64) -> io::Result<Vec<u8>> {
+    let len = read_length(reader)?;
+    if u64::from(len) + FRAME_OVERHEAD > remaining_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "input record exceeds file size",
+        ));
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(len as usize)
+        .map_err(io::Error::other)?;
+    payload.resize(len as usize, 0);
+    reader.read_exact(&mut payload)?;
+    check_payload_crc(reader, crc32fast::hash(&payload))?;
+    Ok(payload)
 }
 
 /// Reads a finished input from disk or memory, checking its size, index incarnation, and checksums.
@@ -108,6 +135,8 @@ fn read_metadata(reader: &mut impl Read) -> anyhow::Result<IndexUid> {
 pub struct DocumentFileReader<R = BufReader<File>> {
     reader: R,
     remaining_bytes: u64,
+    compressed: bool,
+    batch: DecodedBatch,
 }
 
 impl DocumentFileReader {
@@ -124,40 +153,40 @@ impl<R: Read + Seek> DocumentFileReader<R> {
             "input file size mismatch"
         );
         reader.rewind()?;
-        ensure!(
-            read_metadata(&mut reader)? == *index_uid,
-            "input index UID mismatch"
-        );
+        let (stored_index_uid, compressed) = read_metadata(&mut reader)?;
+        ensure!(stored_index_uid == *index_uid, "input index UID mismatch");
         let remaining_bytes = num_bytes
             .checked_sub(reader.stream_position()?)
             .ok_or_else(|| invalid_data("input metadata exceeds file size"))?;
         Ok(Self {
             reader,
             remaining_bytes,
+            compressed,
+            batch: DecodedBatch::default(),
         })
     }
 
     /// Returns the next document, or `None` at the end of the file.
     /// After an error, discard the reader and leave the input unfinished.
     pub fn read_document(&mut self) -> anyhow::Result<Option<Bytes>> {
+        if let Some(document) = self.batch.next_document() {
+            return Ok(Some(document));
+        }
         if self.remaining_bytes == 0 {
             return Ok(None);
         }
-        let len = read_length(&mut self.reader)?;
-        let frame_bytes = u64::from(len) + FRAME_OVERHEAD;
-        ensure!(
-            frame_bytes <= self.remaining_bytes,
-            "input record exceeds file size"
-        );
-        let mut payload = vec![0u8; len as usize];
-        self.reader.read_exact(&mut payload)?;
-        check_payload_crc(&mut self.reader, crc32fast::hash(&payload))?;
-        self.remaining_bytes -= frame_bytes;
-        Ok(Some(Bytes::from(payload)))
+        let payload = read_record(&mut self.reader, self.remaining_bytes)?;
+        self.remaining_bytes -= record_size(payload.len())?;
+        if self.compressed {
+            self.batch = DecodedBatch::decode(&payload)?;
+            Ok(self.batch.next_document())
+        } else {
+            Ok(Some(Bytes::from(payload)))
+        }
     }
 }
 
-// Scan with fixed memory, regardless of document length or backlog size.
+// Scan V1 with fixed memory, regardless of document length or backlog size.
 fn scan_record(reader: &mut impl Read) -> io::Result<u64> {
     let len = read_length(reader)?;
     let mut remaining = u64::from(len);
@@ -185,14 +214,24 @@ pub(super) fn recover(
     let file = OpenOptions::new().read(true).write(!finished).open(path)?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
-    let index_uid = read_metadata(&mut reader)?;
+    let (index_uid, compressed) = read_metadata(&mut reader)?;
     let mut valid_end = reader.stream_position()?;
     let mut num_docs = 0;
     while valid_end < file_len {
-        match scan_record(&mut reader) {
-            Ok(num_bytes) => {
+        let record = if compressed {
+            read_record(&mut reader, file_len - valid_end).and_then(|payload| {
+                let batch = DecodedBatch::decode(&payload).map_err(|error| {
+                    invalid_data(&format!("invalid compressed batch: {error:#}"))
+                })?;
+                Ok((record_size(payload.len())?, batch.num_docs))
+            })
+        } else {
+            scan_record(&mut reader).map(|num_bytes| (num_bytes, 1))
+        };
+        match record {
+            Ok((num_bytes, batch_docs)) => {
                 valid_end += num_bytes;
-                num_docs += 1;
+                num_docs += batch_docs;
             }
             Err(error) if !finished && error.kind() == io::ErrorKind::UnexpectedEof => {
                 reader.get_ref().set_len(valid_end)?;
@@ -217,7 +256,7 @@ mod tests {
     #[test]
     fn test_document_reader_from_memory() {
         let index_uid = IndexUid::for_test("memory-reader", 1);
-        let mut contents = MAGIC.to_vec();
+        let mut contents = MAGIC_V1.to_vec();
         write_record(&mut contents, &encode_metadata(&index_uid).unwrap()).unwrap();
         write_record(&mut contents, b"document").unwrap();
         let num_bytes = contents.len() as u64;
@@ -248,7 +287,7 @@ mod tests {
     #[test]
     fn test_document_reader_checks_frames_and_identity() {
         let index_uid = IndexUid::for_test("reader", 1);
-        let mut contents = MAGIC.to_vec();
+        let mut contents = MAGIC_V1.to_vec();
         write_record(&mut contents, &encode_metadata(&index_uid).unwrap()).unwrap();
         let document_offset = contents.len();
         write_record(&mut contents, b"first\0document\n").unwrap();

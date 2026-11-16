@@ -18,23 +18,25 @@ use std::time::Duration;
 
 #[cfg(test)]
 use bytes::Bytes;
-use futures::future::OptionFuture;
 use quickwit_cluster::Cluster;
-use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::ingest::{DocBatchV2, ParseFailure};
 use quickwit_proto::types::{DocUid, IndexUid};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 use ulid::Ulid;
 
 use super::documents_staged_for_upload::{FRAME_OVERHEAD, MAGIC, encode_metadata};
-use super::{DocumentsStagedForUpload, Ingester, OpenFileLimit, Uploader};
-use crate::ingest_v2::{is_document_validation_enabled, validate_doc_batch_impl};
+use super::{CompressedBatch, DocumentsStagedForUpload, Ingester, Uploader};
 
 #[path = "capacity_tracker.rs"]
 mod capacity_tracker;
 use capacity_tracker::CapacityTracker;
+
+#[path = "write_queue_worker.rs"]
+mod worker;
+use worker::write_batches;
+#[cfg(test)]
+use worker::{append_batch, append_prepared, validate_documents};
 
 #[path = "queue_metrics.rs"]
 mod queue_metrics;
@@ -72,10 +74,11 @@ pub struct AppendResponse {
 /// Queues document batches for validation and writing to per-index files.
 /// Clones share queue and disk byte limits.
 ///
-/// Queue bytes cover queued and processing input, including a validation copy and
-/// descriptors. Validator scratch and response allocations are separate. Disk
-/// reservations allow a new file header per request and settle to file growth
-/// after writes. Filesystem overhead and reserves are separate.
+/// Queue bytes cover input, validation copies/descriptors, compression serialization
+/// (document bytes + four bytes per document), and maximum compressed buffer capacity.
+/// Validator and zstd working scratch and response allocations are separate. Disk
+/// reservations cover the maximum compressed record plus a new file header per request
+/// and settle to actual file growth. Filesystem overhead and reserves are separate.
 #[derive(Clone)]
 pub struct WriteQueue {
     sender: mpsc::UnboundedSender<WriterRequest>,
@@ -169,31 +172,12 @@ struct AppendRequest {
     reservation: Reservation,
 }
 
-// A validation result whose document buffers drop before its input reservation.
-struct ValidatedRequest {
+// A prepared result whose compressed buffer drops before its input reservation.
+struct PreparedRequest {
     index_uid: IndexUid,
     reply: oneshot::Sender<Result<AppendResponse, IngestError>>,
-    validation: Result<(DocBatchV2, Vec<ParseFailure>), IngestError>,
+    preparation: Result<(Option<CompressedBatch>, Vec<ParseFailure>), IngestError>,
     reservation: Reservation,
-}
-
-impl AppendRequest {
-    fn validate(self, metrics: &ValidationMetrics) -> ValidatedRequest {
-        let Self {
-            index_uid,
-            batch,
-            mapper,
-            reply,
-            reservation,
-        } = self;
-        let validation = validate_documents(batch, mapper, metrics);
-        ValidatedRequest {
-            index_uid,
-            reply,
-            validation,
-            reservation,
-        }
-    }
 }
 
 // Requests that the writer append a batch, finish locally, or drain handoff.
@@ -421,15 +405,22 @@ fn num_bytes(index_uid: &IndexUid, batch: &DocBatchV2) -> Result<(u64, u64), Ing
     }
     let metadata = encode_metadata(index_uid)
         .map_err(|error| IngestError::InvalidRequest(error.to_string()))?;
-    // Count input buffers, a possible filtered payload, descriptor growth, and request overhead.
+    let compressed_capacity =
+        CompressedBatch::max_encoded_len(batch.doc_buffer.len(), batch.doc_lengths.len())
+            .map_err(|error| IngestError::InvalidRequest(error.to_string()))?;
+    // Input, validation copy/descriptors, serialization, and the full compressed
+    // allocation coexist during preparation. zstd's working context is separate.
     let mut queue_bytes = size_of::<AppendRequest>() as u64 + metadata.len() as u64;
     for (count, size) in [
-        (batch.doc_buffer.len(), 2),
+        (batch.doc_buffer.len(), 3),
+        (batch.doc_lengths.len(), size_of::<u32>()),
+        (compressed_capacity, 1),
         (batch.doc_lengths.capacity(), size_of::<u32>()),
         (batch.doc_uids.capacity(), size_of::<DocUid>()),
+        // Filtering grows descriptor vectors geometrically while retaining the input.
         (
             batch.doc_lengths.len(),
-            size_of::<u32>() + size_of::<DocUid>(),
+            2 * (size_of::<u32>() + size_of::<DocUid>()),
         ),
     ] {
         queue_bytes = (count as u64)
@@ -437,275 +428,13 @@ fn num_bytes(index_uid: &IndexUid, batch: &DocBatchV2) -> Result<(u64, u64), Ing
             .and_then(|bytes| queue_bytes.checked_add(bytes))
             .ok_or_else(|| IngestError::InvalidRequest("request size overflow".into()))?;
     }
-    let disk_bytes = (batch.doc_lengths.len() as u64)
-        .checked_mul(FRAME_OVERHEAD)
-        .and_then(|total| total.checked_add(batch.doc_buffer.len() as u64))
+    let disk_bytes = (compressed_capacity as u64)
+        .checked_add(FRAME_OVERHEAD)
         .and_then(|total| {
             total.checked_add(MAGIC.len() as u64 + FRAME_OVERHEAD + metadata.len() as u64)
         })
         .ok_or_else(|| IngestError::InvalidRequest("input size overflow".into()))?;
     Ok((queue_bytes, disk_bytes))
-}
-
-/// Validates a batch and returns its valid documents and parse failures.
-fn validate_documents(
-    batch: DocBatchV2,
-    mapper: Option<Arc<DocMapper>>,
-    metrics: &ValidationMetrics,
-) -> Result<(DocBatchV2, Vec<ParseFailure>), IngestError> {
-    let document_bytes = batch
-        .doc_lengths
-        .iter()
-        .try_fold(0usize, |sum, len| sum.checked_add(*len as usize));
-    if document_bytes != Some(batch.doc_buffer.len()) {
-        return Err(IngestError::InvalidRequest(
-            "inconsistent document lengths".into(),
-        ));
-    }
-    let original_bytes = batch.num_bytes();
-    let (batch, parse_failures) = match mapper {
-        Some(mapper) if is_document_validation_enabled() => validate_doc_batch_impl(batch, &mapper),
-        _ => (batch, Vec::new()),
-    };
-    metrics.record(&batch, parse_failures.len(), original_bytes);
-    Ok((batch, parse_failures))
-}
-
-/// Writes batches and finishes files while upload and registration make progress.
-async fn write_batches(
-    ingester: FileWriter,
-    receiver: mpsc::UnboundedReceiver<WriterRequest>,
-    admission: Arc<Mutex<Admission>>,
-    uploader: Option<Uploader>,
-) -> anyhow::Result<()> {
-    let mut drain_reply = None;
-    let result =
-        write_until_stopped(ingester, receiver, &admission, uploader, &mut drain_reply).await;
-    admission.lock().expect("admission mutex poisoned").close();
-    // The owner and any upload future are dropped before acknowledging drain.
-    if let Some(reply) = drain_reply {
-        let response = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| IngestError::Internal(anyhow::anyhow!("{error:#}")));
-        let _ = reply.send(response);
-    }
-    result
-}
-
-async fn write_until_stopped(
-    mut ingester: FileWriter,
-    mut receiver: mpsc::UnboundedReceiver<WriterRequest>,
-    admission: &Arc<Mutex<Admission>>,
-    uploader: Option<Uploader>,
-    drain_reply: &mut Option<oneshot::Sender<Result<(), IngestError>>>,
-) -> anyhow::Result<()> {
-    // Local IO errors or panics can drop the ingester on a blocking thread. Keep
-    // directory ownership until handoff is dropped too (locals drop in reverse order).
-    let directory_lock = ingester.directory_lock.clone();
-    // Handoff completes after registration or remote discard. Then delete the local file.
-    let mut handoff = None;
-    let mut pending_delete: Option<(Ulid, Instant)> = None;
-    loop {
-        if drain_reply.is_some() && ingester.finished.is_empty() {
-            break;
-        }
-        if handoff.is_none()
-            && pending_delete.is_none()
-            && let (Some(uploader), Some(input)) = (&uploader, ingester.finished.first())
-        {
-            handoff = Some(uploader.start(input));
-        }
-        tokio::select! {
-            // Cancellation and expiry take priority even when the request queue stays nonempty.
-            biased;
-            _ = async {
-                match drain_reply.as_mut() {
-                    Some(reply) => reply.closed().await,
-                    None => std::future::pending().await,
-                }
-            } => break,
-            _ = wait_for_deadline(ingester.next_deadline()) => {
-                let (writer, result) = tokio::task::spawn_blocking(move || {
-                    let result = ingester.finish_expired_files();
-                    (ingester, result)
-                }).await?;
-                ingester = writer;
-                if let Err(error) = result {
-                    receiver.close();
-                    drop(handoff);
-                    tokio::task::spawn_blocking(move || drop(ingester)).await?;
-                    return Err(error.context("failed to finish local files"));
-                }
-            }
-            Some(result) = OptionFuture::from(handoff.as_mut()) => {
-                handoff = None;
-                match result {
-                    Ok(file_id) => pending_delete = Some((file_id, Instant::now())),
-                    Err(error) => {
-                        receiver.close();
-                        admission.lock().expect("admission mutex poisoned").close();
-                        // Preserve accepted writes and release the directory on the blocking pool.
-                        tokio::task::spawn_blocking(move || ingester.finish()).await??;
-                        return Err(error);
-                    }
-                }
-            }
-            Some(file_id) = async {
-                let (file_id, retry_at) = pending_delete?;
-                if retry_at > Instant::now() {
-                    tokio::time::sleep_until(retry_at).await;
-                }
-                Some(file_id)
-            } => {
-                let (writer, result) = tokio::task::spawn_blocking(move || {
-                    let result = ingester.delete_finished_file(file_id);
-                    (ingester, result)
-                }).await?;
-                ingester = writer;
-                match result {
-                    Ok(_) => pending_delete = None,
-                    Err(error) => {
-                        tracing::warn!(%file_id, ?error, "failed to delete finished ingesthree file; retrying");
-                        pending_delete = Some((file_id, Instant::now() + Duration::from_secs(1)));
-                    }
-                }
-            }
-            request = receiver.recv(), if drain_reply.is_none() => match request {
-                Some(WriterRequest::Append(append)) => {
-                    ingester = append_batch(ingester, append).await?;
-                }
-                Some(WriterRequest::Finish(reply)) => {
-                    drop(handoff);
-                    let result = tokio::task::spawn_blocking(move || ingester.finish()).await?;
-                    drop(directory_lock);
-                    let _ = reply.send(result.map_err(IngestError::Internal));
-                    return Ok(());
-                }
-                Some(WriterRequest::Drain(reply)) => {
-                    *drain_reply = Some(reply);
-                    receiver.close();
-                    let (writer, result) = tokio::task::spawn_blocking(move || {
-                        let result = ingester.finish_files();
-                        (ingester, result)
-                    }).await?;
-                    ingester = writer;
-                    if let Err(error) = result {
-                        drop(handoff);
-                        tokio::task::spawn_blocking(move || drop(ingester)).await?;
-                        return Err(error.context("failed to finish local files"));
-                    }
-                    if uploader.is_none() {
-                        tokio::task::spawn_blocking(move || drop(ingester)).await?;
-                        anyhow::bail!("handoff drain requires an uploader");
-                    }
-                }
-                None => break,
-            },
-        }
-    }
-    drop(handoff);
-    tokio::task::spawn_blocking(move || ingester.finish()).await??;
-    Ok(())
-}
-
-async fn wait_for_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
-/// Validates and writes one batch, settles its reservation, and replies to the caller.
-async fn append_batch(ingester: FileWriter, append: AppendRequest) -> anyhow::Result<FileWriter> {
-    let metrics = append
-        .reservation
-        .admission
-        .lock()
-        .expect("admission mutex poisoned")
-        .metrics
-        .validation
-        .clone();
-    // Move the request into validation. Cancellation can leave CPU work running,
-    // and a discarded result must drop its buffers before its reservation.
-    let validated = run_cpu_intensive(move || append.validate(&metrics)).await?;
-    tokio::task::spawn_blocking(move || append_validated(ingester, validated)).await?
-}
-
-fn append_validated(
-    mut ingester: FileWriter,
-    validated: ValidatedRequest,
-) -> anyhow::Result<FileWriter> {
-    let ValidatedRequest {
-        index_uid,
-        reply,
-        validation,
-        reservation,
-    } = validated;
-    // Declared after the reservation so the batch drops first during unwinding.
-    let (batch, parse_failures) = match validation {
-        Ok(documents_and_failures) => documents_and_failures,
-        Err(error) => {
-            drop(reservation);
-            let _ = reply.send(Err(error));
-            return Ok(ingester);
-        }
-    };
-    if batch.is_empty() {
-        drop(batch);
-        drop(reservation);
-        let _ = reply.send(Ok(AppendResponse {
-            file_id: None,
-            num_docs: 0,
-            parse_failures,
-        }));
-        return Ok(ingester);
-    }
-    let previous_disk_bytes = ingester.disk_bytes;
-    let num_docs = batch.num_docs() as u64;
-    let result = ingester.append(&index_uid, batch.docs().map(|(_, document)| document));
-    let written_bytes = ingester.disk_bytes - previous_disk_bytes;
-    drop(batch);
-    match result {
-        Ok(file_id) => {
-            // Settle in the blocking task even if its awaiting future was cancelled.
-            reservation.release_after_write(written_bytes);
-            let _ = reply.send(Ok(AppendResponse {
-                file_id: Some(file_id),
-                num_docs,
-                parse_failures,
-            }));
-        }
-        Err(error) if error.is::<OpenFileLimit>() => {
-            let error = reservation
-                .admission
-                .lock()
-                .expect("admission mutex poisoned")
-                .metrics
-                .reject(IngestError::OpenFileLimit);
-            drop(reservation);
-            let _ = reply.send(Err(error));
-        }
-        Err(error) => {
-            let message = format!("{error:#}");
-            {
-                let mut admission = reservation
-                    .admission
-                    .lock()
-                    .expect("admission mutex poisoned");
-                admission.close();
-                // A rename failure can follow a flushed append. Retain its known
-                // file growth. Recovery reconciles partial writes after IO errors.
-                admission.record_written(written_bytes);
-            }
-            // A failed BufWriter may still hold bytes. Drop it on this blocking
-            // thread before releasing its reservation and directory ownership.
-            drop(ingester);
-            let _ = reply.send(Err(IngestError::Internal(error)));
-            anyhow::bail!("local append failed: {message}");
-        }
-    }
-    Ok(ingester)
 }
 
 #[cfg(test)]

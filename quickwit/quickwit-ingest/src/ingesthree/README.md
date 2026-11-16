@@ -3,7 +3,7 @@
 Experimental, opt-in ingestion through local files and object storage. V2 remains the default.
 
 ```text
-request → validate → append locally → ACK
+request → validate → zstd-compress batch → append locally → ACK
                           ↓
                   finish file → upload → register → index
 ```
@@ -30,12 +30,16 @@ local files remain. See [node configuration](../../../../docs/configuration/node
 
 ## Intake and limits
 
-- One writer per node validates and appends batches serially. Each index incarnation
-  has its own active file. Queued batches are not combined.
+- One writer per node validates, compresses, and appends batches serially. Validation
+  and compression run on the CPU pool; file writes run on the blocking pool. Each
+  index incarnation has its own active file. Queued batches are not combined.
 - `validate_docs: false` skips document-schema validation. Batch-length checks remain.
   Invalid documents produce per-document errors. Valid documents continue through intake.
-- Queue and disk bytes are reserved before enqueueing and remain charged through processing.
-  These budgets cover input accounting, not total process memory or physical disk usage.
+- Queue reservations cover input/validation buffers, document descriptors, serialization,
+  and the maximum compressed allocation. Validator and zstd working memory are separate.
+- Disk admission reserves the incompressible batch bound plus framing and a possible file
+  header, then settles to bytes written. File-size targets and disk usage count compressed
+  bytes. Filesystem overhead and recovery reserves remain separate.
 
 | Limit | Default / setting |
 | --- | --- |
@@ -77,8 +81,17 @@ Disk charges remain until deletion succeeds.
 - Recovery repairs incomplete final records in open files. Corruption fails recovery.
   Finished files are immutable and never repaired.
 
-The experimental format uses length-prefixed records with CRC32 checksums.
-See [file format and recovery code](documents_staged_for_upload.rs).
+New files use `QWINPUT\x02`: each accepted batch is one zstd level-1 frame, with a
+16-byte document-count/decoded-length header and 12-byte length/CRC32 framing.
+Inside the compressed frame, each document has a 4-byte length and its opaque bytes.
+The checksum covers the batch. Recovery drops a torn final batch in an open file,
+and rejects corrupt complete batches. Readers validate the batch before yielding documents.
+Incoming wire compression is decoded before validation; staging recompresses accepted documents.
+
+Readers and recovery still support `QWINPUT\x01` files. Older binaries cannot read V2.
+Stop intake and upgrade all ingesthree indexing workers before admitting V2 data.
+Rollback requires draining V2 local and remote inputs with a V2-capable binary first.
+See [file framing/recovery](documents_staged_for_upload.rs) and [batch codec](compressed_batch.rs).
 
 ## Startup and shutdown
 

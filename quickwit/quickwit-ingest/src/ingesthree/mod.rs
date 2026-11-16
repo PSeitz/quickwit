@@ -19,6 +19,9 @@
 //! and age, and limits open files. An optional [`Uploader`] hands finished files to
 //! storage and the metastore before the writer deletes them and releases disk charges.
 
+mod compressed_batch;
+#[cfg(test)]
+mod compressed_batch_tests;
 mod documents_staged_for_upload;
 #[cfg(test)]
 mod file_size_tests;
@@ -45,6 +48,7 @@ use quickwit_proto::types::IndexUid;
 use tokio::time::Instant;
 use ulid::Ulid;
 
+pub(super) use self::compressed_batch::CompressedBatch;
 pub use self::documents_staged_for_upload::{DocumentFileReader, DocumentsStagedForUpload};
 use self::documents_staged_for_upload::{
     MAGIC, encode_metadata, record_size, recover, write_record,
@@ -215,25 +219,29 @@ impl Ingester {
     /// Files reaching the size target are finished after a whole batch, which can exceed the
     /// target. WriteQueue's writer loop finishes expired files between requests.
     /// At the open-file limit, requests needing an additional writer are rejected.
-    /// Cloning the iterator must preserve document lengths for the disk-budget preflight.
+    /// Cloning the iterator must preserve its documents for compression preflight.
     pub fn append(
         &mut self,
         index_uid: &IndexUid,
         documents: impl IntoIterator<Item: AsRef<[u8]>, IntoIter: Clone>,
     ) -> anyhow::Result<Ulid> {
+        let batch = CompressedBatch::new(documents)?;
+        self.append_compressed(index_uid, &batch)
+    }
+
+    /// Appends one complete batch produced by `CompressedBatch::new`. Compression
+    /// runs before entering the blocking writer, with queue memory already reserved.
+    pub(super) fn append_compressed(
+        &mut self,
+        index_uid: &IndexUid,
+        batch: &CompressedBatch,
+    ) -> anyhow::Result<Ulid> {
         ensure!(
             !self.requires_recovery,
             "ingester requires recovery after an IO failure"
         );
-        let documents = documents.into_iter();
-        let mut added_bytes = 0u64;
-        for document in documents.clone() {
-            added_bytes = added_bytes
-                .checked_add(record_size(document.as_ref().len())?)
-                .context("input size overflow")?;
-        }
-        // Every document contributes frame overhead, including empty documents.
-        ensure!(added_bytes > 0, "empty document batch");
+        ensure!(batch.num_docs > 0, "empty document batch");
+        let mut added_bytes = record_size(batch.data.len())?;
         let new_header = if self.active.contains_key(index_uid) {
             None
         } else {
@@ -291,12 +299,9 @@ impl Ingester {
             .active
             .get_mut(index_uid)
             .expect("active file just created");
-        for document in documents {
-            let document = document.as_ref();
-            write_record(&mut active.writer, document)?;
-            active.input.num_bytes += record_size(document.len())?;
-            active.input.num_docs += 1;
-        }
+        write_record(&mut active.writer, &batch.data)?;
+        active.input.num_bytes += record_size(batch.data.len())?;
+        active.input.num_docs += batch.num_docs;
         // This is the acknowledgment boundary, including for small writes that
         // fit entirely inside BufWriter. flush is deliberately distinct from fsync.
         active.writer.flush()?;

@@ -131,7 +131,8 @@ async fn test_admission_metrics_count_queue_storage_and_unavailable_rejections_o
     assert_eq!(usage(&queue), (queue_bytes, disk_bytes, 0));
     let writer = append_batch(writer, request).await.unwrap();
     first.await.unwrap();
-    assert_eq!(usage(&queue), (0, 0, disk_bytes));
+    assert!(writer.disk_bytes < disk_bytes);
+    assert_eq!(usage(&queue), (0, 0, writer.disk_bytes));
     assert!(matches!(
         queue.append(index(), batch(), None).await,
         Err(IngestError::StorageFull)
@@ -227,7 +228,7 @@ async fn test_disk_metric_retains_flushed_growth_when_finishing_file_fails() {
     core.append(&index(), &[Bytes::from_static(b"retained")])
         .unwrap();
     core.file_limits.target_file_bytes = 1;
-    let retained_bytes = core.disk_bytes + batch().doc_buffer.len() as u64 + FRAME_OVERHEAD;
+    let retained_bytes = core.disk_bytes + tests::record_bytes(&batch());
     let finished_path = core.active[&index()].input.path.with_extension("finished");
     fs::create_dir(&finished_path).unwrap();
     let (queue, receiver, writer) = channel(core, BUDGET);
@@ -259,7 +260,7 @@ async fn test_blocking_append_keeps_reservations_after_awaiter_cancellation() {
         panic!("expected append")
     };
     let metrics = queue.admission.lock().unwrap().metrics.validation.clone();
-    let validated = append.validate(&metrics);
+    let prepared = append.prepare(&metrics);
     let (started, ready) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
     let (finished, done) = oneshot::channel();
@@ -267,7 +268,7 @@ async fn test_blocking_append_keeps_reservations_after_awaiter_cancellation() {
         tokio::task::spawn_blocking(move || {
             started.send(()).unwrap();
             released.recv().unwrap();
-            let writer = append_validated(writer, validated).unwrap();
+            let writer = append_prepared(writer, prepared).unwrap();
             drop(writer);
             finished.send(()).unwrap();
         })

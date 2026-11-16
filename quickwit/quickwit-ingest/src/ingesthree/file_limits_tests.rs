@@ -22,6 +22,7 @@ use futures::poll;
 use tokio::time::advance;
 
 use super::*;
+use crate::ingesthree::OpenFileLimit;
 use crate::ingesthree::tests::read_input;
 
 const BUDGET: u64 = 1024 * 1024;
@@ -39,11 +40,12 @@ fn batch() -> DocBatchV2 {
     DocBatchV2::for_test([DOCUMENT])
 }
 
+// Each document here is appended in its own request, hence its own compressed record.
 fn file_size(index_uid: &IndexUid, num_docs: u64) -> u64 {
     MAGIC.len() as u64
         + FRAME_OVERHEAD
         + index_uid.to_string().len() as u64
-        + num_docs * (FRAME_OVERHEAD + DOCUMENT.len() as u64)
+        + num_docs * tests::record_bytes(&batch())
 }
 
 fn input_path(data_dir: &Path, file_id: Ulid, extension: &str) -> PathBuf {
@@ -96,11 +98,18 @@ fn test_size_limit_keeps_whole_batches_and_counts_framing() {
     );
     assert_eq!(read_input(&core.finished_files()[0].path).1, documents(2));
 
+    // A multi-document request compresses together. Set the target just below
+    // its encoded size to verify the whole request is retained across the limit.
+    let compressed = CompressedBatch::new(documents(3)).unwrap();
+    let large_size = file_size(&index_uid, 0) + FRAME_OVERHEAD + compressed.data.len() as u64;
+    core.file_limits.target_file_bytes = large_size - 1;
     let large_id = core.append(&index_uid, &documents(3)).unwrap();
     assert_ne!(large_id, first_id);
     assert!(core.active.is_empty());
-    assert_eq!(core.finished_files()[1].num_bytes, file_size(&index_uid, 3));
+    assert_eq!(core.finished_files()[1].num_bytes, large_size);
+    assert!(large_size > core.file_limits.target_file_bytes);
     assert_eq!(read_input(&core.finished_files()[1].path).1, documents(3));
+    core.file_limits.target_file_bytes = file_size(&index_uid, 2);
     let next_id = core.append(&index_uid, &documents(1)).unwrap();
     assert_ne!(next_id, first_id);
     assert_ne!(next_id, large_id);
@@ -356,7 +365,9 @@ async fn test_finishing_files_at_size_limit_settles_reservations_and_drains_queu
     let index_uid = index(1);
     let (_, disk_bytes) = num_bytes(&index_uid, &batch()).unwrap();
     let mut core = Ingester::open(dir.path(), 2 * disk_bytes).unwrap();
-    core.file_limits.target_file_bytes = disk_bytes;
+    let actual_bytes = file_size(&index_uid, 1);
+    assert!(actual_bytes < disk_bytes);
+    core.file_limits.target_file_bytes = actual_bytes;
     let (queue, receiver) = WriteQueue::channel(&core, BUDGET);
     let core = FileWriter::new(core, queue.admission.clone());
     let mut first = pin!(queue.append(index_uid.clone(), batch(), None));
@@ -378,10 +389,10 @@ async fn test_finishing_files_at_size_limit_settles_reservations_and_drains_queu
     worker.await.unwrap().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.iter().all(|input| input.num_docs == 1));
-    assert_eq!(byte_usage(&queue), (0, 0, 2 * disk_bytes));
+    assert_eq!(byte_usage(&queue), (0, 0, 2 * actual_bytes));
     let recovered = Ingester::open(dir.path(), 0).unwrap();
     assert_eq!(recovered.finished_files().len(), 2);
-    assert_eq!(recovered.disk_bytes, 2 * disk_bytes);
+    assert_eq!(recovered.disk_bytes, 2 * actual_bytes);
 }
 
 #[test]

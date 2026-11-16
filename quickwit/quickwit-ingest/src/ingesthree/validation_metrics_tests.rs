@@ -15,6 +15,7 @@
 use std::pin::pin;
 
 use futures::poll;
+use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_config::{DocMapping, SearchSettings, build_doc_mapper};
 use quickwit_metrics::{Gauge, GaugeGuard, counter, label_values};
 
@@ -35,6 +36,33 @@ fn counts(metrics: &ValidationMetrics) -> (u64, u64, u64, u64) {
         metrics.valid_bytes.get(),
         metrics.invalid_bytes.get(),
     )
+}
+
+#[test]
+fn test_reservation_covers_filtered_descriptor_capacity() {
+    for num_valid_docs in [1, 3, 5, 32_769] {
+        let batch = DocBatchV2::for_test(
+            std::iter::repeat_n("{}", num_valid_docs).chain(std::iter::once("")),
+        );
+        let original_bytes = batch.doc_buffer.len();
+        let original_descriptors = batch.doc_lengths.capacity() * size_of::<u32>()
+            + batch.doc_uids.capacity() * size_of::<DocUid>();
+        let (queue_bytes, _) = num_bytes(&IndexUid::for_test("logs", 1), &batch).unwrap();
+        let (filtered, failures) =
+            validate_documents(batch, Some(mapper()), &ValidationMetrics::default()).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(filtered.num_docs(), num_valid_docs);
+        let filtered_descriptors = filtered.doc_lengths.capacity() * size_of::<u32>()
+            + filtered.doc_uids.capacity() * size_of::<DocUid>();
+        let simultaneous_bytes = original_descriptors
+            + filtered_descriptors
+            + original_bytes
+            + filtered.doc_buffer.len();
+        assert!(
+            queue_bytes >= simultaneous_bytes as u64,
+            "{num_valid_docs} valid documents"
+        );
+    }
 }
 
 #[test]
@@ -137,7 +165,7 @@ async fn test_validation_keeps_input_charged_after_awaiter_cancellation() {
     let waiter = tokio::spawn(run_cpu_intensive(move || {
         started.send(()).unwrap();
         released.recv().unwrap();
-        let result = append.validate(&metrics);
+        let result = append.prepare(&metrics);
         // Dropping a result after its receiver disappeared must release the same charge.
         drop(result);
         finished.send(()).unwrap();
