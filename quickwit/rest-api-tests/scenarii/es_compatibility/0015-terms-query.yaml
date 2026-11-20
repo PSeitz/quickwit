@@ -19,3 +19,16 @@ expected:
   hits:
     total:
       value: 61
+---
+endpoint: simple_es_compat/_search
+json:
+  query:
+    terms:
+      keyword_text: ['gold$', 'r.d']
+expected:
+  hits:
+    total:
+      value: 1
+    hits:
+      - _source:
+          keyword_text: 'gold$'

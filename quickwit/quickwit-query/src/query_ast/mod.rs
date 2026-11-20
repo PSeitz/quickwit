@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -189,6 +190,8 @@ pub struct BuildTantivyAstContext<'a> {
     pub tokenizer_manager: &'a TokenizerManager,
     pub search_fields: &'a [String],
     pub with_validation: bool,
+    /// Collect regexes for search warmup. Without warmup, keep individual terms for snippets.
+    pub term_set_regexes: Option<&'a RefCell<Vec<ResolvedRegex>>>,
 }
 
 impl<'a> BuildTantivyAstContext<'a> {
@@ -204,6 +207,7 @@ impl<'a> BuildTantivyAstContext<'a> {
             tokenizer_manager: &DEFAULT_TOKENIZER_MANAGER,
             search_fields: &[],
             with_validation: true,
+            term_set_regexes: None,
         }
     }
 

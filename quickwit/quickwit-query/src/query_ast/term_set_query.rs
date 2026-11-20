@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tantivy::Term;
 use tantivy::query::{BooleanQuery, ConstScoreQuery};
-use tantivy::schema::IndexRecordOption;
+use tantivy::schema::{FieldType, IndexRecordOption};
 
 use crate::InvalidQuery;
+use crate::query_ast::regex_query::json_str_term_prefix;
 use crate::query_ast::{
-    BoolQuery, BuildTantivyAst, BuildTantivyAstContext, QueryAst, TantivyQueryAst, TermQuery,
+    AutomatonQuery, BoolQuery, BuildTantivyAst, BuildTantivyAstContext, JsonPathPrefix, QueryAst,
+    ResolvedRegex, TantivyQueryAst, TermQuery, get_or_compile_cached_fst_regex,
 };
 
 /// TermSetQuery matches the same document set as if it was a union of
@@ -72,12 +75,57 @@ impl TermSetQuery {
         bool_query.build_tantivy_ast_impl(context)
     }
 
-    // Build a union of normalized terms, using exact dictionary lookups rather than an automaton.
-    fn build_term_disjunction(
+    fn try_string_set_regex(
         &self,
+        terms: &BTreeSet<Term>,
         context: &BuildTantivyAstContext,
-    ) -> Result<TantivyQueryAst, InvalidQuery> {
-        let terms = self.make_term_iterator(context)?;
+    ) -> Option<TantivyQueryAst> {
+        let warmup = context.term_set_regexes?;
+        if self.terms_per_field.len() != 1 || terms.is_empty() {
+            return None;
+        }
+        let (full_path, _) = self.terms_per_field.first_key_value()?;
+        let (field, entry, path) =
+            super::utils::find_field_or_hit_dynamic(full_path, context.schema)?;
+        if !entry.is_indexed() {
+            return None;
+        }
+        let json_path = match entry.field_type() {
+            FieldType::Str(_) => None,
+            FieldType::JsonObject(options) => Some(json_str_term_prefix(field, path, options)),
+            _ => return None,
+        };
+        // Ordered terms give the same compilation cache key on every split.
+        let mut pattern = String::new();
+        for (i, term) in terms.iter().enumerate() {
+            // A JSON literal can also resolve to a typed term. Keep the exact disjunction
+            // if any term does not belong to this path's string dictionary.
+            let value = term
+                .serialized_value_bytes()
+                .strip_prefix(json_path.as_deref().unwrap_or_default())?;
+            if i > 0 {
+                pattern.push('|');
+            }
+            regex_syntax::escape_into(std::str::from_utf8(value).ok()?, &mut pattern);
+        }
+        let regex = get_or_compile_cached_fst_regex(&pattern)?;
+        let query = AutomatonQuery {
+            field,
+            automaton: Arc::new(JsonPathPrefix {
+                prefix: json_path.clone().unwrap_or_default(),
+                automaton: regex,
+            }),
+        };
+        warmup.borrow_mut().push(ResolvedRegex {
+            field,
+            json_path,
+            regex: pattern,
+        });
+        // AutomatonWeight unions matching postings and assigns the boost once per document.
+        Some(query.into())
+    }
+
+    fn build_term_disjunction(terms: BTreeSet<Term>) -> TantivyQueryAst {
         let term_queries = terms
             .into_iter()
             .map(|term| {
@@ -90,14 +138,14 @@ impl TermSetQuery {
         // Score the union, not each term: matching several terms still contributes only 1.0.
         // Basic postings and query_terms also ensure warmup never requests positions.
         let disjunction = BooleanQuery::union(term_queries);
-        Ok(ConstScoreQuery::new(Box::new(disjunction), 1.0).into())
+        ConstScoreQuery::new(Box::new(disjunction), 1.0).into()
     }
 
-    fn make_term_iterator(
+    fn resolve_terms(
         &self,
         context: &BuildTantivyAstContext,
-    ) -> Result<HashSet<Term>, InvalidQuery> {
-        let mut terms: HashSet<Term> = HashSet::default();
+    ) -> Result<BTreeSet<Term>, InvalidQuery> {
+        let mut terms = BTreeSet::new();
 
         for (full_path, values) in &self.terms_per_field {
             for value in values {
@@ -129,10 +177,13 @@ impl BuildTantivyAst for TermSetQuery {
         context: &BuildTantivyAstContext,
     ) -> Result<TantivyQueryAst, InvalidQuery> {
         if self.has_fast_only_field(context) {
-            self.build_bool_query(context)
-        } else {
-            self.build_term_disjunction(context)
+            return self.build_bool_query(context);
         }
+        let terms = self.resolve_terms(context)?;
+        if let Some(query) = self.try_string_set_regex(&terms, context) {
+            return Ok(query);
+        }
+        Ok(Self::build_term_disjunction(terms))
     }
 }
 

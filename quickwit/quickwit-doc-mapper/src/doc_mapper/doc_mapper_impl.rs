@@ -643,14 +643,24 @@ impl DocMapper {
     ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
         build_query(
             query_ast,
-            &BuildTantivyAstContext {
-                schema: &split_schema,
-                tokenizer_manager: self.tokenizer_manager(),
-                search_fields: &self.default_search_field_names[..],
-                with_validation,
-            },
+            &self.query_context(&split_schema, with_validation),
             cache_context,
         )
+    }
+
+    /// Resolve queries against the split's schema and this mapping's tokenizers.
+    pub fn query_context<'a>(
+        &'a self,
+        split_schema: &'a Schema,
+        with_validation: bool,
+    ) -> BuildTantivyAstContext<'a> {
+        BuildTantivyAstContext {
+            schema: split_schema,
+            tokenizer_manager: self.tokenizer_manager(),
+            search_fields: &self.default_search_field_names,
+            with_validation,
+            term_set_regexes: None,
+        }
     }
 
     /// Returns the list of search fields to search into, when no field is specified.

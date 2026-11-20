@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Bound;
@@ -19,8 +20,8 @@ use std::sync::Arc;
 
 use quickwit_query::query_ast::{
     BuildTantivyAstContext, CalcFieldQuery, FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery,
-    QueryAst, QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery,
-    WildcardQuery,
+    QueryAst, QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, ResolvedRegex,
+    TermSetQuery, WildcardQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
 use quickwit_query::{InvalidQuery, find_field_or_hit_dynamic};
@@ -164,13 +165,19 @@ pub(crate) fn build_query(
     // This cannot fail. The error type is Infallible.
     let Ok(_) = fast_fields_visitor.visit(&query_ast);
 
-    let (query, required_terms) = query_ast.build_tantivy_query_and_required_terms(context)?;
+    let term_set_regexes = RefCell::default();
+    let (query, required_terms) =
+        query_ast.build_tantivy_query_and_required_terms(&BuildTantivyAstContext {
+            term_set_regexes: Some(&term_set_regexes),
+            ..*context
+        })?;
 
     let (term_ranges_grouped_by_field, automatons_grouped_by_field) =
         extract_prefix_term_ranges_and_automaton(
             &query_ast,
             context.schema,
             context.tokenizer_manager,
+            term_set_regexes.into_inner(),
         )?;
 
     let mut terms_grouped_by_field: HashMap<Field, HashMap<_, bool>> = Default::default();
@@ -359,9 +366,13 @@ fn extract_prefix_term_ranges_and_automaton(
     query_ast: &QueryAst,
     schema: &Schema,
     tokenizer_manager: &TokenizerManager,
+    term_set_regexes: Vec<ResolvedRegex>,
 ) -> anyhow::Result<(TermRangeWarmupInfo, AutomatonWarmupInfo)> {
     let mut visitor = ExtractPrefixTermRanges::with_schema(schema, tokenizer_manager);
     visitor.visit(query_ast)?;
+    for regex in term_set_regexes {
+        visitor.add_automaton(regex.field, Automaton::Regex(regex.json_path, regex.regex));
+    }
     Ok((
         visitor.term_ranges_to_warm_up,
         visitor.automatons_to_warm_up,
@@ -912,7 +923,7 @@ mod test {
         check_build_query_static_mode(
             "title: IN [hello]",
             Vec::new(),
-            TestExpectation::Ok("Const(score=1, query=BooleanQuery"),
+            TestExpectation::Ok("AutomatonQuery"),
         );
         check_build_query_static_mode(
             "IN [hello]",
@@ -1124,7 +1135,7 @@ mod test {
 
     #[test]
     fn test_build_query_warmup_info() {
-        let query_with_set = query_ast_from_user_text("desc: IN [hello]", None)
+        let query_with_set = query_ast_from_user_text("desc: IN [hello goodbye]", None)
             .parse_user_query(&[])
             .unwrap();
         let query_without_set = query_ast_from_user_text("desc:hello", None)
@@ -1137,11 +1148,12 @@ mod test {
         let (_, warmup_info) = build_query(query_with_set, &context, None).unwrap();
         assert!(warmup_info.term_dict_fields.is_empty());
         let desc = schema.get_field("desc").unwrap();
+        assert!(warmup_info.terms_grouped_by_field.is_empty());
         assert_eq!(
-            warmup_info.terms_grouped_by_field,
+            warmup_info.automatons_grouped_by_field,
             HashMap::from([(
                 desc,
-                HashMap::from([(Term::from_field_text(desc, "hello"), false)])
+                HashSet::from([Automaton::Regex(None, "goodbye|hello".to_string())])
             )])
         );
 

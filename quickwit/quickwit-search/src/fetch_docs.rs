@@ -297,9 +297,11 @@ async fn create_fields_snippet_generator(
     snippet_request: &SnippetRequest,
 ) -> anyhow::Result<FieldsSnippetGenerator> {
     let schema = searcher.schema();
-    let query_ast_resolved = serde_json::from_str(&snippet_request.query_ast_resolved)
-        .context("failed to deserialize QueryAst")?;
-    let (query, _) = doc_mapper.query(schema.clone(), query_ast_resolved, false, None)?;
+    let query_ast: quickwit_query::query_ast::QueryAst =
+        serde_json::from_str(&snippet_request.query_ast_resolved)
+            .context("failed to deserialize QueryAst")?;
+    // Highlight the resolved query terms even when search executes them as a regex.
+    let query = query_ast.build_tantivy_query(&doc_mapper.query_context(schema, false))?;
     let mut snippet_generators = HashMap::new();
     for field_name in &snippet_request.snippet_fields {
         let field = schema.get_field(field_name)?;
@@ -319,7 +321,6 @@ async fn create_snippet_generator(
     field: Field,
 ) -> anyhow::Result<SnippetGenerator> {
     let mut terms: Vec<&Term> = Vec::new();
-    // TODO ok with termset?
     query.query_terms(&mut |term, _need_position| {
         if term.field() == field {
             terms.push(term);

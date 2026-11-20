@@ -116,6 +116,7 @@ json:
         - bug
         - problem
         - closes
+        - pushevent  # Present at the JSON path `type`, absent from commit messages.
 expected:
   hits:
     total:
