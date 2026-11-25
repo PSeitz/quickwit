@@ -62,10 +62,13 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use fnv::FnvHasher;
+use itertools::Itertools;
 use quickwit_config::{
     ClusteringMethod, ClusteringPolicy, DocsClusteringConfig, FingerprintPolicy, JsonPath,
 };
-use serde_json::Value as JsonValue;
+use quickwit_doc_mapper::{
+    ByteDictionary, QuickwitDoc, QuickwitLeafValue, QuickwitObject, QuickwitValue,
+};
 use smallvec::SmallVec;
 
 use super::tokenize;
@@ -127,7 +130,8 @@ impl Fingerprinter {
         &self.config
     }
 
-    pub fn fingerprint(&self, json_value: &JsonValue) -> Fingerprint {
+    /// Hashes original input fields. Mapping stores converted values in separate bindings.
+    pub fn fingerprint(&self, doc: &QuickwitDoc) -> Fingerprint {
         let mut fingerprint = SmallVec::new();
         for policy in self.policies.iter() {
             let mut hasher = FnvHasher::default();
@@ -135,13 +139,19 @@ impl Fingerprinter {
             for method in policy.fingerprint.iter() {
                 match method {
                     ClusteringMethod::Structure { exclude } => {
-                        self.hash_structure(json_value, exclude, &mut hasher);
+                        hash_structure(
+                            doc.as_object(),
+                            doc.dictionary(),
+                            exclude,
+                            &mut Vec::new(),
+                            &mut hasher,
+                        );
                     }
                     ClusteringMethod::Raw { path } => {
-                        self.hash_raw_value(json_value, path, &mut hasher);
+                        hash_raw_value(doc, path, &mut hasher);
                     }
                     ClusteringMethod::Tokenized { path, max_tokens } => {
-                        self.hash_string_tokenized(json_value, path, *max_tokens, &mut hasher);
+                        hash_string_tokenized(doc, path, *max_tokens, &mut hasher);
                     }
                 }
             }
@@ -151,154 +161,85 @@ impl Fingerprinter {
 
         Fingerprint(fingerprint)
     }
+}
 
-    fn hash_structure(&self, value: &JsonValue, exclude: &[JsonPath], hasher: &mut FnvHasher) {
-        fn walk<'a>(
-            json_value: &'a JsonValue,
-            exclude: &[JsonPath],
-            current: &mut Vec<&'a str>,
-            paths: &mut Vec<Vec<&'a str>>,
-        ) {
-            fn is_excluded(exclude: &[JsonPath], path: &[&str]) -> bool {
-                exclude.iter().any(|excluded_path| {
-                    excluded_path.len() == path.len()
-                        && excluded_path.iter().zip(path.iter()).all(
-                            |(excluded_component, component)| {
-                                excluded_component.as_str() == *component
-                            },
-                        )
-                })
-            }
-
-            match json_value {
-                JsonValue::Object(obj) => {
-                    for (key, child_value) in obj.iter() {
-                        current.push(key.as_str());
-                        if !is_excluded(exclude, current) {
-                            walk(child_value, exclude, current, paths);
-                        }
-                        current.pop();
-                    }
-                }
-                _ => paths.push(current.clone()),
-            }
+fn hash_structure<'a>(
+    object: QuickwitObject<'a>,
+    dictionary: &'a ByteDictionary,
+    exclude: &[JsonPath],
+    current: &mut Vec<&'a str>,
+    hasher: &mut FnvHasher,
+) {
+    // Sorting siblings yields complete leaf paths in lexicographic order. Arrays count as leaves.
+    for (key, value) in object
+        .iter(dictionary)
+        .sorted_unstable_by_key(|(key, _)| *key)
+    {
+        current.push(key);
+        if exclude.iter().any(|path| path[..] == current[..]) {
+            current.pop();
+            continue;
         }
-
-        let mut current = Vec::with_capacity(16);
-        let mut paths = Vec::with_capacity(32);
-        walk(value, exclude, &mut current, &mut paths);
-        paths.sort_unstable();
-
-        for path in paths {
-            for component in path {
+        if let QuickwitValue::Object(child) = value {
+            hash_structure(child, dictionary, exclude, current, hasher);
+        } else {
+            for component in current.iter() {
                 hasher.write(component.as_bytes());
                 hasher.write_u8(PATH_COMPONENT_SEPARATOR);
             }
             hasher.write_u8(PATH_SEPARATOR);
         }
+        current.pop();
     }
+}
 
-    fn hash_raw_value(&self, json_value: &JsonValue, path: &JsonPath, hasher: &mut FnvHasher) {
-        fn hash_raw_value_inner(json_value: &JsonValue, hasher: &mut FnvHasher) {
-            const RAW_NULL: u8 = 0;
-            const RAW_BOOL: u8 = 1;
-            const RAW_NUMBER: u8 = 2;
-            const RAW_STRING: u8 = 3;
-            const RAW_ARRAY: u8 = 4;
-            const RAW_OBJECT: u8 = 5;
-
-            match json_value {
-                JsonValue::Null => hasher.write_u8(RAW_NULL),
-                JsonValue::Bool(value) => {
-                    hasher.write_u8(RAW_BOOL);
-                    hasher.write_u8(*value as u8);
-                }
-                JsonValue::Number(value) => {
-                    hasher.write_u8(RAW_NUMBER);
-                    let number = value.to_string();
-                    hasher.write(number.as_bytes());
-                }
-                JsonValue::String(value) => {
-                    hasher.write_u8(RAW_STRING);
-                    hasher.write_usize(value.len());
-                    hasher.write(value.as_bytes());
-                }
-                JsonValue::Array(values) => {
-                    hasher.write_u8(RAW_ARRAY);
-                    hasher.write_usize(values.len());
-                    for value in values {
-                        hash_raw_value_inner(value, hasher);
-                    }
-                }
-                JsonValue::Object(map) => {
-                    hasher.write_u8(RAW_OBJECT);
-                    hasher.write_usize(map.len());
-                    for (key, value) in map.iter() {
-                        hasher.write_usize(key.len());
-                        hasher.write(key.as_bytes());
-                        hash_raw_value_inner(value, hasher);
-                    }
-                }
-            }
-        }
-
-        let Some(json_value) = get_leaf_json_value(json_value, path) else {
-            hasher.write_u8(FIELD_ABSENT);
-            hasher.write_u8(FIELD_BOUNDARY);
-            return;
-        };
+fn hash_raw_value(doc: &QuickwitDoc, path: &JsonPath, hasher: &mut FnvHasher) {
+    if let Some(value) = doc.get_path(path) {
         hasher.write_u8(FIELD_PRESENT);
-        hash_raw_value_inner(json_value, hasher);
-        hasher.write_u8(FIELD_BOUNDARY);
+        value.hash_json(
+            doc.dictionary(),
+            hasher,
+            Hasher::write_usize,
+            |hasher, num| hasher.write(num.to_string().as_bytes()),
+        );
+    } else {
+        hasher.write_u8(FIELD_ABSENT);
     }
+    hasher.write_u8(FIELD_BOUNDARY);
+}
 
-    fn hash_string_tokenized(
-        &self,
-        json_value: &JsonValue,
-        path: &JsonPath,
-        max_tokens: Option<usize>,
-        hasher: &mut FnvHasher,
-    ) {
-        let Some(value) = get_leaf_string(json_value, path) else {
-            hasher.write_u8(FIELD_ABSENT);
-            hasher.write_u8(FIELD_BOUNDARY);
-            return;
-        };
+fn hash_string_tokenized(
+    doc: &QuickwitDoc,
+    path: &JsonPath,
+    max_tokens: Option<usize>,
+    hasher: &mut FnvHasher,
+) {
+    if let Some(QuickwitValue::Leaf(QuickwitLeafValue::String(id))) = doc.get_path(path) {
         hasher.write_u8(FIELD_PRESENT);
-
         let max_tokens = max_tokens.unwrap_or(DEFAULT_MAX_GROUPING_TOKENS);
-        for span in tokenize(value).take(max_tokens) {
+        for span in tokenize(doc.dictionary().get_str(id)).take(max_tokens) {
             hasher.write_u8(span.token_type as u8);
             hasher.write_u8(TOKENIZED_TOKEN_SEPARATOR);
         }
-
-        hasher.write_u8(FIELD_BOUNDARY);
+    } else {
+        hasher.write_u8(FIELD_ABSENT);
     }
-}
-
-fn get_leaf_json_value<'a>(json_value: &'a JsonValue, path: &[String]) -> Option<&'a JsonValue> {
-    if path.is_empty() {
-        return Some(json_value);
-    }
-    let JsonValue::Object(obj) = json_value else {
-        return None;
-    };
-    get_leaf_json_value(obj.get(path.first()?)?, &path[1..])
-}
-
-fn get_leaf_string<'a>(json_value: &'a JsonValue, path: &[String]) -> Option<&'a str> {
-    get_leaf_json_value(json_value, path)?.as_str()
+    hasher.write_u8(FIELD_BOUNDARY);
 }
 
 #[cfg(test)]
 mod tests {
     use quickwit_config::DocsClusteringConfig;
+    use quickwit_doc_mapper::{DocMapper, QuickwitDoc, QuickwitDocBatch};
     use serde_json::Value as JsonValue;
 
     use super::Fingerprinter;
 
-    fn parse(s: &str) -> JsonValue {
-        serde_json::from_str(s).unwrap()
+    fn parse(s: &str) -> QuickwitDoc {
+        let mapper: DocMapper = serde_json::from_str("{}").unwrap();
+        let mut batch = QuickwitDocBatch::default();
+        batch.parse(s.as_bytes()).unwrap();
+        batch.map(&mapper, |_| ()).next().unwrap().1.unwrap().2
     }
 
     fn test_docs_clustering_config() -> DocsClusteringConfig {
@@ -329,6 +270,24 @@ mod tests {
 
     fn docs_clustering_config(json_value: JsonValue) -> DocsClusteringConfig {
         serde_json::from_value(json_value).unwrap()
+    }
+
+    #[test]
+    fn fingerprint_is_independent_of_batch_ids() {
+        let source = r#"{"service":"auth","message":"münchen 42","payload":{"z":"münchen 42","a":["另一"]}}"#;
+        let fingerprinter = test_fingerprinter();
+        let expected = fingerprinter.fingerprint(&parse(source));
+        let mapper: DocMapper = serde_json::from_str("{}").unwrap();
+        let mut batch = QuickwitDocBatch::default();
+        batch.parse(br#"{"unused":"prefix"}"#).unwrap();
+        batch.parse(source.as_bytes()).unwrap();
+        let (fp, _, _) = batch
+            .map(&mapper, |doc| fingerprinter.fingerprint(doc))
+            .last()
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(fp, expected);
     }
 
     #[test]

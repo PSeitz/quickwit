@@ -14,7 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use quickwit_config::TransformConfig;
+use bytes::Bytes;
+use quickwit_config::{SourceInputFormat, TransformConfig};
+use quickwit_doc_mapper::QuickwitDocBatch;
 use tracing::warn;
 use vrl::compiler::runtime::Runtime;
 pub use vrl::compiler::runtime::Terminate as VrlTerminate;
@@ -23,20 +25,6 @@ use vrl::compiler::{Program, TargetValueRef, TimeZone};
 pub use vrl::value::{Secrets as VrlSecrets, Value as VrlValue};
 
 use super::doc_processor::DocProcessorError;
-
-pub(super) struct VrlDoc {
-    pub vrl_value: VrlValue,
-    pub num_bytes: usize,
-}
-
-impl VrlDoc {
-    pub fn new(vrl_value: VrlValue, num_bytes: usize) -> Self {
-        Self {
-            vrl_value,
-            num_bytes,
-        }
-    }
-}
 
 pub(super) struct VrlProgram {
     program: Program,
@@ -47,11 +35,26 @@ pub(super) struct VrlProgram {
 }
 
 impl VrlProgram {
-    pub fn transform_doc(&mut self, vrl_doc: VrlDoc) -> Result<VrlDoc, DocProcessorError> {
-        let VrlDoc {
-            mut vrl_value,
-            num_bytes,
-        } = vrl_doc;
+    pub(super) fn parse_into_batch(
+        &mut self,
+        format: SourceInputFormat,
+        raw_doc: Bytes,
+        batch: &mut QuickwitDocBatch,
+    ) -> Result<(), DocProcessorError> {
+        let num_bytes = raw_doc.len();
+        let mut vrl_value = match format {
+            SourceInputFormat::Json => serde_json::from_slice(&raw_doc)?,
+            SourceInputFormat::PlainText => VrlValue::Object(BTreeMap::from([(
+                "plain_text".into(),
+                VrlValue::Bytes(raw_doc),
+            )])),
+            SourceInputFormat::OtlpLogsJson
+            | SourceInputFormat::OtlpLogsProtobuf
+            | SourceInputFormat::OtlpTracesJson
+            | SourceInputFormat::OtlpTracesProtobuf => {
+                panic!("OTLP logs or traces do not support VRL transforms")
+            }
+        };
 
         let mut target = TargetValueRef {
             value: &mut vrl_value,
@@ -71,7 +74,9 @@ impl VrlProgram {
         }
         self.runtime.clear();
 
-        runtime_res.map(|vrl_value| VrlDoc::new(vrl_value, num_bytes))
+        let output = runtime_res?;
+        batch.push_serialize(&output, num_bytes)?;
+        Ok(())
     }
 
     pub fn try_from_transform_config(transform_config: TransformConfig) -> anyhow::Result<Self> {

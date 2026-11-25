@@ -38,11 +38,12 @@ use crate::doc_mapper::mapping_tree::{
 };
 use crate::doc_mapper::{FieldMappingType, JsonObject, Partition};
 use crate::query_builder::build_query;
+use crate::quickwit_doc::{ByteDictionary, FieldBindings, QuickwitLeafValue, QuickwitObject};
 use crate::routing_expression::RoutingExpr;
 use crate::{
     Cardinality, DOCUMENT_SIZE_FIELD_NAME, DYNAMIC_FIELD_NAME, DocMapping, DocParsingError,
-    FIELD_PRESENCE_FIELD_NAME, Mode, ModeType, NamedField, QueryParserError, SOURCE_FIELD_NAME,
-    TokenizerEntry, WarmupInfo,
+    FIELD_PRESENCE_FIELD_NAME, Mode, ModeType, NamedField, QueryParserError, QuickwitDoc,
+    SOURCE_FIELD_NAME, TokenizerEntry, WarmupInfo,
 };
 
 const FIELD_PRESENCE_FIELD: Field = Field::from_field_id(0u32);
@@ -462,6 +463,56 @@ impl DocMapper {
             };
         }
         Ok(())
+    }
+
+    pub(crate) fn quickwit_partition(&self, doc: &QuickwitDoc) -> Partition {
+        self.partition_key.eval_hash(doc)
+    }
+
+    pub(crate) fn map_tantivy_fields(
+        &self,
+        fields: QuickwitObject<'_>,
+        root_offset: u32,
+        dictionary: &mut ByteDictionary,
+        document_len: u64,
+    ) -> Result<FieldBindings, DocParsingError> {
+        let mut bindings = FieldBindings::default();
+        if let Some(source) = self.source_field {
+            bindings.bind(source, root_offset, true);
+        }
+        self.field_mappings.map_tantivy_fields(
+            fields,
+            dictionary,
+            self.mode.mode_type(),
+            &mut Vec::new(),
+            &mut bindings,
+        )?;
+        if let Some(dynamic) = self.dynamic_field {
+            if !self.concatenate_dynamic_fields.is_empty() {
+                self.field_mappings.concatenate_dynamic(
+                    fields,
+                    dictionary,
+                    &self.concatenate_dynamic_fields,
+                    &mut bindings,
+                );
+            }
+            bindings.bind_dynamic(dynamic);
+        }
+        if let Some(field) = self.document_size_field {
+            bindings.bind_computed(field, QuickwitLeafValue::U64(document_len));
+        }
+        Ok(bindings)
+    }
+
+    /// Presence hashes use the final mapped values after the dictionary is frozen.
+    pub(crate) fn add_field_presence(&self, mapped: &mut QuickwitDoc) {
+        if self.index_field_presence {
+            for hash in populate_field_presence(mapped, &self.schema, true) {
+                mapped
+                    .bindings
+                    .bind_computed(FIELD_PRESENCE_FIELD, QuickwitLeafValue::U64(hash));
+            }
+        }
     }
 
     /// Parses a JSON byte slice into a tantivy [`Document`].

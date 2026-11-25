@@ -24,6 +24,7 @@ mod doc_mapper;
 mod doc_mapping;
 mod error;
 mod query_builder;
+mod quickwit_doc;
 mod routing_expression;
 
 /// Pruning tags manipulation.
@@ -42,6 +43,9 @@ use doc_mapper::{
 pub use doc_mapping::{DocMapping, Mode, ModeType};
 pub use error::{DocParsingError, QueryParserError};
 use quickwit_common::shared_consts::FIELD_PRESENCE_FIELD_NAME;
+pub use quickwit_doc::{
+    ByteDictionary, QuickwitDoc, QuickwitDocBatch, QuickwitLeafValue, QuickwitObject, QuickwitValue,
+};
 use quickwit_proto::types::DocMappingUid;
 pub use routing_expression::RoutingExpr;
 

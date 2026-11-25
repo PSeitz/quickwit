@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod quickwit_doc;
+
 use std::any::type_name;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -671,6 +673,22 @@ fn check_supplied_tie_breaker_value(
 pub(crate) trait NumVal: Sized + FromStr + ToString + Into<TantivyValue> {
     fn from_json_number(num: &serde_json::Number) -> Option<Self>;
 
+    fn from_numeric_string(text: &str, coerce: bool) -> Result<Self, String> {
+        if !coerce {
+            return Err(format!(
+                "expected JSON number, got string `\"{text}\"`. enable coercion to {} with the \
+                 `coerce` parameter in the field mapping",
+                type_name::<Self>()
+            ));
+        }
+        text.parse().map_err(|_| {
+            format!(
+                "failed to coerce JSON string `\"{text}\"` to {}",
+                type_name::<Self>()
+            )
+        })
+    }
+
     fn validate_json(json_val: &BorrowedJsonValue, coerce: bool) -> Result<(), String> {
         match json_val {
             BorrowedJsonValue::Number(num_val) => {
@@ -684,23 +702,7 @@ pub(crate) trait NumVal: Sized + FromStr + ToString + Into<TantivyValue> {
                 })?;
                 Ok(())
             }
-            BorrowedJsonValue::Str(str_val) => {
-                if coerce {
-                    str_val.parse::<Self>().map_err(|_| {
-                        format!(
-                            "failed to coerce JSON string `\"{str_val}\"` to {}",
-                            type_name::<Self>()
-                        )
-                    })?;
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "expected JSON number, got string `\"{str_val}\"`. enable coercion to {} \
-                         with the `coerce` parameter in the field mapping",
-                        type_name::<Self>()
-                    ))
-                }
-            }
+            BorrowedJsonValue::Str(text) => Self::from_numeric_string(text, coerce).map(|_| ()),
             _ => {
                 let message = if coerce {
                     format!("expected JSON number or string, got `{json_val}`")
@@ -721,22 +723,7 @@ pub(crate) trait NumVal: Sized + FromStr + ToString + Into<TantivyValue> {
                     num_val
                 )
             }),
-            JsonValue::String(str_val) => {
-                if coerce {
-                    str_val.parse::<Self>().map_err(|_| {
-                        format!(
-                            "failed to coerce JSON string `\"{str_val}\"` to {}",
-                            type_name::<Self>()
-                        )
-                    })
-                } else {
-                    Err(format!(
-                        "expected JSON number, got string `\"{str_val}\"`. enable coercion to {} \
-                         with the `coerce` parameter in the field mapping",
-                        type_name::<Self>()
-                    ))
-                }
-            }
+            JsonValue::String(text) => Self::from_numeric_string(text, coerce),
             _ => {
                 let message = if coerce {
                     format!("expected JSON number or string, got `{json_val}`")

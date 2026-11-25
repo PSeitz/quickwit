@@ -15,14 +15,15 @@
 use std::fmt;
 
 use quickwit_common::metrics::IN_FLIGHT_INDEXER_MAILBOX;
+use quickwit_doc_mapper::QuickwitDoc;
 use quickwit_metastore::checkpoint::SourceCheckpointDelta;
 use quickwit_metrics::GaugeGuard;
-use tantivy::{DateTime, TantivyDocument};
+use tantivy::DateTime;
 
 use crate::docs_clustering::Fingerprint;
 
 pub struct ProcessedDoc {
-    pub doc: TantivyDocument,
+    pub doc: QuickwitDoc,
     pub timestamp_opt: Option<DateTime>,
     pub fingerprint_opt: Option<Fingerprint>,
     pub partition: u64,

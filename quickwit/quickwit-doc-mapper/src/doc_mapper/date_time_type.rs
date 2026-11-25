@@ -65,6 +65,10 @@ impl Default for QuickwitDateTimeOptions {
 }
 
 impl QuickwitDateTimeOptions {
+    pub(super) fn parse_str(&self, text: &str) -> Result<TantivyDateTime, String> {
+        quickwit_datetime::parse_date_time_str(text, &self.input_formats.0)
+    }
+
     pub(crate) fn validate_json(
         &self,
         json_value: &serde_json_borrow::Value,

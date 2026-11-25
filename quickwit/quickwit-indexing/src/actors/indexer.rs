@@ -705,17 +705,28 @@ mod tests {
 
     use quickwit_actors::Universe;
     use quickwit_config::DocsClusteringConfig;
-    use quickwit_doc_mapper::{DocMapper, default_doc_mapper_for_test};
+    use quickwit_doc_mapper::{
+        DocMapper, QuickwitDoc, QuickwitDocBatch, default_doc_mapper_for_test,
+    };
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
     use quickwit_proto::metastore::{
         EmptyResponse, LastDeleteOpstampResponse, MockMetastoreService,
     };
     use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
+    use serde_json::json;
     use tantivy::schema::Value;
-    use tantivy::{DateTime, DocAddress, TantivyDocument, doc};
+    use tantivy::{DateTime, DocAddress, TantivyDocument};
 
     use super::{IndexerCounters, record_timestamp, *};
     use crate::docs_clustering::Fingerprint;
+
+    fn map_test_docs(mapper: Arc<DocMapper>) -> impl Fn(serde_json::Value) -> QuickwitDoc {
+        move |json| {
+            let mut batch = QuickwitDocBatch::default();
+            batch.push_serialize(&json, 0).unwrap();
+            batch.map(&mapper, |_| ()).next().unwrap().1.unwrap().2
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn create_indexer_for_test(
@@ -781,9 +792,7 @@ mod tests {
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let last_delete_opstamp = 10;
-        let schema = doc_mapper.schema();
-        let body_field = schema.get_field("body").unwrap();
-        let timestamp_field = schema.get_field("timestamp").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.split_num_docs_target = 3;
@@ -814,20 +823,14 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![
                     ProcessedDoc {
-                        doc: doc!(
-                            body_field=>"this is a test document",
-                            timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
-                        ),
+                        doc: doc(json!({"body": "this is a test document", "timestamp": 1_662_529_435})),
                         fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
                     },
                     ProcessedDoc {
-                        doc: doc!(
-                            body_field=>"this is a test document 2",
-                            timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
-                        ),
+                        doc: doc(json!({"body": "this is a test document 2", "timestamp": 1_662_529_435})),
                         fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
@@ -842,20 +845,14 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![
                     ProcessedDoc {
-                        doc: doc!(
-                            body_field=>"this is a test document 3",
-                            timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435i64)
-                        ),
+                        doc: doc(json!({"body": "this is a test document 3", "timestamp": 1_662_529_435})),
                         fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435i64)),
                         partition: 1,
                         num_bytes: 30,
                     },
                     ProcessedDoc {
-                        doc: doc!(
-                            body_field=>"this is a test document 4",
-                            timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
-                        ),
+                        doc: doc(json!({"body": "this is a test document 4", "timestamp": 1_662_529_435})),
                         fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
@@ -869,9 +866,8 @@ mod tests {
         indexer_mailbox
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
-                    doc: doc!(
-                        body_field=>"this is a test document 5",
-                        timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
+                    doc: doc(
+                        json!({"body": "this is a test document 5", "timestamp": 1_662_529_435}),
                     ),
                     fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
@@ -924,8 +920,7 @@ mod tests {
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let last_delete_opstamp = 10;
-        let schema = doc_mapper.schema();
-        let body_field = schema.get_field("body").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.resources.heap_size = ByteSize::mb(16);
@@ -959,7 +954,7 @@ mod tests {
             }
             let num_bytes = body.len() * 2;
             ProcessedDoc {
-                doc: doc!(body_field=>body),
+                doc: doc(json!({"body": body})),
                 fingerprint_opt: None,
                 timestamp_opt: None,
                 partition: 0,
@@ -1003,9 +998,7 @@ mod tests {
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let last_delete_opstamp = 10;
-        let schema = doc_mapper.schema();
-        let body_field = schema.get_field("body").unwrap();
-        let timestamp_field = schema.get_field("timestamp").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.commit_timeout_secs = 1;
@@ -1036,10 +1029,7 @@ mod tests {
                 while indexer_mailbox
                     .send_message(ProcessedDocBatch::new(
                         vec![ProcessedDoc {
-                            doc: doc!(
-                                body_field=>"this is a test document",
-                                timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
-                            ),
+                            doc: doc(json!({"body": "this is a test document", "timestamp": 1_662_529_435})),
                             fingerprint_opt: None,
                             timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                             partition: 1,
@@ -1089,9 +1079,7 @@ mod tests {
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let last_delete_opstamp = 10;
-        let schema = doc_mapper.schema();
-        let body_field = schema.get_field("body").unwrap();
-        let timestamp_field = schema.get_field("timestamp").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let indexing_settings = IndexingSettings::for_test();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
@@ -1116,9 +1104,8 @@ mod tests {
         indexer_mailbox
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
-                    doc: doc!(
-                        body_field=>"this is a test document 5",
-                        timestamp_field=>DateTime::from_timestamp_secs(1_662_529_435)
+                    doc: doc(
+                        json!({"body": "this is a test document 5", "timestamp": 1_662_529_435}),
                     ),
                     fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
@@ -1178,9 +1165,7 @@ mod tests {
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
-        let schema = doc_mapper.schema();
-        let body_field = schema.get_field("body").unwrap();
-        let timestamp_field = schema.get_field("timestamp").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let indexing_settings = IndexingSettings::for_test();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
@@ -1205,9 +1190,8 @@ mod tests {
         indexer_mailbox
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
-                    doc: doc!(
-                        body_field=>"this is a test document 5",
-                        timestamp_field=> DateTime::from_timestamp_secs(1_662_529_435)
+                    doc: doc(
+                        json!({"body": "this is a test document 5", "timestamp": 1_662_529_435}),
                     ),
                     fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
@@ -1251,6 +1235,7 @@ mod tests {
             pipeline_uid: PipelineUid::default(),
         };
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
+        let doc = map_test_docs(doc_mapper.clone());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let mut mock_metastore = MockMetastoreService::new();
@@ -1293,35 +1278,35 @@ mod tests {
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         let docs = vec![
             ProcessedDoc {
-                doc: doc!(body_field=>"first"),
+                doc: doc(json!({"body": "first"})),
                 fingerprint_opt: Some(Fingerprint::new([1, 1, 1])),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"second"),
+                doc: doc(json!({"body": "second"})),
                 fingerprint_opt: Some(Fingerprint::new([1, 2, 1])),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 6,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"third"),
+                doc: doc(json!({"body": "third"})),
                 fingerprint_opt: Some(Fingerprint::new([1, 2, 1])),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"fourth"),
+                doc: doc(json!({"body": "fourth"})),
                 fingerprint_opt: Some(Fingerprint::new([1, 1, 1])),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 6,
             },
             ProcessedDoc {
-                doc: doc!(body_field=>"fifth"),
+                doc: doc(json!({"body": "fifth"})),
                 fingerprint_opt: Some(Fingerprint::new([1, 1, 2])),
                 timestamp_opt: None,
                 partition: 0,
@@ -1381,9 +1366,7 @@ mod tests {
         };
         let doc_mapper: Arc<DocMapper> =
             Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_WITH_PARTITION_JSON).unwrap());
-        let schema = doc_mapper.schema();
-        let tenant_field = schema.get_field("tenant").unwrap();
-        let body_field = schema.get_field("body").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
 
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
@@ -1411,20 +1394,14 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![
                     ProcessedDoc {
-                        doc: doc!(
-                            body_field=>"doc 2",
-                            tenant_field=>"tenant_1",
-                        ),
+                        doc: doc(json!({"body": "doc 2", "tenant": "tenant_1"})),
                         fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 1,
                         num_bytes: 30,
                     },
                     ProcessedDoc {
-                        doc: doc!(
-                            body_field=>"doc 2",
-                            tenant_field=>"tenant_2",
-                        ),
+                        doc: doc(json!({"body": "doc 2", "tenant": "tenant_2"})),
                         fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 3,
@@ -1484,7 +1461,7 @@ mod tests {
         };
         let doc_mapper: Arc<DocMapper> =
             Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
-        let body_field = doc_mapper.schema().get_field("body").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.resources.heap_size = ByteSize::gb(5);
@@ -1511,7 +1488,7 @@ mod tests {
             indexer_mailbox
                 .send_message(ProcessedDocBatch::new(
                     vec![ProcessedDoc {
-                        doc: doc!(body_field=>"doc {i}"),
+                        doc: doc(json!({"body": "doc {i}"})),
                         fingerprint_opt: None,
                         timestamp_opt: None,
                         partition,
@@ -1557,7 +1534,7 @@ mod tests {
         };
         let doc_mapper: Arc<DocMapper> =
             Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
-        let body_field = doc_mapper.schema().get_field("body").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.split_num_docs_target = 1;
@@ -1591,7 +1568,7 @@ mod tests {
             indexer_mailbox
                 .send_message(ProcessedDocBatch::new(
                     vec![ProcessedDoc {
-                        doc: doc!(body_field=>"doc 1"),
+                        doc: doc(json!({"body": "doc 1"})),
                         fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 0,
@@ -1631,7 +1608,7 @@ mod tests {
         };
         let doc_mapper: Arc<DocMapper> =
             Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
-        let body_field = doc_mapper.schema().get_field("body").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let mut indexing_settings = IndexingSettings::for_test();
         indexing_settings.split_num_docs_target = 1;
@@ -1664,7 +1641,7 @@ mod tests {
         indexer_mailbox
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
-                    doc: doc!(body_field=>"doc 1"),
+                    doc: doc(json!({"body": "doc 1"})),
                     fingerprint_opt: None,
                     timestamp_opt: None,
                     partition: 0,
@@ -1698,7 +1675,7 @@ mod tests {
         };
         let doc_mapper: Arc<DocMapper> =
             Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_SIMPLE_JSON).unwrap());
-        let body_field = doc_mapper.schema().get_field("body").unwrap();
+        let doc = map_test_docs(doc_mapper.clone());
         let indexing_directory = TempDirectory::for_test();
         let indexing_settings = IndexingSettings::for_test();
         let mut mock_metastore = MockMetastoreService::new();
@@ -1722,7 +1699,7 @@ mod tests {
         indexer_mailbox
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
-                    doc: doc!(body_field=>"doc 1"),
+                    doc: doc(json!({"body": "doc 1"})),
                     fingerprint_opt: None,
                     timestamp_opt: None,
                     partition: 0,
