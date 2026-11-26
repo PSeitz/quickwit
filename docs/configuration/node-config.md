@@ -44,16 +44,18 @@ docs_clustering_config:
   - kind: raw
     path: service
   - kind: structure
-  - kind: raw
-    path: status
+  - kind: tokenized
+    path: message
+    max_tokens: 50
 ```
 
 Each entry defines one clustering level from outermost to innermost:
 
-- `kind: raw` groups by string values at a mapped schema or JSON path. Use dot-separated paths for nested fields and `_dynamic.service` for an unmapped `service` field. Each path must have nonempty components without leading or trailing whitespace. Unresolvable paths cause indexing to fail. Arrays and repeated fields use their first value. Missing and non-string values share an ignored bucket that precedes string groups in ascending lexicographic order.
-- `kind: structure` groups by a 64-bit hash of the document's unique mapped leaf paths (values, scalar types, field order, and repetitions are ignored; arrays count as leaves; empty objects contribute no leaves), ordered by ascending hash.
+- `kind: raw` groups by string values at a dot-separated JSON path on the document. Each path must have nonempty components without leading or trailing whitespace. Arrays use their first value. Missing and non-string values share an ignored bucket that precedes string groups in ascending lexicographic order.
+- `kind: tokenized` groups by the token-type pattern (`Word`, `Number`, `IPv4`, `Uuid`, `Gap`) of the string value at a dot-separated JSON path, replacing volatile literals with their token types so structurally similar messages cluster together. Optional `max_tokens` caps the number of tokens considered (default `50`). Array handling and the ignored bucket match `kind: raw`.
+- `kind: structure` groups by an order-independent 64-bit hash of the document's unique JSON leaf paths (values, scalar types, and key order are ignored; arrays count as leaves; empty objects contribute no leaves), ordered by ascending hash.
 
-The old `fingerprint` wrapper and `docs_clustering` key are rejected. `kind: tokenized` returns an explicit unsupported error.
+The old `fingerprint` wrapper and `docs_clustering` key are rejected.
 
 Omit the setting to disable clustering. `QW_DISABLE_DOCS_CLUSTERING=true` disables a supported configuration and bypasses path validation. `false` preserves the configured entries and leaves clustering disabled when the setting is absent. Unsupported kinds and malformed entries remain errors even with the override enabled.
 

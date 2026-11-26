@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use anyhow::ensure;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::config_value::ConfigValue;
 use crate::qw_env_vars::QW_DISABLE_DOCS_CLUSTERING;
@@ -27,13 +27,15 @@ use crate::qw_env_vars::QW_DISABLE_DOCS_CLUSTERING;
 /// - kind: raw
 ///   path: service
 /// - kind: structure
-/// - kind: raw
-///   path: status
+/// - kind: tokenized
+///   path: message
+///   max_tokens: 50
 /// ```
-/// Field levels group by string values at mapped schema or JSON paths (arrays and repeated fields
-/// use the first value; missing and non-string values share an ignored bucket before string
-/// groups). Structure levels group by a 64-bit hash of the document's unique mapped leaf paths.
-/// Tokenized clustering is unsupported.
+/// Field levels (`raw` and `tokenized`) group by string values at dot-separated JSON paths
+/// (arrays use the first value; missing and non-string values share an ignored bucket before
+/// string groups). `tokenized` replaces literals with their token-type pattern up to `max_tokens`
+/// (default 50). Structure levels group by an order-independent 64-bit hash of the document's
+/// unique JSON leaf paths.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     try_from = "DocsClusteringConfigBuilder",
@@ -47,9 +49,16 @@ pub struct DocsClusteringConfig {
 /// How to group documents at one level of clustering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusteringKey {
-    /// Group by a mapped schema field or JSON path (string values).
+    /// Group by a dot-separated JSON path (exact string values).
     Field(String),
-    /// Group by a 64-bit hash of the document's unique mapped leaf paths.
+    /// Group by the token-type pattern of the string value at a dot-separated JSON path.
+    Tokenized {
+        /// Dot-separated path to the string value.
+        path: String,
+        /// Maximum number of tokens to consider. Defaults to 50.
+        max_tokens: Option<usize>,
+    },
+    /// Group by an order-independent 64-bit hash of the document's unique JSON leaf paths.
     Structure,
 }
 
@@ -59,67 +68,19 @@ pub(crate) struct DocsClusteringConfigBuilder {
     group_by: Vec<ClusteringKeyEntry>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ClusteringKeyEntry {
-    Raw { path: String },
-    Structure,
-}
-
-impl Serialize for ClusteringKeyEntry {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        #[derive(Serialize)]
-        #[serde(tag = "kind", rename_all = "snake_case")]
-        enum Tagged<'a> {
-            Raw { path: &'a str },
-            Structure,
-        }
-        match self {
-            Self::Raw { path } => Tagged::Raw { path }.serialize(serializer),
-            Self::Structure => Tagged::Structure.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ClusteringKeyEntry {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            kind: String,
-            path: Option<String>,
-            max_tokens: Option<usize>,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        match wire.kind.as_str() {
-            "raw" => {
-                if wire.max_tokens.is_some() {
-                    return Err(serde::de::Error::unknown_field("max_tokens", &["path"]));
-                }
-                let path = wire
-                    .path
-                    .ok_or_else(|| serde::de::Error::missing_field("path"))?;
-                Ok(Self::Raw { path })
-            }
-            "structure" => {
-                if wire.path.is_some() {
-                    return Err(serde::de::Error::unknown_field("path", &["kind"]));
-                }
-                if wire.max_tokens.is_some() {
-                    return Err(serde::de::Error::unknown_field("max_tokens", &["kind"]));
-                }
-                Ok(Self::Structure)
-            }
-            "tokenized" => Err(serde::de::Error::custom(
-                "tokenized document clustering is unsupported",
-            )),
-            other => Err(serde::de::Error::unknown_variant(
-                other,
-                &["raw", "structure"],
-            )),
-        }
-    }
+    Raw {
+        path: String,
+    },
+    Tokenized {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<usize>,
+    },
+    // Empty struct variant so `deny_unknown_fields` rejects extra fields on `kind: structure`.
+    Structure {},
 }
 
 impl DocsClusteringConfigBuilder {
@@ -152,7 +113,10 @@ impl TryFrom<DocsClusteringConfigBuilder> for DocsClusteringConfig {
                 .into_iter()
                 .map(|entry| match entry {
                     ClusteringKeyEntry::Raw { path } => ClusteringKey::Field(path),
-                    ClusteringKeyEntry::Structure => ClusteringKey::Structure,
+                    ClusteringKeyEntry::Tokenized { path, max_tokens } => {
+                        ClusteringKey::Tokenized { path, max_tokens }
+                    }
+                    ClusteringKeyEntry::Structure {} => ClusteringKey::Structure,
                 })
                 .collect(),
         };
@@ -169,7 +133,10 @@ impl From<DocsClusteringConfig> for DocsClusteringConfigBuilder {
                 .into_iter()
                 .map(|key| match key {
                     ClusteringKey::Field(path) => ClusteringKeyEntry::Raw { path },
-                    ClusteringKey::Structure => ClusteringKeyEntry::Structure,
+                    ClusteringKey::Tokenized { path, max_tokens } => {
+                        ClusteringKeyEntry::Tokenized { path, max_tokens }
+                    }
+                    ClusteringKey::Structure => ClusteringKeyEntry::Structure {},
                 })
                 .collect(),
         }
@@ -178,16 +145,16 @@ impl From<DocsClusteringConfig> for DocsClusteringConfigBuilder {
 
 impl DocsClusteringConfig {
     /// Validates the grouping keys and path syntax, including for programmatically constructed
-    /// configs. The indexer additionally checks whether field paths resolve in each index's mapped
-    /// schema.
+    /// configs.
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             !self.group_by.is_empty(),
             "document clustering keys must contain at least one entry"
         );
         for key in &self.group_by {
-            let ClusteringKey::Field(path) = key else {
-                continue;
+            let path = match key {
+                ClusteringKey::Field(path) | ClusteringKey::Tokenized { path, .. } => path,
+                ClusteringKey::Structure => continue,
             };
             ensure!(
                 !path.split('.').any(str::is_empty),
@@ -210,8 +177,9 @@ mod tests {
 
     use super::{ClusteringKey, DocsClusteringConfig, DocsClusteringConfigBuilder};
 
-    const SAMPLE_KEYS: &str =
-        "[{kind: raw, path: service}, {kind: structure}, {kind: raw, path: attributes.status}]";
+    const SAMPLE_KEYS: &str = "[{kind: raw, path: service}, {kind: structure}, {kind: tokenized, \
+                               path: message}, {kind: tokenized, path: attributes.body, \
+                               max_tokens: 16}]";
 
     fn build_config(
         yaml: &str,
@@ -229,13 +197,21 @@ mod tests {
             [
                 ClusteringKey::Field("service".into()),
                 ClusteringKey::Structure,
-                ClusteringKey::Field("attributes.status".into()),
+                ClusteringKey::Tokenized {
+                    path: "message".into(),
+                    max_tokens: None,
+                },
+                ClusteringKey::Tokenized {
+                    path: "attributes.body".into(),
+                    max_tokens: Some(16),
+                },
             ]
         );
         let expected = serde_json::json!([
             {"kind": "raw", "path": "service"},
             {"kind": "structure"},
-            {"kind": "raw", "path": "attributes.status"}
+            {"kind": "tokenized", "path": "message"},
+            {"kind": "tokenized", "path": "attributes.body", "max_tokens": 16}
         ]);
         assert_eq!(serde_json::to_value(&config).unwrap(), expected);
         assert_eq!(
@@ -281,6 +257,20 @@ mod tests {
                 vec![ClusteringKey::Field("attributes.status ".into())],
                 "must not contain leading or trailing whitespace",
             ),
+            (
+                vec![ClusteringKey::Tokenized {
+                    path: "attributes..message".into(),
+                    max_tokens: None,
+                }],
+                "must not contain empty components",
+            ),
+            (
+                vec![ClusteringKey::Tokenized {
+                    path: " message".into(),
+                    max_tokens: Some(10),
+                }],
+                "must not contain leading or trailing whitespace",
+            ),
         ];
         for (group_by, expected_error) in invalid_configs {
             let config = DocsClusteringConfig { group_by };
@@ -311,6 +301,9 @@ mod tests {
             "[{kind: combined, fields: [service, status]}]",
             "[{kind: raw, path: service, extra: nope}]",
             "[{kind: raw, path: service, max_tokens: 10}]",
+            "[{kind: structure, max_tokens: 10}]",
+            "[{kind: tokenized}]",
+            "[{kind: tokenized, path: message, extra: nope}]",
             "[{kind: raw}]",
             "[{path: service}]",
             "[{kind: templated, path: message}]",
@@ -330,32 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn tokenized_is_explicitly_unsupported_even_when_disabled() {
-        let env_vars = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "true".into())]);
-        for yaml in [
-            "[{kind: tokenized, path: message}]",
-            "[{kind: tokenized, path: message, max_tokens: 50}]",
-        ] {
-            let error = serde_yaml::from_str::<DocsClusteringConfig>(yaml).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("tokenized document clustering is unsupported")
-            );
-            let error = build_config(yaml, &env_vars).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("tokenized document clustering is unsupported")
-            );
-        }
-    }
-
-    #[test]
     fn disable_override_preserves_supported_config_behavior() {
         let disabled = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "true".into())]);
         assert!(build_config(SAMPLE_KEYS, &disabled).unwrap().is_none());
-        for yaml in ["[]", "[{kind: raw, path: attributes..status}]"] {
+        for yaml in [
+            "[]",
+            "[{kind: raw, path: attributes..status}]",
+            "[{kind: tokenized, path: attributes..message}]",
+        ] {
             assert!(build_config(yaml, &disabled).unwrap().is_none());
         }
         let enabled = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "false".into())]);

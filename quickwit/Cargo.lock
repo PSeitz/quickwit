@@ -7959,6 +7959,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid 3.0.0",
+ "unicode-segmentation",
  "utoipa",
  "vrl",
  "warp",

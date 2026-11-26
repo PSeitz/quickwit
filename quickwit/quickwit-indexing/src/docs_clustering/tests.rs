@@ -22,7 +22,7 @@ use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
 use tantivy::schema::Value;
 use tantivy::{DocAddress, IndexBuilder, TantivyDocument};
 
-use super::DocClusterer;
+use super::{DocClusterer, structure_hash};
 use crate::models::IndexedSplitBuilder;
 
 fn mapper() -> DocMapper {
@@ -52,7 +52,7 @@ fn builder(
     group_by: Vec<ClusteringKey>,
 ) -> anyhow::Result<IndexedSplitBuilder> {
     let config = DocsClusteringConfig { group_by };
-    let clusterer = DocClusterer::new(&mapper.schema(), &config)?;
+    let clusterer = DocClusterer::new(&config)?;
     let index_builder = IndexBuilder::new()
         .schema(mapper.schema())
         .tokenizers(mapper.tokenizer_manager().tantivy_manager().clone());
@@ -74,27 +74,23 @@ fn builder(
 }
 
 #[test]
-fn test_clustering_schema_paths() {
+fn test_clustering_structure_hash_is_order_and_batch_independent() {
     let mapper = mapper();
-    for path in [
-        "body",
-        "attributes.service",
-        "labels.service",
-        "_dynamic.service",
-    ] {
-        assert!(
-            builder(&mapper, vec![ClusteringKey::Field(path.into())]).is_ok(),
-            "{path}"
-        );
-    }
-    assert!(builder(&mapper, vec![ClusteringKey::Structure]).is_ok());
-    // An unmapped source field must name its dynamic schema container explicitly.
-    for path in ["service", "body.service", "attributes"] {
-        assert!(
-            builder(&mapper, vec![ClusteringKey::Field(path.into())]).is_err(),
-            "{path}"
-        );
-    }
+    // Different batches assign different dictionary key IDs to the same keys.
+    let batch1 = map_docs(
+        &mapper,
+        &[
+            serde_json::json!({"alpha": 1, "beta": {"nested": "x"}}),
+            serde_json::json!({"a": {"bc": 1}}),
+            serde_json::json!({"ab": {"c": 1}}),
+        ],
+    );
+    let batch2 = map_docs(
+        &mapper,
+        &[serde_json::json!({"beta": {"nested": [1, 2], "empty": {}}, "alpha": "str"})],
+    );
+    assert_eq!(structure_hash(&batch1[0]), structure_hash(&batch2[0]));
+    assert_ne!(structure_hash(&batch1[1]), structure_hash(&batch1[2]));
 }
 
 #[test]
@@ -103,7 +99,7 @@ fn test_clustering_field_and_ignored_lexicographic_order() -> anyhow::Result<()>
     let mut split_builder = builder(
         &mapper,
         vec![
-            ClusteringKey::Field("_dynamic.service".into()),
+            ClusteringKey::Field("service".into()),
             ClusteringKey::Field("labels.status".into()),
         ],
     )?;
@@ -159,7 +155,7 @@ fn test_clustering_structure_groups_matching_shapes() -> anyhow::Result<()> {
     let mut split_builder = builder(
         &mapper,
         vec![
-            ClusteringKey::Field("_dynamic.service".into()),
+            ClusteringKey::Field("service".into()),
             ClusteringKey::Structure,
         ],
     )?;
@@ -208,7 +204,7 @@ fn test_clustering_mem_usage_counts_shared_batch_once() {
     let config = DocsClusteringConfig {
         group_by: vec![ClusteringKey::Field("body".into())],
     };
-    let mut clusterer = DocClusterer::new(&mapper.schema(), &config).unwrap();
+    let mut clusterer = DocClusterer::new(&config).unwrap();
     let payload = "x".repeat(4096);
     let docs = map_docs(
         &mapper,
@@ -227,6 +223,100 @@ fn test_clustering_mem_usage_counts_shared_batch_once() {
     let after_second = clusterer.mem_usage();
     // Second doc from the same batch must not double-count `BatchData`.
     assert!(after_second - after_first < batch_mem);
+}
+
+#[test]
+fn test_clustering_tokenized_groups_by_token_pattern_and_max_tokens() -> anyhow::Result<()> {
+    let mapper = mapper();
+    let mut split_builder = builder(
+        &mapper,
+        vec![
+            ClusteringKey::Field("service".into()),
+            ClusteringKey::Tokenized {
+                path: "labels.message".into(),
+                max_tokens: None,
+            },
+        ],
+    )?;
+    let inputs = [
+        // Word Gap Number (tag 1,5,2)
+        serde_json::json!({"body": "port_1", "service": "api", "labels": {"message": "port 8080"}}),
+        // Missing message -> ignored bucket (first within "api")
+        serde_json::json!({"body": "no_msg", "service": "api", "labels": {}}),
+        // Word Gap IPv4 (tag 1,5,3)
+        serde_json::json!({"body": "ip_1", "service": "api", "labels": {"message": "from 10.0.0.1"}}),
+        // Non-string message -> ignored bucket
+        serde_json::json!({"body": "num_msg", "service": "api", "labels": {"message": 42}}),
+        // Same pattern as port_1 (Word Gap Number)
+        serde_json::json!({"body": "port_2", "service": "api", "labels": {"message": "started 9090"}}),
+        // Same pattern as ip_1 (Word Gap IPv4)
+        serde_json::json!({"body": "ip_2", "service": "api", "labels": {"message": "peer 192.168.1.5"}}),
+        // Word Gap Uuid (tag 1,5,4)
+        serde_json::json!({"body": "uuid_1", "service": "api", "labels": {"message": "id 550e8400-e29b-41d4-a716-446655440000"}}),
+    ];
+    for doc in map_docs(&mapper, &inputs) {
+        split_builder.add_document(doc)?;
+    }
+    assert_eq!(
+        split_builder
+            .doc_clusterer_opt
+            .as_ref()
+            .unwrap()
+            .group_sizes(),
+        vec![2, 2, 2, 1]
+    );
+    let split = split_builder.finalize()?;
+    let reader = split.index.reader()?;
+    let searcher = reader.searcher();
+    let body = split.index.schema().get_field("body")?;
+    let bodies: Vec<String> = (0..inputs.len() as u32)
+        .map(|doc_id| {
+            let doc: TantivyDocument = searcher.doc(DocAddress::new(0, doc_id)).unwrap();
+            doc.get_first(body).unwrap().as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            "no_msg", "num_msg", "port_1", "port_2", "ip_1", "ip_2", "uuid_1"
+        ]
+    );
+
+    // `max_tokens: Some(3)` ignores tokens past the 3rd span (Word Gap Number).
+    let mut truncated_builder = builder(
+        &mapper,
+        vec![ClusteringKey::Tokenized {
+            path: "labels.message".into(),
+            max_tokens: Some(3),
+        }],
+    )?;
+    let truncated_inputs = [
+        serde_json::json!({"body": "short", "labels": {"message": "req 10"}}),
+        serde_json::json!({"body": "different", "labels": {"message": "10 req"}}),
+        serde_json::json!({"body": "long", "labels": {"message": "req 20 extra 10.0.0.1"}}),
+    ];
+    for doc in map_docs(&mapper, &truncated_inputs) {
+        truncated_builder.add_document(doc)?;
+    }
+    assert_eq!(
+        truncated_builder
+            .doc_clusterer_opt
+            .as_ref()
+            .unwrap()
+            .group_sizes(),
+        vec![2, 1]
+    );
+    let split = truncated_builder.finalize()?;
+    let reader = split.index.reader()?;
+    let searcher = reader.searcher();
+    let bodies: Vec<String> = (0..truncated_inputs.len() as u32)
+        .map(|doc_id| {
+            let doc: TantivyDocument = searcher.doc(DocAddress::new(0, doc_id)).unwrap();
+            doc.get_first(body).unwrap().as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(bodies, ["short", "long", "different"]);
+    Ok(())
 }
 
 #[test]

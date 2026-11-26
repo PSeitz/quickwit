@@ -129,7 +129,7 @@ impl IndexerState {
         let doc_clusterer_opt = self
             .clustering_config
             .as_ref()
-            .map(|config| DocClusterer::new(&self.schema, config))
+            .map(DocClusterer::new)
             .transpose()?;
 
         let indexed_split = IndexedSplitBuilder::new_in_dir(

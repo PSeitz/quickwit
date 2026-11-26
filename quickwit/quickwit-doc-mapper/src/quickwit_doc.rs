@@ -334,7 +334,8 @@ impl<'a> QuickwitObject<'a> {
         std::iter::from_fn(move || self.next_entry())
     }
 
-    pub(crate) fn get(self, name: &str, dictionary: &ByteDictionary) -> Option<QuickwitValue<'a>> {
+    /// Looks up a literal field name in this object.
+    pub fn get(self, name: &str, dictionary: &ByteDictionary) -> Option<QuickwitValue<'a>> {
         let target = name.as_bytes();
         self.entries()
             .find(|&(key_id, ..)| dictionary.get_bytes(key_id) == target)
@@ -371,6 +372,12 @@ impl<'a> QuickwitArray<'a> {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len as usize
+    }
+
+    /// Returns the first element of the array, if non-empty.
+    #[inline]
+    pub fn first(mut self) -> Option<QuickwitValue<'a>> {
+        self.next_entry().map(|(_, value)| value)
     }
 
     #[inline]

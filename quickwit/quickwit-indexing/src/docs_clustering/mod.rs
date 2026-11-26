@@ -20,35 +20,41 @@
 //!
 //! Each entry in [`DocsClusteringConfig::group_by`] defines one grouping level from outermost to
 //! innermost:
-//! - [`ClusteringKey::Field`] groups by string values at a mapped schema or JSON path. Repeated
-//!   fields and arrays use their first value. Missing and non-string values share an ignored
-//!   bucket, which precedes string groups in ascending lexicographic order. Unmapped dynamic values
-//!   require explicit paths such as `_dynamic.service`.
-//! - [`ClusteringKey::Structure`] groups by a 64-bit hash of the document's unique mapped leaf
-//!   paths (values, scalar types, field order, and repetitions are ignored; arrays count as leaves;
-//!   empty objects contribute no leaves), ordered by ascending hash.
+//! - [`ClusteringKey::Field`] groups by string values at a dot-separated JSON path on
+//!   [`QuickwitDoc`]. Arrays use their first value. Missing and non-string values share an ignored
+//!   bucket, which precedes string groups in ascending lexicographic order.
+//! - [`ClusteringKey::Tokenized`] groups by the sequence of [`tokenizer::TokenType`] tags for the
+//!   first `max_tokens` tokens (default 50) of the string value at a dot-separated JSON path,
+//!   ordering values with identical token-type templates together and adjacent to shared prefixes.
+//!   Missing and non-string values share an ignored bucket before tokenized groups.
+//! - [`ClusteringKey::Structure`] groups by an order-independent 64-bit hash of the document's
+//!   unique JSON leaf paths (values, scalar types, and key order are ignored; arrays count as
+//!   leaves; empty objects contribute no leaves), ordered by ascending hash.
 //!
 //! Documents within each leaf group retain arrival order.
 
 #[cfg(test)]
 mod tests;
+mod tokenizer;
 
-use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 
-use anyhow::{Context, bail, ensure};
 use quickwit_config::{ClusteringKey, DocsClusteringConfig};
-use quickwit_doc_mapper::QuickwitDoc;
+use quickwit_doc_mapper::{
+    ByteDictionary, QuickwitDoc, QuickwitLeafValue, QuickwitObject, QuickwitValue,
+};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
-use tantivy::json_utils::split_json_path;
-use tantivy::schema::document::{ReferenceValue, ReferenceValueLeaf, Value};
-use tantivy::schema::{Document, Field, FieldType, Schema};
+
+const DEFAULT_MAX_GROUPING_TOKENS: usize = 50;
 
 enum Grouping {
     Field {
-        field: Field,
-        json_path: Vec<String>,
+        path: Vec<String>,
+    },
+    Tokenized {
+        path: Vec<String>,
+        max_tokens: usize,
     },
     Structure,
 }
@@ -56,40 +62,38 @@ enum Grouping {
 #[derive(Debug, Eq, PartialEq, Hash)]
 enum GroupKey<'a> {
     Ignored,
-    Str(Cow<'a, str>),
+    Str(&'a str),
+    Tokenized { text: &'a str, max_tokens: usize },
     Structure(u64),
 }
 
-impl<'a> GroupKey<'a> {
-    fn from_value<V: Value<'a>>(value: V, json_path: &[String]) -> Self {
-        match value.as_value() {
-            ReferenceValue::Array(mut values) => values
-                .next()
-                .map(|value| Self::from_value(value, json_path))
-                .unwrap_or(Self::Ignored),
-            ReferenceValue::Object(mut values) => {
-                let Some((segment, rest)) = json_path.split_first() else {
-                    return Self::Ignored;
-                };
-                values
-                    .find(|(key, _)| *key == segment)
-                    .map(|(_, value)| Self::from_value(value, rest))
-                    .unwrap_or(Self::Ignored)
-            }
-            ReferenceValue::Leaf(_) if !json_path.is_empty() => Self::Ignored,
-            ReferenceValue::Leaf(leaf) => match leaf {
-                ReferenceValueLeaf::Str(text) => Self::Str(Cow::Borrowed(text)),
-                ReferenceValueLeaf::PreTokStr(value) => Self::Str(Cow::Owned(value.text)),
-                _ => Self::Ignored,
-            },
+fn extract_str<'a>(
+    value: QuickwitValue<'a>,
+    path: &[String],
+    dict: &'a ByteDictionary,
+) -> Option<&'a str> {
+    match value {
+        QuickwitValue::Array(array) => array
+            .first()
+            .and_then(|value| extract_str(value, path, dict)),
+        QuickwitValue::Object(object) => {
+            let (segment, rest) = path.split_first()?;
+            object
+                .get(segment, dict)
+                .and_then(|value| extract_str(value, rest, dict))
         }
+        QuickwitValue::Leaf(_) if !path.is_empty() => None,
+        QuickwitValue::Leaf(QuickwitLeafValue::String(id)) => Some(dict.get_str(id)),
+        QuickwitValue::Leaf(_) => None,
     }
 }
 
 struct GroupNode<T> {
-    // Each level has one key kind: UTF-8 strings or big-endian structure hashes.
+    // Each level has one key kind: UTF-8 strings, token-type byte sequences, or big-endian
+    // structure hashes.
     children: FxHashMap<Vec<u8>, GroupNode<T>>,
-    // Keep ignored values separate so the empty string still has its own group.
+    // Keep ignored values separate so the empty string / empty token pattern still has its own
+    // group.
     ignored: Option<Box<GroupNode<T>>>,
     documents: Vec<T>,
 }
@@ -109,6 +113,7 @@ impl<T> GroupNode<T> {
     fn leaf<'a>(
         &mut self,
         mut group_keys: impl Iterator<Item = GroupKey<'a>>,
+        token_buf: &mut Vec<u8>,
         mem_usage: &mut usize,
     ) -> &mut Vec<T> {
         let Some(key) = group_keys.next() else {
@@ -117,6 +122,15 @@ impl<T> GroupNode<T> {
         let hash_bytes;
         let key_bytes = match &key {
             GroupKey::Str(text) => text.as_bytes(),
+            GroupKey::Tokenized { text, max_tokens } => {
+                token_buf.clear();
+                token_buf.extend(
+                    tokenizer::tokenize(text)
+                        .take(*max_tokens)
+                        .map(|span| span.token_type as u8),
+                );
+                token_buf.as_slice()
+            }
             GroupKey::Structure(hash) => {
                 hash_bytes = hash.to_be_bytes();
                 &hash_bytes
@@ -128,7 +142,7 @@ impl<T> GroupNode<T> {
                         *mem_usage += size_of::<Self>();
                         Box::default()
                     })
-                    .leaf(group_keys, mem_usage);
+                    .leaf(group_keys, token_buf, mem_usage);
             }
         };
         if !self.children.contains_key(key_bytes) {
@@ -145,7 +159,7 @@ impl<T> GroupNode<T> {
         self.children
             .get_mut(key_bytes)
             .unwrap()
-            .leaf(group_keys, mem_usage)
+            .leaf(group_keys, token_buf, mem_usage)
     }
 
     fn collect_group_sizes(&self, sizes: &mut Vec<usize>) {
@@ -179,77 +193,81 @@ impl<T> GroupNode<T> {
     }
 }
 
-fn resolve_grouping(schema: &Schema, keys: &[ClusteringKey]) -> anyhow::Result<Vec<Grouping>> {
-    ensure!(!keys.is_empty(), "clustering requires at least one key");
+fn split_path(path: &str) -> Vec<String> {
+    path.split('.').map(str::to_string).collect()
+}
+
+fn build_grouping(keys: &[ClusteringKey]) -> Vec<Grouping> {
     keys.iter()
-        .map(|key| {
-            let ClusteringKey::Field(name) = key else {
-                return Ok(Grouping::Structure);
-            };
-            let (field, json_path) = schema
-                .find_field(name)
-                .with_context(|| format!("clustering field `{name}` not found in schema"))?;
-            if !json_path.is_empty()
-                && !matches!(
-                    schema.get_field_entry(field).field_type(),
-                    FieldType::JsonObject(_)
-                )
-            {
-                bail!("clustering path `{name}` is not inside a JSON field");
-            }
-            Ok(Grouping::Field {
-                field,
-                json_path: if json_path.is_empty() {
-                    Vec::new()
-                } else {
-                    split_json_path(json_path)
-                },
-            })
+        .map(|key| match key {
+            ClusteringKey::Field(path) => Grouping::Field {
+                path: split_path(path),
+            },
+            ClusteringKey::Tokenized { path, max_tokens } => Grouping::Tokenized {
+                path: split_path(path),
+                max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_GROUPING_TOKENS),
+            },
+            ClusteringKey::Structure => Grouping::Structure,
         })
         .collect()
 }
 
-fn structure_hash<D: Document>(document: &D) -> u64 {
-    fn collect<'a, V: Value<'a>>(value: V, path: FxHasher, leaves: &mut Vec<u64>) {
-        match value.as_value() {
-            ReferenceValue::Object(values) => {
-                for (key, value) in values {
-                    let mut child = path.clone();
-                    // Hash includes the component boundary, unlike concatenating path text.
-                    key.hash(&mut child);
-                    collect(value, child, leaves);
-                }
+#[inline]
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn structure_hash(doc: &QuickwitDoc) -> u64 {
+    fn hash_object(
+        object: QuickwitObject<'_>,
+        dict: &ByteDictionary,
+        path: FxHasher,
+        acc: &mut u64,
+    ) {
+        for (key, value) in object.iter(dict) {
+            let mut child = path.clone();
+            // `str::hash` writes a `0xff` terminator so nested path boundaries remain distinct.
+            key.hash(&mut child);
+            match value {
+                QuickwitValue::Object(nested) => hash_object(nested, dict, child, acc),
+                _ => *acc = acc.wrapping_add(mix64(child.finish())),
             }
-            _ => leaves.push(path.finish()),
         }
     }
 
-    let mut leaves = Vec::new();
-    for (field, value) in document.iter_fields_and_values() {
-        let mut path = FxHasher::default();
-        field.hash(&mut path);
-        collect(value, path, &mut leaves);
-    }
-    leaves.sort_unstable();
-    leaves.dedup();
-    let mut hash = FxHasher::default();
-    leaves.hash(&mut hash);
-    hash.finish()
+    let mut acc = 0u64;
+    hash_object(
+        doc.as_object(),
+        doc.dictionary(),
+        FxHasher::default(),
+        &mut acc,
+    );
+    acc
 }
 
-fn group_keys<'a, D: Document>(
+fn group_keys<'a>(
     grouping: &'a [Grouping],
-    document: &'a D,
+    doc: &'a QuickwitDoc,
 ) -> impl Iterator<Item = GroupKey<'a>> + 'a {
     let mut structure = None;
+    let root = QuickwitValue::Object(doc.as_object());
+    let dict = doc.dictionary();
     grouping.iter().map(move |key| match key {
-        Grouping::Field { field, json_path } => document
-            .iter_fields_and_values()
-            .find(|(candidate, _)| candidate == field)
-            .map(|(_, value)| GroupKey::from_value(value, json_path))
+        Grouping::Field { path } => extract_str(root, path, dict)
+            .map(GroupKey::Str)
+            .unwrap_or(GroupKey::Ignored),
+        Grouping::Tokenized { path, max_tokens } => extract_str(root, path, dict)
+            .map(|text| GroupKey::Tokenized {
+                text,
+                max_tokens: *max_tokens,
+            })
             .unwrap_or(GroupKey::Ignored),
         Grouping::Structure => {
-            GroupKey::Structure(*structure.get_or_insert_with(|| structure_hash(document)))
+            GroupKey::Structure(*structure.get_or_insert_with(|| structure_hash(doc)))
         }
     })
 }
@@ -258,24 +276,24 @@ fn group_keys<'a, D: Document>(
 pub struct DocClusterer {
     grouping: Vec<Grouping>,
     root: GroupNode<QuickwitDoc>,
+    token_buf: Vec<u8>,
     seen_batches: FxHashSet<usize>,
     mem_usage: usize,
 }
 
 impl DocClusterer {
-    /// Resolves and validates `config` against `schema`.
-    pub fn new(schema: &Schema, config: &DocsClusteringConfig) -> anyhow::Result<Self> {
+    /// Validates `config` and initializes a clusterer.
+    pub fn new(config: &DocsClusteringConfig) -> anyhow::Result<Self> {
         config.validate()?;
-        let grouping = resolve_grouping(schema, &config.group_by)
-            .context("invalid clustering schema paths (dynamic fields require `_dynamic.`)")?;
+        let grouping = build_grouping(&config.group_by);
         let mem_usage = size_of::<Self>()
             + grouping.capacity() * size_of::<Grouping>()
             + grouping
                 .iter()
                 .map(|key| match key {
-                    Grouping::Field { json_path, .. } => {
-                        json_path.capacity() * size_of::<String>()
-                            + json_path.iter().map(String::capacity).sum::<usize>()
+                    Grouping::Field { path } | Grouping::Tokenized { path, .. } => {
+                        path.capacity() * size_of::<String>()
+                            + path.iter().map(String::capacity).sum::<usize>()
                     }
                     Grouping::Structure => 0,
                 })
@@ -283,6 +301,7 @@ impl DocClusterer {
         Ok(Self {
             grouping,
             root: GroupNode::default(),
+            token_buf: Vec::new(),
             seen_batches: FxHashSet::default(),
             mem_usage,
         })
@@ -295,9 +314,11 @@ impl DocClusterer {
         if self.seen_batches.insert(batch_id) {
             self.mem_usage += batch_mem_usage;
         }
-        let leaf = self
-            .root
-            .leaf(group_keys(&self.grouping, &document), &mut self.mem_usage);
+        let leaf = self.root.leaf(
+            group_keys(&self.grouping, &document),
+            &mut self.token_buf,
+            &mut self.mem_usage,
+        );
         let capacity = leaf.capacity();
         leaf.push(document);
         self.mem_usage += (leaf.capacity() - capacity) * size_of::<QuickwitDoc>();
@@ -313,7 +334,7 @@ impl DocClusterer {
     /// Estimated retained memory across buffered documents, shared batch buffers, and grouping
     /// structures.
     pub fn mem_usage(&self) -> usize {
-        self.mem_usage
+        self.mem_usage + self.token_buf.capacity()
     }
 
     /// Consumes the clusterer and visits every document in cluster order.
