@@ -26,6 +26,9 @@ use super::{
 use crate::doc_mapper::Partition;
 use crate::{DocMapper, DocParsingError};
 
+// Release temporary parser scratch spikes after a batch containing an oversized document.
+const MAX_RETAINED_SCRATCH_CAPACITY: usize = 256 * 1024;
+
 // The input length stays outside the result so rejected documents count towards byte metrics.
 type MappedEntry<T> = (usize, Result<(T, Partition, QuickwitDoc), DocParsingError>);
 
@@ -82,7 +85,7 @@ impl QuickwitDocBatch {
             text.len(),
             |dictionary, out| {
                 let key = dictionary.intern_str("plain_text").map_err(Error::custom)?;
-                let val = dictionary.intern_str(text).map_err(Error::custom)?;
+                let val = dictionary.intern_value_str(text).map_err(Error::custom)?;
                 write_container(out, TAG_OBJECT, 1, |out| {
                     out.extend_from_slice(&key.to_le_bytes());
                     out.push(TAG_STRING);
@@ -131,34 +134,41 @@ impl QuickwitDocBatch {
 
     /// Maps all roots before freezing the dictionary so identical binary conversions across
     /// documents share an entry. `before_map` reads original fields (e.g. to fingerprint them).
-    pub fn map<T>(
-        mut self,
-        mapper: &DocMapper,
-        mut before_map: impl FnMut(&QuickwitDoc) -> T,
-    ) -> impl ExactSizeIterator<Item = MappedEntry<T>> {
+    /// Resets the batch while retaining scratch buffers for reuse across batches.
+    pub fn map<'a, T, F: FnMut(&QuickwitDoc) -> T>(
+        &mut self,
+        mapper: &'a DocMapper,
+        mut before_map: F,
+    ) -> impl ExactSizeIterator<Item = MappedEntry<T>> + use<'a, T, F> {
+        let mut data = std::mem::take(&mut self.data);
         let mut results = Vec::with_capacity(self.docs.len());
-        for (len, root_offset) in self.docs {
+        for (len, root_offset) in self.docs.drain(..) {
             let mut doc = QuickwitDoc {
                 root_offset,
-                data: self.data,
+                data,
                 bindings: FieldBindings::default(),
             };
             let meta = before_map(&doc);
             let partition = mapper.quickwit_partition(&doc);
-            let data = Arc::get_mut(&mut doc.data).expect("unique BatchData");
-            let checkpoint = data.dictionary.len();
-            let object = decode_root_object(&data.nodes, root_offset);
+            let data_mut = Arc::get_mut(&mut doc.data).expect("unique BatchData");
+            let checkpoint = data_mut.dictionary.len();
+            let object = decode_root_object(&data_mut.nodes, root_offset);
             let result = mapper
-                .map_tantivy_fields(object, root_offset, &mut data.dictionary, len as u64)
-                .inspect_err(|_| data.dictionary.truncate(checkpoint))
+                .map_tantivy_fields(object, root_offset, &mut data_mut.dictionary, len as u64)
+                .inspect_err(|_| data_mut.dictionary.truncate(checkpoint))
                 .map(|bindings| (meta, partition, root_offset, bindings));
-            self.data = doc.data;
+            data = doc.data;
             results.push((len, result));
         }
-        let data_mut = Arc::get_mut(&mut self.data).expect("unique BatchData");
+        let data_mut = Arc::get_mut(&mut data).expect("unique BatchData");
         data_mut.dictionary.freeze();
         data_mut.nodes.shrink_to_fit();
-        let data = self.data;
+        if self.scratch.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            self.scratch = Vec::new();
+            self.simd_buffers = Buffers::default();
+            self.tape = Tape(Vec::new());
+            self.key_scratch = Vec::new();
+        }
         results.into_iter().map(move |(len, result)| {
             (
                 len,
@@ -289,7 +299,7 @@ fn write_tape_value<'a>(
     match node {
         Node::String(text) => {
             *cursor += 1;
-            let id = dictionary.intern_str(text).map_err(Error::custom)?;
+            let id = dictionary.intern_value_str(text).map_err(Error::custom)?;
             out.push(TAG_STRING);
             out.extend_from_slice(&id.to_le_bytes());
             Ok(())

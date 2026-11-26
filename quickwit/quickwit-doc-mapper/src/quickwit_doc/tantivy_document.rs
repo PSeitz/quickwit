@@ -224,13 +224,23 @@ fn tantivy_leaf(leaf: QuickwitLeafValue, dictionary: &ByteDictionary) -> Referen
 }
 
 #[inline]
+fn is_rfc3339_candidate(bytes: &[u8]) -> bool {
+    bytes.len() >= 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[0].is_ascii_digit()
+}
+
+#[inline]
 fn json_leaf(leaf: ReferenceValueLeaf<'_>) -> ReferenceValueLeaf<'_> {
     match leaf {
         ReferenceValueLeaf::U64(number) => i64::try_from(number)
             .map(ReferenceValueLeaf::I64)
             .unwrap_or(leaf),
-        // Match Tantivy's RFC3339 candidate check and nanosecond range check.
-        ReferenceValueLeaf::Str(text) if matches!(text.as_bytes().first(), Some(b'0'..=b'9')) => {
+        // Match Tantivy's RFC3339 parsing and nanosecond range check.
+        ReferenceValueLeaf::Str(text) if is_rfc3339_candidate(text.as_bytes()) => {
             OffsetDateTime::parse(text, &Rfc3339)
                 .ok()
                 .and_then(|dt| tantivy::DateTime::try_from_utc(dt.to_offset(UtcOffset::UTC)))

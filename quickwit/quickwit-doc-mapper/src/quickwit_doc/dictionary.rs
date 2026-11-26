@@ -19,7 +19,11 @@ use std::ops::Range;
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 
-/// Stores the bytes for a batch. Field names, text, decoded binary data, and IP addresses
+/// String values longer than this are appended without hash-table deduplication.
+/// Object keys are always interned so duplicate-key resolution remains exact.
+const MAX_INTERNED_VALUE_LEN: usize = 256;
+
+/// Stores the bytes for a batch. Field names, short text, decoded binary data, and IP addresses
 /// share an ID when their bytes match.
 #[derive(Clone, Debug, Default)]
 pub struct ByteDictionary {
@@ -75,16 +79,19 @@ impl ByteDictionary {
         self.intern_entry(text.as_bytes(), true)
     }
 
+    pub(super) fn intern_value_str(&mut self, text: &str) -> Result<u32, &'static str> {
+        if text.len() <= MAX_INTERNED_VALUE_LEN {
+            self.intern_entry(text.as_bytes(), true)
+        } else {
+            self.append_entry(text.as_bytes(), true)
+        }
+    }
+
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> Result<u32, &'static str> {
         self.intern_entry(bytes, false)
     }
 
-    fn intern_entry(&mut self, bytes: &[u8], is_text: bool) -> Result<u32, &'static str> {
-        debug_assert_eq!(self.lookup.len(), self.len());
-        let hash = hash_bytes(bytes);
-        if let Some(&id) = self.lookup.find(hash, |id| self.get_bytes(*id) == bytes) {
-            return Ok(id);
-        }
+    fn append_entry(&mut self, bytes: &[u8], is_text: bool) -> Result<u32, &'static str> {
         // Wrapped offsets could make an unchecked string read point into binary data.
         if bytes.len() > u32::MAX as usize - self.bytes.len() {
             return Err("document batch dictionary exceeds 4 GiB");
@@ -95,6 +102,15 @@ impl ByteDictionary {
         if is_text && id as usize == self.text_prefix_len {
             self.text_prefix_len += 1;
         }
+        Ok(id)
+    }
+
+    fn intern_entry(&mut self, bytes: &[u8], is_text: bool) -> Result<u32, &'static str> {
+        let hash = hash_bytes(bytes);
+        if let Some(&id) = self.lookup.find(hash, |id| self.get_bytes(*id) == bytes) {
+            return Ok(id);
+        }
+        let id = self.append_entry(bytes, is_text)?;
         self.lookup.insert_unique(hash, id, |id| {
             hash_bytes(&self.bytes[byte_range(&self.end_offsets, *id)])
         });
@@ -105,10 +121,9 @@ impl ByteDictionary {
     pub(super) fn truncate(&mut self, len: usize) {
         for i in len..self.end_offsets.len() {
             let hash = hash_bytes(&self.bytes[byte_range(&self.end_offsets, i as u32)]);
-            self.lookup
-                .find_entry(hash, |id| *id == i as u32)
-                .expect("interned entry missing")
-                .remove();
+            if let Ok(entry) = self.lookup.find_entry(hash, |id| *id == i as u32) {
+                entry.remove();
+            }
         }
         self.end_offsets.truncate(len);
         self.text_prefix_len = self.text_prefix_len.min(len);

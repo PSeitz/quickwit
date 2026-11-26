@@ -143,6 +143,26 @@ fn batch_shares_entries_and_rolls_back_errors() -> anyhow::Result<()> {
     };
     assert_eq!(last.dictionary().get_bytes(text_id + 1), &[0xff]);
     assert_eq!(last.dictionary().get_bytes(text_id + 2), &[0xcc]);
+
+    // Reusing the batch starts fresh storage; long values bypass dedup while long keys deduplicate.
+    let long_key = "k".repeat(300);
+    let long_val = "v".repeat(300);
+    let bad_long = format!(r#"{{"bad":"{long_val}",}}"#);
+    assert!(batch.parse(bad_long.as_bytes()).is_err());
+    let dup_long_key = format!(r#"{{"{long_key}":"first","{long_key}":"{long_val}"}}"#);
+    batch.parse(dup_long_key.as_bytes())?;
+    let second_doc = batch.map(&mapper, |_| ()).next().unwrap().1?.2;
+    assert!(!std::ptr::eq(first.dictionary(), second_doc.dictionary()));
+    let entries: Vec<_> = second_doc
+        .as_object()
+        .iter(second_doc.dictionary())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, long_key);
+    assert!(matches!(
+        entries[0].1,
+        Leaf(QuickwitLeafValue::String(id)) if second_doc.dictionary().get_str(id) == long_val
+    ));
     Ok(())
 }
 
