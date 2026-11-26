@@ -15,21 +15,19 @@
 //! Validates and compresses queued batches, then drives local writes and upload handoff.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use futures::future::OptionFuture;
 use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_proto::ingest::{DocBatchV2, ParseFailure};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
-use ulid::Ulid;
 
 use super::{
     Admission, AppendRequest, AppendResponse, CompressedBatch, FileWriter, IngestError,
     PreparedRequest, ValidationMetrics, WriterRequest,
 };
 use crate::ingest_v2::{is_document_validation_enabled, validate_doc_batch_impl};
+use crate::ingesthree::handoff::FileHandoffs;
 use crate::ingesthree::{OpenFileLimit, Uploader};
 
 impl AppendRequest {
@@ -119,18 +117,15 @@ async fn write_until_stopped(
     // Local IO errors or panics can drop the ingester on a blocking thread. Keep
     // directory ownership until handoff is dropped too (locals drop in reverse order).
     let directory_lock = ingester.directory_lock.clone();
-    // Handoff completes after registration or remote discard. Then delete the local file.
-    let mut handoff = None;
-    let mut pending_delete: Option<(Ulid, Instant)> = None;
+    // Each handoff completes after registration or remote discard, independently
+    // of other files. Keep it tracked until its local copy is deleted.
+    let mut handoffs = FileHandoffs::default();
     loop {
         if drain_reply.is_some() && ingester.finished.is_empty() {
             break;
         }
-        if handoff.is_none()
-            && pending_delete.is_none()
-            && let (Some(uploader), Some(input)) = (&uploader, ingester.finished.first())
-        {
-            handoff = Some(uploader.start(input));
+        if let Some(uploader) = &uploader {
+            handoffs.schedule_uploads(uploader, &ingester.finished);
         }
         tokio::select! {
             // Cancellation and expiry take priority even when the request queue stays nonempty.
@@ -149,41 +144,33 @@ async fn write_until_stopped(
                 ingester = writer;
                 if let Err(error) = result {
                     receiver.close();
-                    drop(handoff);
+                    drop(handoffs);
                     tokio::task::spawn_blocking(move || drop(ingester)).await?;
                     return Err(error.context("failed to finish local files"));
                 }
             }
-            Some(result) = OptionFuture::from(handoff.as_mut()) => {
-                handoff = None;
-                match result {
-                    Ok(file_id) => pending_delete = Some((file_id, Instant::now())),
+            result = handoffs.next_delete() => {
+                let file_id = match result {
+                    Ok(file_id) => file_id,
                     Err(error) => {
                         receiver.close();
                         admission.lock().expect("admission mutex poisoned").close();
+                        drop(handoffs);
                         // Preserve accepted writes and release the directory on the blocking pool.
                         tokio::task::spawn_blocking(move || ingester.finish()).await??;
                         return Err(error);
                     }
-                }
-            }
-            Some(file_id) = async {
-                let (file_id, retry_at) = pending_delete?;
-                if retry_at > Instant::now() {
-                    tokio::time::sleep_until(retry_at).await;
-                }
-                Some(file_id)
-            } => {
+                };
                 let (writer, result) = tokio::task::spawn_blocking(move || {
                     let result = ingester.delete_finished_file(file_id);
                     (ingester, result)
                 }).await?;
                 ingester = writer;
                 match result {
-                    Ok(_) => pending_delete = None,
+                    Ok(_) => handoffs.deleted(file_id),
                     Err(error) => {
                         tracing::warn!(%file_id, ?error, "failed to delete finished ingesthree file; retrying");
-                        pending_delete = Some((file_id, Instant::now() + Duration::from_secs(1)));
+                        handoffs.retry_delete(file_id);
                     }
                 }
             }
@@ -192,7 +179,7 @@ async fn write_until_stopped(
                     ingester = append_batch(ingester, append).await?;
                 }
                 Some(WriterRequest::Finish(reply)) => {
-                    drop(handoff);
+                    drop(handoffs);
                     let result = tokio::task::spawn_blocking(move || ingester.finish()).await?;
                     drop(directory_lock);
                     let _ = reply.send(result.map_err(IngestError::Internal));
@@ -207,7 +194,7 @@ async fn write_until_stopped(
                     }).await?;
                     ingester = writer;
                     if let Err(error) = result {
-                        drop(handoff);
+                        drop(handoffs);
                         tokio::task::spawn_blocking(move || drop(ingester)).await?;
                         return Err(error.context("failed to finish local files"));
                     }
@@ -220,7 +207,7 @@ async fn write_until_stopped(
             },
         }
     }
-    drop(handoff);
+    drop(handoffs);
     tokio::task::spawn_blocking(move || ingester.finish()).await??;
     Ok(())
 }

@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use ulid::Ulid;
 
 use super::documents_staged_for_upload::{FRAME_OVERHEAD, MAGIC, encode_metadata};
+use super::handoff::FileHandoffs;
 use super::{CompressedBatch, DocumentsStagedForUpload, Ingester, Uploader};
 
 #[path = "capacity_tracker.rs"]
@@ -211,24 +212,25 @@ impl WriteQueue {
         .await
         .map_err(anyhow::Error::from)??;
         if let Some(uploader) = &uploader {
-            while let Some(input) = ingester.finished_files().first() {
-                let file_id = uploader.start(input).await?;
-                // Once registered or discarded, retry only local deletion. Recovered
-                // files remain charged throughout startup handoff and deletion retries.
-                loop {
-                    let (writer, result) = tokio::task::spawn_blocking(move || {
-                        let result = ingester.delete_finished_file(file_id);
-                        (ingester, result)
-                    })
-                    .await
-                    .map_err(anyhow::Error::from)?;
-                    ingester = writer;
-                    match result {
-                        Ok(_) => break,
-                        Err(error) => {
-                            tracing::warn!(%file_id, ?error, "failed to delete finished ingesthree file; retrying");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+            // Keep ownership until every handoff is dropped, including when local
+            // deletion fails or startup is cancelled during blocking filesystem work.
+            let _directory_lock = ingester.directory_lock.clone();
+            let mut handoffs = FileHandoffs::default();
+            handoffs.schedule_uploads(uploader, ingester.finished_files());
+            while !ingester.finished_files().is_empty() {
+                let file_id = handoffs.next_delete().await?;
+                let (writer, result) = tokio::task::spawn_blocking(move || {
+                    let result = ingester.delete_finished_file(file_id);
+                    (ingester, result)
+                })
+                .await
+                .map_err(anyhow::Error::from)?;
+                ingester = writer;
+                match result {
+                    Ok(_) => handoffs.deleted(file_id),
+                    Err(error) => {
+                        tracing::warn!(%file_id, ?error, "failed to delete finished ingesthree file; retrying");
+                        handoffs.retry_delete(file_id);
                     }
                 }
             }

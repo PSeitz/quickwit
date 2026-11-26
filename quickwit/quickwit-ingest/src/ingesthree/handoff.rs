@@ -12,26 +12,88 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
 use quickwit_common::retry::Retryable;
 use quickwit_proto::metastore::{
     EntityKind, MetastoreError, MetastoreService, MetastoreServiceClient, RegisterFileForIndexing,
 };
 use quickwit_storage::{FilePayload, Storage, StorageErrorKind};
+use tokio::time::Instant;
 use ulid::Ulid;
 
 use super::DocumentsStagedForUpload;
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Tracks uploads, registration, and local deletion of finished files.
+/// Each file retries independently.
+#[derive(Default)]
+pub(super) struct FileHandoffs {
+    // IDs of files scheduled for upload, retained until local deletion.
+    scheduled_file_ids: HashSet<Ulid>,
+    uploads: FuturesUnordered<BoxFuture<'static, anyhow::Result<Ulid>>>,
+    pending_delete: BTreeSet<(Instant, Ulid)>,
+}
+
+impl FileHandoffs {
+    /// Schedules uploads for finished files. Repeated scans schedule each file once
+    /// while its ID is tracked. `next_delete` polls the uploads and registration.
+    pub fn schedule_uploads(
+        &mut self,
+        uploader: &Uploader,
+        finished_files: &[DocumentsStagedForUpload],
+    ) {
+        for file in finished_files {
+            if self.scheduled_file_ids.insert(file.file_id) {
+                self.uploads.push(uploader.start(file));
+            }
+        }
+    }
+
+    /// Polls uploads and registration before yielding a file ID for local deletion.
+    /// Upload futures and deletion deadlines remain in `self` when the writer's
+    /// select loop cancels this call.
+    pub async fn next_delete(&mut self) -> anyhow::Result<Ulid> {
+        loop {
+            let deadline = self.pending_delete.first().map(|(deadline, _)| *deadline);
+            tokio::select! {
+                biased;
+                Some(result) = self.uploads.next(), if !self.uploads.is_empty() => {
+                    self.pending_delete.insert((Instant::now(), result?));
+                }
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let (_, file_id) = self.pending_delete.pop_first().expect("deletion is pending");
+                    return Ok(file_id);
+                }
+            }
+        }
+    }
+
+    pub fn deleted(&mut self, file_id: Ulid) {
+        assert!(self.scheduled_file_ids.remove(&file_id));
+    }
+
+    pub fn retry_delete(&mut self, file_id: Ulid) {
+        self.pending_delete
+            .insert((Instant::now() + RETRY_DELAY, file_id));
+    }
+}
+
 /// Uploads finished files and registers them for indexing.
 ///
-/// The storage must be resolved at the complete upload prefix. Keep this destination
+/// The storage must be resolved at the upload prefix. Keep this destination
 /// unchanged across restarts while local files remain: recovery retains file IDs,
 /// but the local format does not store their remote URIs.
 pub struct Uploader {

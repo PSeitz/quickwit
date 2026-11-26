@@ -30,6 +30,9 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use super::*;
 
+#[path = "handoff_concurrency_tests.rs"]
+mod concurrency_tests;
+
 const BUDGET: u64 = 1024 * 1024;
 const DOCUMENT: &str = "opaque\0document\n";
 
@@ -404,7 +407,7 @@ async fn test_startup_finishes_recovered_handoff_before_intake_or_retains_files_
             .iter()
             .map(|file| fs::read(&file.path).unwrap())
             .collect();
-        let (storage, mut uploads) = capture_uploads(vec![Ok(()); if cancel { 1 } else { 2 }]);
+        let (storage, mut uploads) = capture_uploads(vec![Ok(()); 2]);
         let mut mock = MockMetastoreService::new();
         mock.expect_register_file_for_indexing()
             .times(if cancel { 0 } else { 2 })
@@ -414,12 +417,25 @@ async fn test_startup_finishes_recovered_handoff_before_intake_or_retains_files_
             dir.path(),
             Some(Uploader::new(storage, metastore)),
         ));
-        complete(async {
-            tokio::select! {
-                result = &mut opening => panic!("startup passed stalled registration: {:?}", result.err()),
-                upload = uploads.recv() => assert_eq!(upload.unwrap(), (PathBuf::from(recovered[0].file_id.to_string()), expected[0].clone())),
-            }
-        }).await;
+        // Every recovered file uploads while registration is stalled. Intake still
+        // waits for every registration and local deletion, and cancellation retains all files.
+        let mut remaining: HashSet<_> = recovered.iter().map(|file| file.file_id).collect();
+        for _ in 0..recovered.len() {
+            let (key, bytes) = complete(async {
+                tokio::select! {
+                    result = &mut opening => panic!("startup passed stalled registration: {:?}", result.err()),
+                    upload = uploads.recv() => upload.unwrap(),
+                }
+            }).await;
+            let file_id: Ulid = key.to_str().unwrap().parse().unwrap();
+            assert!(remaining.remove(&file_id));
+            let position = recovered
+                .iter()
+                .position(|file| file.file_id == file_id)
+                .unwrap();
+            assert_eq!(bytes, expected[position]);
+        }
+        assert!(remaining.is_empty());
         assert!(poll!(&mut opening).is_pending());
         assert!(uploads.try_recv().is_err());
         assert!(recovered.iter().all(|file| file.path.is_file()));
@@ -438,13 +454,7 @@ async fn test_startup_finishes_recovered_handoff_before_intake_or_retains_files_
         }
         permits.add_permits(1);
         let queue = complete(opening).await.unwrap();
-        assert_eq!(
-            uploads.try_recv().unwrap(),
-            (
-                PathBuf::from(recovered[1].file_id.to_string()),
-                expected[1].clone()
-            )
-        );
+        assert!(uploads.try_recv().is_err());
         assert_eq!(retained_bytes(&queue), 0);
         assert!(
             recovered
@@ -551,6 +561,10 @@ async fn test_drain_closes_clones_and_finishes_queued_and_active_files() {
     assert_eq!(complete(append).await.unwrap().file_id, Some(active_id));
     assert!(poll!(&mut drain).is_pending());
     assert!(file.path.is_file());
+    assert_eq!(
+        complete(uploads.recv()).await.unwrap(),
+        (PathBuf::from(active_id.to_string()), expected)
+    );
     permits.add_permits(1);
     complete(drain).await.unwrap();
     // Acknowledging drain must release ownership before the caller's next await.
@@ -561,10 +575,7 @@ async fn test_drain_closes_clones_and_finishes_queued_and_active_files() {
             .is_empty()
     );
     worker.await.unwrap().unwrap();
-    assert_eq!(
-        uploads.try_recv().unwrap(),
-        (PathBuf::from(active_id.to_string()), expected)
-    );
+    assert!(uploads.try_recv().is_err());
     assert_eq!(retained_bytes(&queue), 0);
 }
 
