@@ -35,9 +35,9 @@ pulsar = { workspace = true, optional = true }
 quickwit-query = { workspace = true }
 regex = { workspace = true }
 rdkafka = { workspace = true, optional = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-smallvec = { workspace = true }
 tantivy = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -117,7 +117,6 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres"] }
 tempfile = { workspace = true }
-unicode-segmentation = { workspace = true }
 
 quickwit-actors = { workspace = true, features = ["testsuite"] }
 quickwit-cluster = { workspace = true, features = ["testsuite"] }

@@ -30,7 +30,7 @@ use quickwit_common::io::{IoControls, Limiter};
 use quickwit_common::metrics::IN_FLIGHT_INDEX_WRITER;
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_config::IndexingSettings;
+use quickwit_config::{DocsClusteringConfig, IndexingSettings};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::checkpoint::{IndexCheckpointDelta, SourceCheckpointDelta};
 use quickwit_metrics::GaugeGuard;
@@ -44,7 +44,7 @@ use serde::Serialize;
 use tantivy::schema::Schema;
 use tantivy::store::{Compressor, ZstdCompressor};
 use tantivy::tokenizer::TokenizerManager;
-use tantivy::{DateTime, DocId, IndexBuilder, IndexSettings};
+use tantivy::{DateTime, IndexBuilder, IndexSettings};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{Span, debug, info_span, warn};
@@ -52,7 +52,7 @@ use ulid::Ulid;
 
 use super::IndexSerializer;
 use super::cooperative_indexing::{CooperativeIndexingCycle, CooperativeIndexingPeriod};
-use crate::docs_clustering::{DocIdClusterer, Fingerprinter};
+use crate::docs_clustering::DocClusterer;
 use crate::metrics::SPLIT_BUILDERS;
 use crate::models::{
     CommitTrigger, EmptySplit, IndexedSplitBatchBuilder, IndexedSplitBuilder, NewPublishLock,
@@ -93,7 +93,7 @@ struct IndexerState {
     metastore: MetastoreServiceClient,
     indexing_directory: TempDirectory,
     indexing_settings: IndexingSettings,
-    fingerprinter_opt: Option<Fingerprinter>,
+    clustering_config: Option<DocsClusteringConfig>,
     publish_lock: PublishLock,
     schema: Schema,
     doc_mapping_uid: DocMappingUid,
@@ -126,11 +126,11 @@ impl IndexerState {
             .set_progress(ctx.progress().clone())
             .set_kill_switch(ctx.kill_switch().clone())
             .set_component("indexer");
-        let doc_id_clusterer_opt = if self.fingerprinter_opt.is_some() {
-            Some(DocIdClusterer::default())
-        } else {
-            None
-        };
+        let doc_clusterer_opt = self
+            .clustering_config
+            .as_ref()
+            .map(|config| DocClusterer::new(&self.schema, config))
+            .transpose()?;
 
         let indexed_split = IndexedSplitBuilder::new_in_dir(
             self.pipeline_id.clone(),
@@ -140,7 +140,7 @@ impl IndexerState {
             self.indexing_directory.clone(),
             index_builder,
             io_controls,
-            doc_id_clusterer_opt,
+            doc_clusterer_opt,
         )?;
         debug!(
             split_id=%indexed_split.split_id(),
@@ -305,7 +305,6 @@ impl IndexerState {
         for doc in batch.docs {
             let ProcessedDoc {
                 doc,
-                fingerprint_opt,
                 timestamp_opt,
                 partition,
                 num_bytes,
@@ -326,18 +325,12 @@ impl IndexerState {
                 memory_usage_delta += mem_usage_before as i64;
             }
             indexed_split.split_attrs.uncompressed_docs_size_in_bytes += num_bytes as u64;
-            // Tantivy doc IDs are local to the split and continue across processed-doc batches.
-            let split_doc_id = indexed_split.split_attrs.num_docs as DocId;
             indexed_split.split_attrs.num_docs += 1;
-            if let Some(doc_id_clusterer) = indexed_split.doc_id_clusterer_opt.as_mut() {
-                doc_id_clusterer.push(fingerprint_opt, split_doc_id);
-            }
             if let Some(timestamp) = timestamp_opt {
                 record_timestamp(timestamp, &mut indexed_split.split_attrs.time_range);
             }
             let _protect_guard = ctx.protect_zone();
             indexed_split
-                .index_writer
                 .add_document(doc)
                 .context("failed to add document")?;
             let mem_usage_after = indexed_split.mem_usage() as u64;
@@ -535,7 +528,7 @@ impl Indexer {
         indexing_settings: IndexingSettings,
         cooperative_indexing_permits_opt: Option<Arc<Semaphore>>,
         index_serializer_mailbox: Mailbox<IndexSerializer>,
-        fingerprinter_opt: Option<Fingerprinter>,
+        clustering_config: Option<DocsClusteringConfig>,
         indexing_io_throughput_limiter_opt: Option<Limiter>,
     ) -> Self {
         let schema = doc_mapper.schema();
@@ -548,8 +541,7 @@ impl Indexer {
             docstore_blocksize: indexing_settings.docstore_blocksize,
             docstore_compression,
             docstore_compress_dedicated_thread: true,
-            // A configured fingerprinter supplies the mapping when the split is finalized.
-            manual_doc_id_mapping: fingerprinter_opt.is_some(),
+            manual_doc_id_mapping: false,
         };
         let cooperative_indexing_opt: Option<CooperativeIndexingCycle> =
             cooperative_indexing_permits_opt.map(|cooperative_indexing_permits| {
@@ -565,7 +557,7 @@ impl Indexer {
                 metastore: metastore.clone(),
                 indexing_directory,
                 indexing_settings,
-                fingerprinter_opt,
+                clustering_config,
                 publish_lock: PublishLock::default(),
                 schema,
                 doc_mapping_uid: doc_mapper.doc_mapping_uid(),
@@ -704,7 +696,7 @@ mod tests {
     use std::time::Duration;
 
     use quickwit_actors::Universe;
-    use quickwit_config::DocsClusteringConfig;
+    use quickwit_config::{ClusteringKey, DocsClusteringConfig};
     use quickwit_doc_mapper::{
         DocMapper, QuickwitDoc, QuickwitDocBatch, default_doc_mapper_for_test,
     };
@@ -718,13 +710,12 @@ mod tests {
     use tantivy::{DateTime, DocAddress, TantivyDocument};
 
     use super::{IndexerCounters, record_timestamp, *};
-    use crate::docs_clustering::Fingerprint;
 
     fn map_test_docs(mapper: Arc<DocMapper>) -> impl Fn(serde_json::Value) -> QuickwitDoc {
         move |json| {
             let mut batch = QuickwitDocBatch::default();
             batch.push_serialize(&json, 0).unwrap();
-            batch.map(&mapper, |_| ()).next().unwrap().1.unwrap().2
+            batch.map(&mapper).next().unwrap().1.unwrap().1
         }
     }
 
@@ -737,7 +728,7 @@ mod tests {
         indexing_settings: IndexingSettings,
         cooperative_indexing_permits_opt: Option<Arc<Semaphore>>,
         index_serializer_mailbox: Mailbox<IndexSerializer>,
-        fingerprinter_opt: Option<Fingerprinter>,
+        clustering_config: Option<DocsClusteringConfig>,
     ) -> Indexer {
         Indexer::new(
             pipeline_id,
@@ -747,7 +738,7 @@ mod tests {
             indexing_settings,
             cooperative_indexing_permits_opt,
             index_serializer_mailbox,
-            fingerprinter_opt,
+            clustering_config,
             None,
         )
     }
@@ -824,14 +815,12 @@ mod tests {
                 vec![
                     ProcessedDoc {
                         doc: doc(json!({"body": "this is a test document", "timestamp": 1_662_529_435})),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
                     },
                     ProcessedDoc {
                         doc: doc(json!({"body": "this is a test document 2", "timestamp": 1_662_529_435})),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
@@ -846,14 +835,12 @@ mod tests {
                 vec![
                     ProcessedDoc {
                         doc: doc(json!({"body": "this is a test document 3", "timestamp": 1_662_529_435})),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435i64)),
                         partition: 1,
                         num_bytes: 30,
                     },
                     ProcessedDoc {
                         doc: doc(json!({"body": "this is a test document 4", "timestamp": 1_662_529_435})),
-                        fingerprint_opt: None,
                         timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                         partition: 1,
                         num_bytes: 30,
@@ -869,7 +856,6 @@ mod tests {
                     doc: doc(
                         json!({"body": "this is a test document 5", "timestamp": 1_662_529_435}),
                     ),
-                    fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                     partition: 1,
                     num_bytes: 30,
@@ -955,7 +941,6 @@ mod tests {
             let num_bytes = body.len() * 2;
             ProcessedDoc {
                 doc: doc(json!({"body": body})),
-                fingerprint_opt: None,
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes,
@@ -1030,7 +1015,6 @@ mod tests {
                     .send_message(ProcessedDocBatch::new(
                         vec![ProcessedDoc {
                             doc: doc(json!({"body": "this is a test document", "timestamp": 1_662_529_435})),
-                            fingerprint_opt: None,
                             timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                             partition: 1,
                             num_bytes: 30,
@@ -1107,7 +1091,6 @@ mod tests {
                     doc: doc(
                         json!({"body": "this is a test document 5", "timestamp": 1_662_529_435}),
                     ),
-                    fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                     partition: 1,
                     num_bytes: 30,
@@ -1193,7 +1176,6 @@ mod tests {
                     doc: doc(
                         json!({"body": "this is a test document 5", "timestamp": 1_662_529_435}),
                     ),
-                    fingerprint_opt: None,
                     timestamp_opt: Some(DateTime::from_timestamp_secs(1_662_529_435)),
                     partition: 1,
                     num_bytes: 30,
@@ -1226,7 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_indexer_collects_fingerprints_when_clustering_is_enabled() -> anyhow::Result<()> {
+    async fn test_indexer_clusters_mapped_documents() -> anyhow::Result<()> {
         let universe = Universe::with_accelerated_time();
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
@@ -1237,6 +1219,7 @@ mod tests {
         let doc_mapper = Arc::new(default_doc_mapper_for_test());
         let doc = map_test_docs(doc_mapper.clone());
         let body_field = doc_mapper.schema().get_field("body").unwrap();
+        let timestamp_field = doc_mapper.schema().get_field("timestamp").unwrap();
         let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
         let mut mock_metastore = MockMetastoreService::new();
         mock_metastore.expect_publish_splits().never();
@@ -1252,62 +1235,38 @@ mod tests {
             IndexingSettings::for_test(),
             None,
             index_serializer_mailbox,
-            Some(Fingerprinter::new(
-                &serde_json::from_value::<DocsClusteringConfig>(serde_json::json!([
-                    {
-                        "fingerprint": [{
-                            "kind": "structure"
-                        }]
-                    },
-                    {
-                        "fingerprint": [{
-                            "path": "body",
-                            "kind": "raw"
-                        }]
-                    },
-                    {
-                        "fingerprint": [{
-                            "path": "body",
-                            "kind": "tokenized"
-                        }]
-                    }
-                ]))
-                .unwrap(),
-            )),
+            Some(DocsClusteringConfig {
+                group_by: vec![ClusteringKey::Field("body".into())],
+            }),
         );
         let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
         let docs = vec![
             ProcessedDoc {
-                doc: doc(json!({"body": "first"})),
-                fingerprint_opt: Some(Fingerprint::new([1, 1, 1])),
-                timestamp_opt: None,
-                partition: 0,
-                num_bytes: 5,
-            },
-            ProcessedDoc {
-                doc: doc(json!({"body": "second"})),
-                fingerprint_opt: Some(Fingerprint::new([1, 2, 1])),
+                doc: doc(json!({"body": "second", "timestamp": 1_700_000_001})),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 6,
             },
             ProcessedDoc {
-                doc: doc(json!({"body": "third"})),
-                fingerprint_opt: Some(Fingerprint::new([1, 2, 1])),
+                doc: doc(json!({"body": "first", "timestamp": 1_700_000_002})),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
             },
             ProcessedDoc {
-                doc: doc(json!({"body": "fourth"})),
-                fingerprint_opt: Some(Fingerprint::new([1, 1, 1])),
+                doc: doc(json!({"body": "second", "timestamp": 1_700_000_003})),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 6,
             },
             ProcessedDoc {
-                doc: doc(json!({"body": "fifth"})),
-                fingerprint_opt: Some(Fingerprint::new([1, 1, 2])),
+                doc: doc(json!({"body": "first", "timestamp": 1_700_000_004})),
+                timestamp_opt: None,
+                partition: 0,
+                num_bytes: 5,
+            },
+            ProcessedDoc {
+                doc: doc(json!({"body": "first", "timestamp": 1_700_000_005})),
                 timestamp_opt: None,
                 partition: 0,
                 num_bytes: 5,
@@ -1333,6 +1292,7 @@ mod tests {
         let reader = indexed_split.index.reader()?;
         let searcher = reader.searcher();
         let mut bodies = Vec::new();
+        let mut timestamps = Vec::new();
         for doc_id in 0..5 {
             let doc: TantivyDocument = searcher.doc(DocAddress::new(0, doc_id))?;
             let body = doc
@@ -1340,8 +1300,25 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .unwrap();
             bodies.push(body.to_string());
+            timestamps.push(
+                doc.get_first(timestamp_field)
+                    .unwrap()
+                    .as_datetime()
+                    .unwrap()
+                    .into_timestamp_secs(),
+            );
         }
-        assert_eq!(bodies, ["first", "fourth", "fifth", "second", "third"]);
+        assert_eq!(bodies, ["first", "first", "first", "second", "second"]);
+        assert_eq!(
+            timestamps,
+            [
+                1_700_000_002,
+                1_700_000_004,
+                1_700_000_005,
+                1_700_000_001,
+                1_700_000_003
+            ]
+        );
         universe.assert_quit().await;
         Ok(())
     }
@@ -1395,14 +1372,12 @@ mod tests {
                 vec![
                     ProcessedDoc {
                         doc: doc(json!({"body": "doc 2", "tenant": "tenant_1"})),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 1,
                         num_bytes: 30,
                     },
                     ProcessedDoc {
                         doc: doc(json!({"body": "doc 2", "tenant": "tenant_2"})),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 3,
                         num_bytes: 30,
@@ -1489,7 +1464,6 @@ mod tests {
                 .send_message(ProcessedDocBatch::new(
                     vec![ProcessedDoc {
                         doc: doc(json!({"body": "doc {i}"})),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition,
                         num_bytes: 30,
@@ -1569,7 +1543,6 @@ mod tests {
                 .send_message(ProcessedDocBatch::new(
                     vec![ProcessedDoc {
                         doc: doc(json!({"body": "doc 1"})),
-                        fingerprint_opt: None,
                         timestamp_opt: None,
                         partition: 0,
                         num_bytes: 30,
@@ -1642,7 +1615,6 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
                     doc: doc(json!({"body": "doc 1"})),
-                    fingerprint_opt: None,
                     timestamp_opt: None,
                     partition: 0,
                     num_bytes: 30,
@@ -1700,7 +1672,6 @@ mod tests {
             .send_message(ProcessedDocBatch::new(
                 vec![ProcessedDoc {
                     doc: doc(json!({"body": "doc 1"})),
-                    fingerprint_opt: None,
                     timestamp_opt: None,
                     partition: 0,
                     num_bytes: 30,

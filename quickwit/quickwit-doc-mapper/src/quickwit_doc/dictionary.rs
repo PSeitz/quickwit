@@ -136,4 +136,8 @@ impl ByteDictionary {
         self.bytes.shrink_to_fit();
         self.end_offsets.shrink_to_fit();
     }
+
+    pub(crate) fn mem_usage(&self) -> usize {
+        self.bytes.capacity() + self.end_offsets.capacity() * std::mem::size_of::<u32>()
+    }
 }

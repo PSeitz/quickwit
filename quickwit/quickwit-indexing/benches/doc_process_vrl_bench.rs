@@ -129,7 +129,6 @@ fn create_doc_processor(
         indexer_mailbox,
         transform_config_opt,
         SourceInputFormat::Json,
-        None,
     )
     .unwrap();
     let (mailbox, handle) = universe.spawn_builder().spawn(doc_processor);

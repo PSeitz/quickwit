@@ -20,12 +20,9 @@ use quickwit_metastore::checkpoint::SourceCheckpointDelta;
 use quickwit_metrics::GaugeGuard;
 use tantivy::DateTime;
 
-use crate::docs_clustering::Fingerprint;
-
 pub struct ProcessedDoc {
     pub doc: QuickwitDoc,
     pub timestamp_opt: Option<DateTime>,
-    pub fingerprint_opt: Option<Fingerprint>,
     pub partition: u64,
     pub num_bytes: usize,
 }
@@ -34,7 +31,6 @@ impl fmt::Debug for ProcessedDoc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProcessedDoc")
             .field("timestamp_opt", &self.timestamp_opt)
-            .field("fingerprint_opt", &self.fingerprint_opt)
             .field("partition", &self.partition)
             .field("num_bytes", &self.num_bytes)
             .finish()

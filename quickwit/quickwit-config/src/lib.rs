@@ -41,9 +41,7 @@ mod storage_config;
 mod templating;
 
 pub use cluster_config::ClusterConfig;
-pub use docs_clustering::{
-    ClusteringMethod, ClusteringPolicy, DocsClusteringConfig, FingerprintPolicy, JsonPath,
-};
+pub use docs_clustering::{ClusteringKey, DocsClusteringConfig};
 // We export that one for backward compatibility.
 // See #2048
 use index_config::serialize::{IndexConfigV0_8, VersionedIndexConfig};

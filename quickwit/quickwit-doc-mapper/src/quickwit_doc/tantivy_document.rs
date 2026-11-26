@@ -92,6 +92,11 @@ impl FieldBindings {
             self.values.push((field, Binding::Dynamic));
         }
     }
+
+    pub(crate) fn mem_usage(&self) -> usize {
+        self.values.capacity() * std::mem::size_of::<(Field, Binding)>()
+            + self.dynamic.capacity() * std::mem::size_of::<DynamicEntry>()
+    }
 }
 
 /// Yields Tantivy field IDs and their mapped views of the document.

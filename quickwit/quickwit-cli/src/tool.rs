@@ -37,7 +37,6 @@ use quickwit_config::{
 };
 use quickwit_index_management::{IndexService, clear_cache_directory};
 use quickwit_indexing::actors::{IndexingService, MergePipeline, MergeSchedulerService};
-use quickwit_indexing::docs_clustering::Fingerprinter;
 use quickwit_indexing::models::{
     DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnPipeline,
 };
@@ -452,10 +451,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
     let merge_scheduler_service_mailbox = universe.get_or_spawn_one();
     let split_cache =
         Arc::new(IndexingSplitCache::from_config(&indexer_config, &config.data_dir_path).await?);
-    let fingerprinter_opt = config
-        .docs_clustering_config
-        .as_ref()
-        .map(Fingerprinter::new);
+    let clustering_config = config.docs_clustering_config.clone();
     let indexing_server = IndexingService::new(
         config.node_id.clone(),
         config.data_dir_path.clone(),
@@ -469,7 +465,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         storage_resolver,
         EventBroker::default(),
         split_cache,
-        fingerprinter_opt,
+        clustering_config,
     )
     .await?;
     let (indexing_server_mailbox, indexing_server_handle) =
@@ -597,10 +593,7 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
     let indexer_config = IndexerConfig::default();
     let universe = Universe::new();
     let merge_scheduler_service: Mailbox<MergeSchedulerService> = universe.get_or_spawn_one();
-    let fingerprinter_opt = config
-        .docs_clustering_config
-        .as_ref()
-        .map(Fingerprinter::new);
+    let clustering_config = config.docs_clustering_config.clone();
     let indexing_server = IndexingService::new(
         config.node_id,
         config.data_dir_path,
@@ -614,7 +607,7 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
         storage_resolver,
         EventBroker::default(),
         Arc::new(IndexingSplitCache::no_caching()),
-        fingerprinter_opt,
+        clustering_config,
     )
     .await?;
     let (indexing_service_mailbox, indexing_service_handle) =

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::ops::Deref;
 
 use anyhow::ensure;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -21,50 +20,106 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::config_value::ConfigValue;
 use crate::qw_env_vars::QW_DISABLE_DOCS_CLUSTERING;
 
-const JSON_PATH_SEPARATOR: &str = ".";
-
-/// Configuration for document clustering.
+/// Experimental document clustering for fresh splits.
 ///
-/// Document clustering groups documents by structure and field values, then orders those groups by
-/// descending size. It applies only when publishing fresh splits, not during split merge
-/// operations.
-///
-/// See the docs_clustering module in the quickwit-indexing crate for more details.
-///
-/// # Warning
-///
-/// Document clustering is experimental. Its configuration and behavior may change, and it should be
-/// validated on representative workloads before production use.
-///
-/// # Example
-///
-/// For example, documents with the same JSON structure are clustered together, then grouped by
-/// fields such as `service` or the token pattern of `message` within each structure group.
-///
-/// Example YAML:
-///
+/// YAML uses an ordered list of grouping levels, from outermost to innermost:
 /// ```yaml
-/// - fingerprint:
-///     - kind: structure
-///       exclude: [custom]
-/// - fingerprint:
-///     - kind: raw
-///       path: status
-///     - kind: raw
-///       path: service
-///     - kind: tokenized
-///       path: message
+/// - kind: raw
+///   path: service
+/// - kind: structure
+/// - kind: raw
+///   path: status
 /// ```
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(transparent)]
+/// Field levels group by string values at mapped schema or JSON paths (arrays and repeated fields
+/// use the first value; missing and non-string values share an ignored bucket before string
+/// groups). Structure levels group by a 64-bit hash of the document's unique mapped leaf paths.
+/// Tokenized clustering is unsupported.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    try_from = "DocsClusteringConfigBuilder",
+    into = "DocsClusteringConfigBuilder"
+)]
 pub struct DocsClusteringConfig {
-    pub policies: Vec<ClusteringPolicy>,
+    /// Ordered grouping keys, from outermost to innermost.
+    pub group_by: Vec<ClusteringKey>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+/// How to group documents at one level of clustering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusteringKey {
+    /// Group by a mapped schema field or JSON path (string values).
+    Field(String),
+    /// Group by a 64-bit hash of the document's unique mapped leaf paths.
+    Structure,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct DocsClusteringConfigBuilder {
-    policies: Vec<ClusteringPolicy>,
+    group_by: Vec<ClusteringKeyEntry>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ClusteringKeyEntry {
+    Raw { path: String },
+    Structure,
+}
+
+impl Serialize for ClusteringKeyEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged<'a> {
+            Raw { path: &'a str },
+            Structure,
+        }
+        match self {
+            Self::Raw { path } => Tagged::Raw { path }.serialize(serializer),
+            Self::Structure => Tagged::Structure.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClusteringKeyEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            kind: String,
+            path: Option<String>,
+            max_tokens: Option<usize>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        match wire.kind.as_str() {
+            "raw" => {
+                if wire.max_tokens.is_some() {
+                    return Err(serde::de::Error::unknown_field("max_tokens", &["path"]));
+                }
+                let path = wire
+                    .path
+                    .ok_or_else(|| serde::de::Error::missing_field("path"))?;
+                Ok(Self::Raw { path })
+            }
+            "structure" => {
+                if wire.path.is_some() {
+                    return Err(serde::de::Error::unknown_field("path", &["kind"]));
+                }
+                if wire.max_tokens.is_some() {
+                    return Err(serde::de::Error::unknown_field("max_tokens", &["kind"]));
+                }
+                Ok(Self::Structure)
+            }
+            "tokenized" => Err(serde::de::Error::custom(
+                "tokenized document clustering is unsupported",
+            )),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["raw", "structure"],
+            )),
+        }
+    }
 }
 
 impl DocsClusteringConfigBuilder {
@@ -78,164 +133,72 @@ impl DocsClusteringConfigBuilder {
         let Some(config_builder) = config_builder_opt else {
             return Ok(None);
         };
+        // Preserve the override's bypass of path validation for supported entries.
+        // Unsupported kinds and malformed entries already fail during deserialization.
+        if disable_override == Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(config_builder.try_into()?))
+    }
+}
 
-        match disable_override {
-            Some(true) => Ok(None),
-            Some(false) | None => {
-                let config = DocsClusteringConfig {
-                    policies: config_builder.policies,
-                };
-                config.validate()?;
-                Ok(Some(config))
-            }
+impl TryFrom<DocsClusteringConfigBuilder> for DocsClusteringConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(builder: DocsClusteringConfigBuilder) -> anyhow::Result<Self> {
+        let config = Self {
+            group_by: builder
+                .group_by
+                .into_iter()
+                .map(|entry| match entry {
+                    ClusteringKeyEntry::Raw { path } => ClusteringKey::Field(path),
+                    ClusteringKeyEntry::Structure => ClusteringKey::Structure,
+                })
+                .collect(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+impl From<DocsClusteringConfig> for DocsClusteringConfigBuilder {
+    fn from(config: DocsClusteringConfig) -> Self {
+        Self {
+            group_by: config
+                .group_by
+                .into_iter()
+                .map(|key| match key {
+                    ClusteringKey::Field(path) => ClusteringKeyEntry::Raw { path },
+                    ClusteringKey::Structure => ClusteringKeyEntry::Structure,
+                })
+                .collect(),
         }
     }
 }
 
 impl DocsClusteringConfig {
+    /// Validates the grouping keys and path syntax, including for programmatically constructed
+    /// configs. The indexer additionally checks whether field paths resolve in each index's mapped
+    /// schema.
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
-            !self.policies.is_empty(),
-            "document clustering policies must contain at least one policy"
+            !self.group_by.is_empty(),
+            "document clustering keys must contain at least one entry"
         );
-        for policy in &self.policies {
-            policy.validate()?;
-        }
-        Ok(())
-    }
-}
-
-/// Defines how documents are clustered.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, untagged)]
-pub enum ClusteringPolicy {
-    /// Clusters documents using structure and configured field fingerprints.
-    Fingerprint { fingerprint: FingerprintPolicy },
-}
-
-impl ClusteringPolicy {
-    fn validate(&self) -> anyhow::Result<()> {
-        match self {
-            Self::Fingerprint { fingerprint } => {
-                fingerprint.validate()?;
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct FingerprintPolicy {
-    pub fingerprint: Vec<ClusteringMethod>,
-}
-
-impl FingerprintPolicy {
-    fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            !self.fingerprint.is_empty(),
-            "document clustering fingerprint policy must contain at least one field"
-        );
-        for method in &self.fingerprint {
-            method.validate()?;
-        }
-        Ok(())
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct JsonPath(Box<[String]>);
-
-impl Serialize for JsonPath {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        serializer.serialize_str(&self.0.join(JSON_PATH_SEPARATOR))
-    }
-}
-
-impl<'de> Deserialize<'de> for JsonPath {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
-        let path = String::deserialize(deserializer)?;
-        let json_path: Box<[String]> = path
-            .split(JSON_PATH_SEPARATOR)
-            .map(ToString::to_string)
-            .collect();
-        Ok(Self(json_path))
-    }
-}
-
-impl JsonPath {
-    fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            !self.iter().any(|path_component| path_component.is_empty()),
-            "document clustering path `{:?}` must not contain empty components",
-            self
-        );
-        ensure!(
-            !self
-                .iter()
-                .any(|path_component| path_component.trim() != path_component),
-            "document clustering path `{:?}` must not contain leading or trailing whitespace",
-            self
-        );
-        Ok(())
-    }
-}
-
-impl Deref for JsonPath {
-    type Target = [String];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// A field used to partition documents.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ClusteringMethod {
-    /// Groups documents by JSON structure.
-    ///
-    /// For example, `{"message":"hello"}` and `{"body":"hello"}` belong to different groups
-    /// because their field paths differ.
-    Structure {
-        /// Paths omitted from the structure fingerprint.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude: Vec<JsonPath>,
-    },
-    /// Groups documents by the exact JSON value at `path`.
-    ///
-    /// For example, `{"service":"api"}` and `{"service":"worker"}` belong to different groups
-    /// when `path` is `service`.
-    Raw {
-        /// Dot-separated path to the JSON value.
-        path: JsonPath,
-    },
-    /// Groups documents by the pattern of the first `max_tokens` tokens in the string value at
-    /// `path`.
-    ///
-    /// For example, `{"message":"request 123"}` and `{"message":"request 456"}` belong to the same
-    /// group when `path` is `message`, because both values have the same token pattern.
-    Tokenized {
-        /// Dot-separated path to the string value.
-        path: JsonPath,
-        /// Maximum number of tokens to consider. Defaults to 50.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        max_tokens: Option<usize>,
-    },
-}
-
-impl ClusteringMethod {
-    fn validate(&self) -> anyhow::Result<()> {
-        match self {
-            Self::Structure { exclude } => {
-                for path in exclude {
-                    path.validate()?;
-                }
-            }
-            Self::Raw { path } | Self::Tokenized { path, .. } => path.validate()?,
+        for key in &self.group_by {
+            let ClusteringKey::Field(path) = key else {
+                continue;
+            };
+            ensure!(
+                !path.split('.').any(str::is_empty),
+                "document clustering path `{path}` must not contain empty components"
+            );
+            ensure!(
+                !path
+                    .split('.')
+                    .any(|component| component.trim() != component),
+                "document clustering path `{path}` must not contain leading or trailing whitespace"
+            );
         }
         Ok(())
     }
@@ -245,276 +208,179 @@ impl ClusteringMethod {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{DocsClusteringConfig, DocsClusteringConfigBuilder};
+    use super::{ClusteringKey, DocsClusteringConfig, DocsClusteringConfigBuilder};
 
-    fn build_config(yaml: &str) -> anyhow::Result<Option<DocsClusteringConfig>> {
-        build_config_with_env(yaml, &HashMap::new())
-    }
+    const SAMPLE_KEYS: &str =
+        "[{kind: raw, path: service}, {kind: structure}, {kind: raw, path: attributes.status}]";
 
-    fn build_config_with_env(
+    fn build_config(
         yaml: &str,
         env_vars: &HashMap<String, String>,
     ) -> anyhow::Result<Option<DocsClusteringConfig>> {
-        let config_builder = serde_yaml::from_str::<DocsClusteringConfigBuilder>(yaml)?;
-        DocsClusteringConfigBuilder::build_optional(Some(config_builder), env_vars)
+        let builder = serde_yaml::from_str::<DocsClusteringConfigBuilder>(yaml)?;
+        DocsClusteringConfigBuilder::build_optional(Some(builder), env_vars)
     }
 
     #[test]
-    fn build_accepts_structure_without_exclusions() {
-        let config = build_config(
-            r#"
-- fingerprint:
-    - kind: structure
-- fingerprint:
-    - path: message
-      kind: tokenized
-"#,
-        )
-        .unwrap();
-        assert!(config.is_some());
-    }
-
-    #[test]
-    fn build_can_be_disabled_by_env_var() {
-        let env_vars =
-            HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".to_string(), "true".to_string())]);
-        let config = build_config_with_env(
-            r#"
-- fingerprint:
-    - kind: structure
-- fingerprint:
-    - path: message
-      kind: tokenized
-"#,
-            &env_vars,
-        )
-        .unwrap();
-
-        assert!(config.is_none());
-    }
-
-    #[test]
-    fn build_false_env_var_preserves_config() {
-        let env_vars = HashMap::from([(
-            "QW_DISABLE_DOCS_CLUSTERING".to_string(),
-            "false".to_string(),
-        )]);
-        let config = build_config_with_env(
-            r#"
-- fingerprint:
-    - kind: structure
-- fingerprint:
-    - path: message
-      kind: tokenized
-"#,
-            &env_vars,
-        )
-        .unwrap();
-
-        assert!(config.is_some());
-    }
-
-    #[test]
-    fn build_rejects_invalid_env_var() {
-        let env_vars = HashMap::from([(
-            "QW_DISABLE_DOCS_CLUSTERING".to_string(),
-            "invalid".to_string(),
-        )]);
-        let error = DocsClusteringConfigBuilder::build_optional(None, &env_vars).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("failed to convert value `invalid`"),
-            "expected invalid boolean error, got: {error}",
+    fn keys_preserve_order_and_round_trip() {
+        let config = build_config(SAMPLE_KEYS, &HashMap::new()).unwrap().unwrap();
+        assert_eq!(
+            config.group_by,
+            [
+                ClusteringKey::Field("service".into()),
+                ClusteringKey::Structure,
+                ClusteringKey::Field("attributes.status".into()),
+            ]
+        );
+        let expected = serde_json::json!([
+            {"kind": "raw", "path": "service"},
+            {"kind": "structure"},
+            {"kind": "raw", "path": "attributes.status"}
+        ]);
+        assert_eq!(serde_json::to_value(&config).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<DocsClusteringConfig>(expected).unwrap(),
+            config
+        );
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert_eq!(
+            serde_yaml::from_str::<DocsClusteringConfig>(&yaml).unwrap(),
+            config
         );
     }
 
     #[test]
-    fn config_validation_rejects_invalid_fingerprint_policies() {
-        let test_cases = [
+    fn validation_rejects_empty_keys_and_invalid_paths() {
+        let invalid_configs = [
+            (vec![], "must contain at least one entry"),
             (
-                serde_json::json!([
-                    {"fingerprint": []},
-                    {"fingerprint": [{"path": "message", "kind": "tokenized"}]}
-                ]),
-                "fingerprint policy must contain at least one field",
-            ),
-            (
-                serde_json::json!([
-                    {"fingerprint": [{"kind": "structure"}]},
-                    {"fingerprint": []}
-                ]),
-                "fingerprint policy must contain at least one field",
-            ),
-            (
-                serde_json::json!([
-                    {"fingerprint": [{"path": "", "kind": "raw"}]}
-                ]),
+                vec![ClusteringKey::Field("".into())],
                 "must not contain empty components",
             ),
             (
-                serde_json::json!([
-                    {"fingerprint": [
-                        {"path": "message..template", "kind": "tokenized"}
-                    ]}
-                ]),
+                vec![ClusteringKey::Field(".service".into())],
                 "must not contain empty components",
             ),
             (
-                serde_json::json!([
-                    {"fingerprint": [{"kind": "structure", "exclude": [" custom"]}]}
-                ]),
+                vec![ClusteringKey::Field("service.".into())],
+                "must not contain empty components",
+            ),
+            (
+                vec![ClusteringKey::Field("attributes..status".into())],
+                "must not contain empty components",
+            ),
+            (
+                vec![ClusteringKey::Field(" service".into())],
+                "must not contain leading or trailing whitespace",
+            ),
+            (
+                vec![ClusteringKey::Field("attributes. status".into())],
+                "must not contain leading or trailing whitespace",
+            ),
+            (
+                vec![ClusteringKey::Field("attributes.status ".into())],
                 "must not contain leading or trailing whitespace",
             ),
         ];
-
-        for (json_value, expected_error) in test_cases {
-            let config: DocsClusteringConfig = serde_json::from_value(json_value).unwrap();
-            let error = config.validate().unwrap_err();
+        for (group_by, expected_error) in invalid_configs {
+            let config = DocsClusteringConfig { group_by };
             assert!(
-                error.to_string().contains(expected_error),
-                "expected `{expected_error}`, got: {error:?}"
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected_error)
+            );
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            let error = serde_yaml::from_str::<DocsClusteringConfig>(&yaml).unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+            let json = serde_json::to_value(&config).unwrap();
+            let error = serde_json::from_value::<DocsClusteringConfig>(json).unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+            let error = build_config(&yaml, &HashMap::new()).unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+    }
+
+    #[test]
+    fn deserialization_rejects_removed_and_malformed_entries() {
+        for yaml in [
+            "[{fingerprint: [{kind: raw, path: service}]}]",
+            "[{kind: structure, exclude: [custom]}]",
+            "[{kind: structure, path: service}]",
+            "[{kind: combined, fields: [service, status]}]",
+            "[{kind: raw, path: service, extra: nope}]",
+            "[{kind: raw, path: service, max_tokens: 10}]",
+            "[{kind: raw}]",
+            "[{path: service}]",
+            "[{kind: templated, path: message}]",
+            "[{kind: raw, path: [service, status]}]",
+            "{fields: [service]}",
+            "[",
+        ] {
+            assert!(
+                serde_yaml::from_str::<DocsClusteringConfig>(yaml).is_err(),
+                "{yaml}"
+            );
+            assert!(
+                serde_yaml::from_str::<DocsClusteringConfigBuilder>(yaml).is_err(),
+                "{yaml}"
             );
         }
     }
 
     #[test]
-    fn config_validation_rejects_empty_policies() {
-        let json_value = serde_json::json!([]);
-        let expected_error = "document clustering policies must contain at least one policy";
+    fn tokenized_is_explicitly_unsupported_even_when_disabled() {
+        let env_vars = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "true".into())]);
+        for yaml in [
+            "[{kind: tokenized, path: message}]",
+            "[{kind: tokenized, path: message, max_tokens: 50}]",
+        ] {
+            let error = serde_yaml::from_str::<DocsClusteringConfig>(yaml).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("tokenized document clustering is unsupported")
+            );
+            let error = build_config(yaml, &env_vars).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("tokenized document clustering is unsupported")
+            );
+        }
+    }
 
-        let config: DocsClusteringConfig = serde_json::from_value(json_value).unwrap();
-        let error = config.validate().unwrap_err();
-        assert!(
-            error.to_string().contains(expected_error),
-            "expected `{expected_error}`, got: {error:?}"
+    #[test]
+    fn disable_override_preserves_supported_config_behavior() {
+        let disabled = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "true".into())]);
+        assert!(build_config(SAMPLE_KEYS, &disabled).unwrap().is_none());
+        for yaml in ["[]", "[{kind: raw, path: attributes..status}]"] {
+            assert!(build_config(yaml, &disabled).unwrap().is_none());
+        }
+        let enabled = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "false".into())]);
+        assert_eq!(
+            build_config(SAMPLE_KEYS, &enabled).unwrap(),
+            build_config(SAMPLE_KEYS, &HashMap::new()).unwrap()
         );
+        for env_vars in [&enabled, &disabled, &HashMap::new()] {
+            assert!(
+                DocsClusteringConfigBuilder::build_optional(None, env_vars)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
-    fn disable_override_bypasses_invalid_json_path() {
-        let env_vars =
-            HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".to_string(), "true".to_string())]);
-        let config = build_config_with_env(
-            r#"
-- fingerprint:
-    - path: message..template
-      kind: tokenized
-"#,
-            &env_vars,
-        );
-
-        assert!(config.unwrap().is_none());
-    }
-
-    #[test]
-    fn config_validation_accepts_arbitrary_policy_shapes() {
-        let config: DocsClusteringConfig = serde_json::from_value(serde_json::json!([
-            {"fingerprint": [{"path": "message", "kind": "raw"}]},
-            {"fingerprint": [{"kind": "structure"}]},
-            {"fingerprint": [{"kind": "structure"}]},
-            {"fingerprint": [
-                {"path": "service", "kind": "raw"},
-                {"path": "message", "kind": "tokenized"}
-            ]}
-        ]))
-        .unwrap();
-
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn deserialization_rejects_malformed_yaml() {
-        let error = serde_yaml::from_str::<DocsClusteringConfigBuilder>("- fingerprint: [")
-            .err()
-            .unwrap();
+    fn invalid_disable_override_is_an_error_even_without_config() {
+        let env_vars = HashMap::from([("QW_DISABLE_DOCS_CLUSTERING".into(), "invalid".into())]);
+        let error = DocsClusteringConfigBuilder::build_optional(None, &env_vars).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("did not find expected node content"),
-            "expected parse failure, got: {error:?}"
+                .contains("failed to convert value `invalid`")
         );
-    }
-
-    #[test]
-    fn deserialization_rejects_unknown_fields() {
-        let error = serde_yaml::from_str::<DocsClusteringConfigBuilder>(
-            r#"
-- fingerprint:
-    - kind: structure
-    - path: message
-      kind: tokenized
-      extra: nope
-"#,
-        )
-        .err()
-        .unwrap();
-        assert!(
-            format!("{error:?}").contains("did not match any variant"),
-            "expected unknown field failure, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn deserialization_rejects_unknown_policy_fields() {
-        let error = serde_yaml::from_str::<DocsClusteringConfigBuilder>(
-            r#"
-- fingerprint:
-    - kind: structure
-  extra: nope
-- fingerprint:
-    - path: message
-      kind: tokenized
-"#,
-        )
-        .err()
-        .unwrap();
-        assert!(
-            format!("{error:?}").contains("did not match any variant"),
-            "expected unknown policy field failure, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn deserialization_rejects_unknown_kinds() {
-        let error = serde_yaml::from_str::<DocsClusteringConfigBuilder>(
-            r#"
-- fingerprint:
-    - kind: structure
-    - path: message
-      kind: templated
-"#,
-        )
-        .err()
-        .unwrap();
-        assert!(
-            format!("{error:?}").contains("did not match any variant"),
-            "expected unknown kind failure, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn serialization_uses_flattened_policy_format() {
-        let config = build_config(
-            r#"
-- fingerprint:
-    - kind: structure
-      exclude: [custom]
-- fingerprint:
-    - path: custom
-      kind: raw
-    - path: message
-      kind: tokenized
-"#,
-        )
-        .unwrap()
-        .unwrap();
-        let serialized_config = serde_yaml::to_string(&config).unwrap();
-
-        assert!(serialized_config.starts_with("- fingerprint:"));
-        assert!(serialized_config.contains("fingerprint:"));
-        assert!(serialized_config.contains("kind: structure"));
-        assert!(!serialized_config.contains("grouping:"));
+        assert!(build_config(SAMPLE_KEYS, &env_vars).is_err());
     }
 }

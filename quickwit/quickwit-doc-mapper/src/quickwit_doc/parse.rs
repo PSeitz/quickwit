@@ -30,7 +30,7 @@ use crate::{DocMapper, DocParsingError};
 const MAX_RETAINED_SCRATCH_CAPACITY: usize = 256 * 1024;
 
 // The input length stays outside the result so rejected documents count towards byte metrics.
-type MappedEntry<T> = (usize, Result<(T, Partition, QuickwitDoc), DocParsingError>);
+type MappedEntry = (usize, Result<(Partition, QuickwitDoc), DocParsingError>);
 
 /// Parses and maps JSON documents into one flat byte buffer with a shared batch dictionary.
 pub struct QuickwitDocBatch {
@@ -133,13 +133,12 @@ impl QuickwitDocBatch {
     }
 
     /// Maps all roots before freezing the dictionary so identical binary conversions across
-    /// documents share an entry. `before_map` reads original fields (e.g. to fingerprint them).
-    /// Resets the batch while retaining scratch buffers for reuse across batches.
-    pub fn map<'a, T, F: FnMut(&QuickwitDoc) -> T>(
+    /// documents share an entry. Resets the batch while retaining scratch buffers for reuse across
+    /// batches.
+    pub fn map<'a>(
         &mut self,
         mapper: &'a DocMapper,
-        mut before_map: F,
-    ) -> impl ExactSizeIterator<Item = MappedEntry<T>> + use<'a, T, F> {
+    ) -> impl ExactSizeIterator<Item = MappedEntry> + use<'a> {
         let mut data = std::mem::take(&mut self.data);
         let mut results = Vec::with_capacity(self.docs.len());
         for (len, root_offset) in self.docs.drain(..) {
@@ -148,7 +147,6 @@ impl QuickwitDocBatch {
                 data,
                 bindings: FieldBindings::default(),
             };
-            let meta = before_map(&doc);
             let partition = mapper.quickwit_partition(&doc);
             let data_mut = Arc::get_mut(&mut doc.data).expect("unique BatchData");
             let checkpoint = data_mut.dictionary.len();
@@ -156,7 +154,7 @@ impl QuickwitDocBatch {
             let result = mapper
                 .map_tantivy_fields(object, root_offset, &mut data_mut.dictionary, len as u64)
                 .inspect_err(|_| data_mut.dictionary.truncate(checkpoint))
-                .map(|bindings| (meta, partition, root_offset, bindings));
+                .map(|bindings| (partition, root_offset, bindings));
             data = doc.data;
             results.push((len, result));
         }
@@ -172,14 +170,14 @@ impl QuickwitDocBatch {
         results.into_iter().map(move |(len, result)| {
             (
                 len,
-                result.map(|(meta, partition, root_offset, bindings)| {
+                result.map(|(partition, root_offset, bindings)| {
                     let mut doc = QuickwitDoc {
                         root_offset,
                         data: data.clone(),
                         bindings,
                     };
                     mapper.add_field_presence(&mut doc);
-                    (meta, partition, doc)
+                    (partition, doc)
                 }),
             )
         })

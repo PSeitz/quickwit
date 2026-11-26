@@ -35,6 +35,28 @@ A commented example is available here: [quickwit.yaml](https://github.com/quickw
 | `default_index_root_uri` | Default index root URI that defines the location where index data (splits) is stored. The index URI is built following the scheme: `{default_index_root_uri}/{index-id}` | `QW_DEFAULT_INDEX_ROOT_URI` | `{data_dir}/indexes` |
 | environment variable only | Log level of Quickwit. Can be a direct log level, or a comma separated list of `module_name=level` | `RUST_LOG` | `info` |
 
+## Document clustering
+
+The optional, experimental top-level `docs_clustering_config` buffers documents in fresh splits and indexes them in cluster order instead of remapping document IDs afterward. Split merging stays unchanged.
+
+```yaml
+docs_clustering_config:
+  - kind: raw
+    path: service
+  - kind: structure
+  - kind: raw
+    path: status
+```
+
+Each entry defines one clustering level from outermost to innermost:
+
+- `kind: raw` groups by string values at a mapped schema or JSON path. Use dot-separated paths for nested fields and `_dynamic.service` for an unmapped `service` field. Each path must have nonempty components without leading or trailing whitespace. Unresolvable paths cause indexing to fail. Arrays and repeated fields use their first value. Missing and non-string values share an ignored bucket that precedes string groups in ascending lexicographic order.
+- `kind: structure` groups by a 64-bit hash of the document's unique mapped leaf paths (values, scalar types, field order, and repetitions are ignored; arrays count as leaves; empty objects contribute no leaves), ordered by ascending hash.
+
+The old `fingerprint` wrapper and `docs_clustering` key are rejected. `kind: tokenized` returns an explicit unsupported error.
+
+Omit the setting to disable clustering. `QW_DISABLE_DOCS_CLUSTERING=true` disables a supported configuration and bypasses path validation. `false` preserves the configured entries and leaves clustering disabled when the setting is absent. Unsupported kinds and malformed entries remain errors even with the override enabled.
+
 ## REST configuration
 
 This section contains the REST API configuration options.

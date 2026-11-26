@@ -56,12 +56,7 @@ fn named_fields(doc: &impl Document, schema: &Schema) -> BTreeMap<String, Vec<Ow
 fn map_one(mapper: &DocMapper, input: &str) -> Result<(u64, QuickwitDoc), crate::DocParsingError> {
     let mut batch = QuickwitDocBatch::default();
     batch.parse(input.as_bytes()).unwrap();
-    batch
-        .map(mapper, |_| ())
-        .next()
-        .unwrap()
-        .1
-        .map(|((), partition, doc)| (partition, doc))
+    batch.map(mapper).next().unwrap().1
 }
 
 fn assert_parity(mapper: &DocMapper, input: &str) -> BTreeMap<String, Vec<OwnedValue>> {
@@ -129,12 +124,12 @@ fn batch_shares_entries_and_rolls_back_errors() -> anyhow::Result<()> {
     batch.parse(br#"{"data":"ff"}"#)?;
     batch.parse(invalid)?;
     batch.parse(br#"{"data":"cc"}"#)?;
-    let mut mapped = batch.map(&mapper, |_| ());
-    let ((), _, first) = mapped.next().unwrap().1?;
+    let mut mapped = batch.map(&mapper);
+    let (_, first) = mapped.next().unwrap().1?;
     let (len, error) = mapped.next().unwrap();
     assert_eq!(len, invalid.len());
     assert!(matches!(error, Err(crate::DocParsingError::ValueError(path, _)) if path == "data"));
-    let ((), _, last) = mapped.next().unwrap().1?;
+    let (_, last) = mapped.next().unwrap().1?;
     assert!(std::ptr::eq(first.dictionary(), last.dictionary()));
     let Some(Leaf(QuickwitLeafValue::String(text_id))) =
         last.as_object().get("data", last.dictionary())
@@ -151,7 +146,7 @@ fn batch_shares_entries_and_rolls_back_errors() -> anyhow::Result<()> {
     assert!(batch.parse(bad_long.as_bytes()).is_err());
     let dup_long_key = format!(r#"{{"{long_key}":"first","{long_key}":"{long_val}"}}"#);
     batch.parse(dup_long_key.as_bytes())?;
-    let second_doc = batch.map(&mapper, |_| ()).next().unwrap().1?.2;
+    let second_doc = batch.map(&mapper).next().unwrap().1?.1;
     assert!(!std::ptr::eq(first.dictionary(), second_doc.dictionary()));
     let entries: Vec<_> = second_doc
         .as_object()
@@ -251,7 +246,7 @@ fn routing_matches_json() {
     let mut batch = QuickwitDocBatch::default();
     batch.parse(br#"{"prefix":"offset_ids"}"#).unwrap();
     batch.parse(source.as_bytes()).unwrap();
-    let ((), _, doc) = batch.map(&mapper, |_| ()).last().unwrap().1.unwrap();
+    let (_, doc) = batch.map(&mapper).last().unwrap().1.unwrap();
     for expr in [
         "",
         r"key\.with\.dot",
@@ -360,9 +355,9 @@ fn stored_source_dynamic_concatenate_and_batch_dedup() -> anyhow::Result<()> {
     for input in &inputs {
         batch.parse(input.as_bytes())?;
     }
-    let mut mapped = batch.map(&mapper, |_| ());
-    let ((), p1, first) = mapped.next().unwrap().1?;
-    let ((), p2, second) = mapped.next().unwrap().1?;
+    let mut mapped = batch.map(&mapper);
+    let (p1, first) = mapped.next().unwrap().1?;
+    let (p2, second) = mapped.next().unwrap().1?;
     let (base64, hex) = (decoded(&first), decoded(&second));
     assert_eq!(base64, [b"\x00\xff\x80".as_slice(), "café".as_bytes(), b""]);
     for (&left, right) in base64.iter().zip(hex) {

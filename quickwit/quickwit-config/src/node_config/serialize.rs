@@ -246,7 +246,6 @@ struct NodeConfigBuilder {
     #[serde(rename = "compactor")]
     #[serde(default)]
     compactor_config: CompactorConfig,
-    #[serde(rename = "docs_clustering")]
     #[serde(default)]
     docs_clustering_config: Option<DocsClusteringConfigBuilder>,
 }
@@ -1529,6 +1528,41 @@ mod tests {
         .await
         .unwrap();
         assert!(node_config.is_service_enabled(QuickwitService::Compactor));
+    }
+
+    #[tokio::test]
+    async fn test_docs_clustering_config_and_override() {
+        let yaml = b"version: 0.8\ndocs_clustering_config: [{kind: raw, path: service}, {kind: structure}, {kind: raw, path: status}]";
+        for disabled in [false, true] {
+            let env_vars = HashMap::from([(
+                "QW_DISABLE_DOCS_CLUSTERING".to_string(),
+                disabled.to_string(),
+            )]);
+            let config = load_node_config_with_env(ConfigFormat::Yaml, yaml, &env_vars, None)
+                .await
+                .unwrap();
+            if disabled {
+                assert!(config.docs_clustering_config.is_none());
+            } else {
+                assert_eq!(
+                    config.docs_clustering_config.unwrap().group_by,
+                    [
+                        crate::ClusteringKey::Field("service".into()),
+                        crate::ClusteringKey::Structure,
+                        crate::ClusteringKey::Field("status".into()),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_docs_clustering_config_rejects_old_key() {
+        let yaml = b"version: 0.8\ndocs_clustering: [{kind: raw, path: service}]";
+        let error = load_node_config_with_env(ConfigFormat::Yaml, yaml, &HashMap::new(), None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field `docs_clustering`"));
     }
 
     #[tokio::test]

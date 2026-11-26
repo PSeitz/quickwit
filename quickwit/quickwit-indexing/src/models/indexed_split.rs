@@ -20,17 +20,17 @@ use quickwit_common::metrics::index_label;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_doc_mapper::QuickwitDoc;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
-use quickwit_metrics::{GaugeGuard, label_values};
+use quickwit_metrics::{GaugeGuard, histogram, label_values};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SplitId};
 use tantivy::directory::{Advice, RamDirectory};
 use tantivy::{IndexBuilder, SingleSegmentIndexWriter};
-use tracing::{Span, error, instrument};
+use tracing::{Span, instrument};
 
 use crate::controlled_directory::ControlledDirectory;
-use crate::docs_clustering::DocIdClusterer;
+use crate::docs_clustering::DocClusterer;
 use crate::merge_policy::MergeTask;
-use crate::metrics::INDEX_SOURCE;
+use crate::metrics::{DOCS_CLUSTER_GROUP_SIZE, INDEX_SOURCE};
 use crate::models::{PublishLock, SplitAttrs};
 use crate::no_fsync_mmap_directory::open_split_scratch_directory;
 
@@ -39,7 +39,7 @@ pub struct IndexedSplitBuilder {
     pub index_writer: SingleSegmentIndexWriter<QuickwitDoc>,
     pub split_scratch_directory: TempDirectory,
     pub controlled_directory: ControlledDirectory,
-    pub doc_id_clusterer_opt: Option<DocIdClusterer>,
+    pub doc_clusterer_opt: Option<DocClusterer>,
     ram_directory_opt: Option<RamDirectory>,
 }
 
@@ -74,7 +74,7 @@ impl fmt::Debug for IndexedSplitBuilder {
             .field("split_id", &self.split_attrs.split_id)
             .field("dir", &self.split_scratch_directory.path())
             .field("num_docs", &self.split_attrs.num_docs)
-            .field("doc_id_clusterer_opt", &self.doc_id_clusterer_opt.is_some())
+            .field("doc_clusterer_opt", &self.doc_clusterer_opt.is_some())
             .finish()
     }
 }
@@ -89,7 +89,7 @@ impl IndexedSplitBuilder {
         scratch_directory: TempDirectory,
         index_builder: IndexBuilder,
         io_controls: IoControls,
-        doc_id_clusterer_opt: Option<DocIdClusterer>,
+        doc_clusterer_opt: Option<DocClusterer>,
     ) -> anyhow::Result<Self> {
         // We avoid intermediary merge, and instead merge all segments in the packager.
         // The benefit is that we don't have to wait for potentially existing merges,
@@ -130,11 +130,20 @@ impl IndexedSplitBuilder {
                 num_merge_ops: 0,
             },
             index_writer,
-            doc_id_clusterer_opt,
+            doc_clusterer_opt,
             split_scratch_directory,
             controlled_directory,
             ram_directory_opt,
         })
+    }
+
+    pub fn add_document(&mut self, doc: QuickwitDoc) -> anyhow::Result<()> {
+        if let Some(doc_clusterer) = self.doc_clusterer_opt.as_mut() {
+            doc_clusterer.push(doc);
+        } else {
+            self.index_writer.add_document(doc)?;
+        }
+        Ok(())
     }
 
     #[instrument(name="serialize_split",
@@ -151,28 +160,21 @@ impl IndexedSplitBuilder {
             num_merge_ops=%self.split_attrs.num_merge_ops,
         )
     )]
-    pub fn finalize(self) -> anyhow::Result<IndexedSplit> {
+    pub fn finalize(mut self) -> anyhow::Result<IndexedSplit> {
         let split_attrs = self.split_attrs;
-        let index = if let Some(doc_id_clusterer) = self.doc_id_clusterer_opt {
-            // Update metrics for document clustering.
+        if let Some(doc_clusterer) = self.doc_clusterer_opt.take() {
             let index_label = index_label(&split_attrs.index_uid.index_id);
             let labels = label_values!(
                 INDEX_SOURCE => index_label.to_string(),
                 split_attrs.source_id.to_string()
             );
-            doc_id_clusterer.observe_cluster_group_sizes(labels);
-
-            // Finalize the index with the doc id mapping.
-            let doc_id_mapping = doc_id_clusterer
-                .into_doc_id_mapping()
-                .inspect_err(|error| {
-                    error!(?error, "failed to create doc id mapping");
-                })?;
-            self.index_writer
-                .finalize_with_doc_id_mapping(&doc_id_mapping)?
-        } else {
-            self.index_writer.finalize()?
-        };
+            let histogram = histogram!(parent: DOCS_CLUSTER_GROUP_SIZE, labels: [labels]);
+            for group_size in doc_clusterer.group_sizes() {
+                histogram.observe(group_size as f64);
+            }
+            doc_clusterer.drain(&mut |doc| self.index_writer.add_document(doc))?;
+        }
+        let index = self.index_writer.finalize()?;
         let index = if let Some(ram_directory) = self.ram_directory_opt {
             ram_directory.persist(&self.controlled_directory)?;
             // Persist copies files but leaves RAM intact. Return a disk-backed index so packaging
@@ -197,6 +199,11 @@ impl IndexedSplitBuilder {
 
     pub fn mem_usage(&self) -> usize {
         self.index_writer.mem_usage()
+            + self
+                .doc_clusterer_opt
+                .as_ref()
+                .map(DocClusterer::mem_usage)
+                .unwrap_or(0)
             + self
                 .ram_directory_opt
                 .as_ref()
@@ -271,7 +278,7 @@ mod tests {
             .single_segment_index_writer(ram_directory.clone(), 15_000_000)?;
         let mut batch = QuickwitDocBatch::default();
         batch.parse(br#"{"id":42}"#)?;
-        let ((), _, doc) = batch.map(&mapper, |_| ()).next().unwrap().1?;
+        let (_, doc) = batch.map(&mapper).next().unwrap().1?;
         index_writer.add_document(doc)?;
         let split_scratch_directory = TempDirectory::for_test();
         let controlled_directory = ControlledDirectory::new(
@@ -297,7 +304,7 @@ mod tests {
             index_writer,
             split_scratch_directory,
             controlled_directory,
-            doc_id_clusterer_opt: None,
+            doc_clusterer_opt: None,
             ram_directory_opt: Some(ram_directory.clone()),
         };
         let split = builder.finalize()?;

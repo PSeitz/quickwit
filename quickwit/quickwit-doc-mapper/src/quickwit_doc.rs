@@ -67,6 +67,12 @@ pub(crate) struct BatchData {
     pub(crate) nodes: Vec<u8>,
 }
 
+impl BatchData {
+    fn mem_usage(&self) -> usize {
+        std::mem::size_of::<Self>() + self.dictionary.mem_usage() + self.nodes.capacity()
+    }
+}
+
 /// A parsed document referencing its root object inside the shared batch buffer, plus Tantivy
 /// field bindings populated during mapping.
 #[derive(Clone, Debug, Default)]
@@ -126,6 +132,18 @@ impl QuickwitDoc {
     /// Looks up a value by literal object keys.
     pub fn get_path(&self, path: &[String]) -> Option<QuickwitValue<'_>> {
         self.as_object().get_path(path, &self.data.dictionary)
+    }
+
+    /// Heap capacity owned exclusively by this document's Tantivy field bindings.
+    pub fn bindings_mem_usage(&self) -> usize {
+        self.bindings.mem_usage()
+    }
+
+    /// Identity and retained heap size of the batch buffer shared across documents from the same
+    /// [`QuickwitDocBatch`]. Callers retaining multiple documents can deduplicate by the returned
+    /// address so shared batch buffers are counted once.
+    pub fn batch_data_id_and_mem_usage(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.data) as usize, self.data.mem_usage())
     }
 }
 
