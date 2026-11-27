@@ -162,7 +162,7 @@ fn batch_shares_entries_and_rolls_back_errors() -> anyhow::Result<()> {
 }
 
 #[test]
-fn dictionary_text_prefix_and_deserialization() {
+fn dictionary_truncate_freeze_and_deserialization() {
     let mut dict = ByteDictionary::default();
     let first = dict.intern_str("first").unwrap();
     let checkpoint = dict.len();
@@ -171,7 +171,6 @@ fn dictionary_text_prefix_and_deserialization() {
     let binary = dict.intern(&[0xff]).unwrap();
     assert_eq!(binary, removed);
     assert_eq!(dict.get_str(first), "first");
-    assert!(std::panic::catch_unwind(|| dict.get_str(binary)).is_err());
     let text = dict.intern_str("☃").unwrap();
     assert_eq!(dict.get_str(text), "☃");
     dict.freeze();

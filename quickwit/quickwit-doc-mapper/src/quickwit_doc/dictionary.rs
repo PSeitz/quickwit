@@ -30,8 +30,6 @@ pub struct ByteDictionary {
     bytes: Vec<u8>,
     // Exclusive end offset in `bytes` for each dictionary ID.
     end_offsets: Vec<u32>,
-    // JSON parsing inserts only &str entries. Binary conversions follow during mapping.
-    text_prefix_len: usize,
     // Indexes every entry while building a batch. Freezing drops its allocation.
     lookup: HashTable<u32>,
 }
@@ -52,14 +50,14 @@ impl ByteDictionary {
         &self.bytes[byte_range(&self.end_offsets, id)]
     }
 
-    /// Borrows an entry as text. Panics for an unknown ID or invalid UTF-8.
+    /// Borrows an entry as UTF-8 text without re-validating.
+    ///
+    /// Contract: `id` must refer to a UTF-8 entry inserted via `intern_str` / `intern_value_str`
+    /// (object keys and `QuickwitLeafValue::String`).
+    #[inline]
     pub fn get_str(&self, id: u32) -> &str {
-        let bytes = self.get_bytes(id);
-        if (id as usize) < self.text_prefix_len {
-            // SAFETY: every entry in this prefix was appended from a `&str`.
-            return unsafe { std::str::from_utf8_unchecked(bytes) };
-        }
-        std::str::from_utf8(bytes).expect("dictionary entry is not UTF-8")
+        // SAFETY: callers only pass IDs originating from `&str` dictionary insertions.
+        unsafe { std::str::from_utf8_unchecked(self.get_bytes(id)) }
     }
 
     /// Reads the 16 network-order octets of a mapped IP address.
@@ -76,41 +74,37 @@ impl ByteDictionary {
     }
 
     pub(super) fn intern_str(&mut self, text: &str) -> Result<u32, &'static str> {
-        self.intern_entry(text.as_bytes(), true)
+        self.intern_entry(text.as_bytes())
     }
 
     pub(super) fn intern_value_str(&mut self, text: &str) -> Result<u32, &'static str> {
         if text.len() <= MAX_INTERNED_VALUE_LEN {
-            self.intern_entry(text.as_bytes(), true)
+            self.intern_entry(text.as_bytes())
         } else {
-            self.append_entry(text.as_bytes(), true)
+            self.append_entry(text.as_bytes())
         }
     }
 
     pub(crate) fn intern(&mut self, bytes: &[u8]) -> Result<u32, &'static str> {
-        self.intern_entry(bytes, false)
+        self.intern_entry(bytes)
     }
 
-    fn append_entry(&mut self, bytes: &[u8], is_text: bool) -> Result<u32, &'static str> {
-        // Wrapped offsets could make an unchecked string read point into binary data.
+    fn append_entry(&mut self, bytes: &[u8]) -> Result<u32, &'static str> {
         if bytes.len() > u32::MAX as usize - self.bytes.len() {
             return Err("document batch dictionary exceeds 4 GiB");
         }
         let id = self.len() as u32;
         self.bytes.extend_from_slice(bytes);
         self.end_offsets.push(self.bytes.len() as u32);
-        if is_text && id as usize == self.text_prefix_len {
-            self.text_prefix_len += 1;
-        }
         Ok(id)
     }
 
-    fn intern_entry(&mut self, bytes: &[u8], is_text: bool) -> Result<u32, &'static str> {
+    fn intern_entry(&mut self, bytes: &[u8]) -> Result<u32, &'static str> {
         let hash = hash_bytes(bytes);
         if let Some(&id) = self.lookup.find(hash, |id| self.get_bytes(*id) == bytes) {
             return Ok(id);
         }
-        let id = self.append_entry(bytes, is_text)?;
+        let id = self.append_entry(bytes)?;
         self.lookup.insert_unique(hash, id, |id| {
             hash_bytes(&self.bytes[byte_range(&self.end_offsets, *id)])
         });
@@ -126,7 +120,6 @@ impl ByteDictionary {
             }
         }
         self.end_offsets.truncate(len);
-        self.text_prefix_len = self.text_prefix_len.min(len);
         self.bytes
             .truncate(self.end_offsets.last().copied().unwrap_or(0) as usize);
     }
